@@ -264,11 +264,11 @@ async function serveStatic(request, response, pathname) {
         return response.end("Bad request");
     }
 
-    const relativePath = decodedPath === "/" ? "public/index.html" : decodedPath.replace(/^[/\\]+/, "");
+    const relativePath = decodedPath === "/" ? "index.html" : decodedPath.replace(/^[/\\]+/, "");
     let filePath = path.resolve(ROOT, relativePath);
     const isAllowedStaticPath = candidate => STATIC_ROOTS.some(
         base => candidate === base || candidate.startsWith(base + path.sep)
-    );
+    ) || candidate === path.join(ROOT, "index.html");
     if (!isAllowedStaticPath(filePath)) {
         response.writeHead(404);
         return response.end("Not found");
