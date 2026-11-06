@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex, nofollow">
+    <meta name="theme-color" content="#071a36">
+    <title>Verwaltung | Zoicas &amp; Osinski</title>
+    <link rel="icon" href="../assets/images/Logo/zoicas-osinski.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="../Css/admin.css">
+    <script src="../js/admin.js" defer></script>
+</head>
+<body>
+    <main id="login-view" class="login-screen" hidden>
+        <a class="back-link" href="../index.html">&larr; Zurück zur Website</a>
+        <section class="login-card" aria-labelledby="login-title">
+            <div class="login-mark" aria-hidden="true">Z&amp;O</div>
+            <p class="eyebrow">INTERNE VERWALTUNG</p>
+            <h1 id="login-title">Willkommen zurück</h1>
+            <p class="login-description">Melden Sie sich an, um Kontaktanfragen und Bewerbungen einzusehen.</p>
+            <form id="login-form" autocomplete="on">
+                <label for="login-username">Benutzername</label>
+                <input id="login-username" name="username" type="text" autocomplete="username" required maxlength="80">
+                <label for="login-password">Passwort</label>
+                <input id="login-password" name="password" type="password" autocomplete="current-password" required maxlength="256">
+                <p id="login-error" class="form-message" role="alert" hidden></p>
+                <button class="button button-primary" type="submit">
+                    <span>Anmelden</span><span aria-hidden="true">&rarr;</span>
+                </button>
+            </form>
+            <p class="login-footnote">Der Zugang ist auf autorisierte Mitarbeitende beschränkt.</p>
+        </section>
+    </main>
+
+    <div id="dashboard-view" class="dashboard" hidden>
+        <aside class="sidebar">
+            <a class="brand" href="../index.html" aria-label="Zoicas &amp; Osinski Startseite">
+                <img src="../assets/images/Logo/zoicas-osinski.svg" alt="Zoicas &amp; Osinski">
+            </a>
+            <div class="sidebar-label">ARBEITSBEREICH</div>
+            <nav class="side-nav" aria-label="Verwaltungsbereiche">
+                <button class="nav-item is-active" type="button" data-type="contact">
+                    <span class="nav-icon" aria-hidden="true">✉</span>
+                    <span>Kontaktanfragen</span>
+                    <span id="nav-contact-count" class="nav-count">0</span>
+                </button>
+                <button class="nav-item" type="button" data-type="career">
+                    <span class="nav-icon" aria-hidden="true">↗</span>
+                    <span>Bewerbungen</span>
+                    <span id="nav-career-count" class="nav-count">0</span>
+                </button>
+            </nav>
+            <div class="sidebar-bottom">
+                <a class="back-link" href="../index.html">Website ansehen <span aria-hidden="true">↗</span></a>
+                <div class="account-card">
+                    <span class="account-avatar" aria-hidden="true">AD</span>
+                    <span class="account-meta"><strong id="account-name">Admin</strong><small>Administrator</small></span>
+                    <button id="logout-button" class="icon-button" type="button" aria-label="Abmelden" title="Abmelden">↪</button>
+                </div>
+            </div>
+        </aside>
+
+        <main class="main-panel">
+            <header class="topbar">
+                <div>
+                    <p class="eyebrow">ZOICAS &amp; OSINSKI <span class="eyebrow-divider">/</span> VERWALTUNG</p>
+                    <h1 id="page-title">Kontaktanfragen</h1>
+                </div>
+                <div class="topbar-right">
+                    <span class="live-indicator"><span></span> Datenbank verbunden</span>
+                    <button id="refresh-button" class="button button-light" type="button"><span aria-hidden="true">⟳</span> Aktualisieren</button>
+                </div>
+            </header>
+
+            <section class="stats-grid" aria-label="Übersicht">
+                <article class="stat-card stat-card-dark">
+                    <div class="stat-top"><span>Kontaktanfragen</span><span class="stat-icon" aria-hidden="true">✉</span></div>
+                    <strong id="stat-contacts" class="stat-value">—</strong>
+                    <span class="stat-caption">insgesamt eingegangen</span>
+                </article>
+                <article class="stat-card">
+                    <div class="stat-top"><span>Neue Anfragen</span><span class="stat-icon stat-icon-blue" aria-hidden="true">✦</span></div>
+                    <strong id="stat-new-contacts" class="stat-value">—</strong>
+                    <span class="stat-caption">warten auf Rückmeldung</span>
+                </article>
+                <article class="stat-card">
+                    <div class="stat-top"><span>Bewerbungen</span><span class="stat-icon stat-icon-gold" aria-hidden="true">↗</span></div>
+                    <strong id="stat-applications" class="stat-value">—</strong>
+                    <span class="stat-caption">insgesamt eingegangen</span>
+                </article>
+                <article class="stat-card">
+                    <div class="stat-top"><span>Neue Bewerbungen</span><span class="stat-icon stat-icon-green" aria-hidden="true">✦</span></div>
+                    <strong id="stat-new-applications" class="stat-value">—</strong>
+                    <span class="stat-caption">warten auf Bearbeitung</span>
+                </article>
+            </section>
+
+            <section class="records-panel" aria-labelledby="records-title">
+                <div class="records-heading">
+                    <div>
+                        <p class="eyebrow">EINGÄNGE</p>
+                        <h2 id="records-title">Aktuelle Einträge</h2>
+                    </div>
+                    <span id="result-count" class="result-count">—</span>
+                </div>
+                <div class="toolbar">
+                    <label class="search-box">
+                        <span aria-hidden="true">⌕</span>
+                        <input id="search-input" type="search" placeholder="Name, E-Mail oder Nachricht suchen" autocomplete="off">
+                    </label>
+                    <label class="filter-label" for="status-filter">Status</label>
+                    <select id="status-filter" class="filter-select">
+                        <option value="all">Alle Status</option>
+                        <option value="new">Neu</option>
+                        <option value="in_progress">In Bearbeitung</option>
+                        <option value="done">Erledigt</option>
+                    </select>
+                </div>
+
+                <div id="dashboard-message" class="dashboard-message" role="status" aria-live="polite" hidden></div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">EINGANG</th>
+                                <th scope="col">KONTAKT</th>
+                                <th id="service-heading" scope="col">LEISTUNG</th>
+                                <th scope="col">NACHRICHT</th>
+                                <th scope="col">STATUS</th>
+                                <th scope="col"><span class="sr-only">Details</span></th>
+                            </tr>
+                        </thead>
+                        <tbody id="records-body"></tbody>
+                    </table>
+                    <div id="empty-state" class="empty-state" hidden>
+                        <span class="empty-icon" aria-hidden="true">✦</span>
+                        <strong>Keine Einträge gefunden</strong>
+                        <p>Neue Eingänge erscheinen hier, sobald sie gesendet werden.</p>
+                    </div>
+                    <div id="loading-state" class="loading-state" hidden><span class="spinner" aria-hidden="true"></span> Einträge werden geladen …</div>
+                </div>
+                <footer class="table-footer">
+                    <span id="page-summary">—</span>
+                    <div class="pagination">
+                        <button id="previous-page" class="page-button" type="button" disabled>← Zurück</button>
+                        <span id="page-number">1</span>
+                        <button id="next-page" class="page-button" type="button" disabled>Weiter →</button>
+                    </div>
+                </footer>
+            </section>
+            <p class="privacy-note"><span aria-hidden="true">◈</span> Personenbezogene Daten werden vertraulich behandelt und nur im angemeldeten Bereich angezeigt.</p>
+        </main>
+    </div>
+
+    <dialog id="detail-dialog" class="detail-dialog" aria-labelledby="detail-name">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <p id="detail-type" class="eyebrow">EINGANG</p>
+        <h2 id="detail-name">—</h2>
+        <a id="detail-email" class="detail-email">—</a>
+        <dl class="detail-meta">
+            <div><dt>Datum</dt><dd id="detail-date">—</dd></div>
+            <div><dt>Leistung / Bereich</dt><dd id="detail-service">—</dd></div>
+            <div id="detail-phone-row" hidden><dt>Telefon</dt><dd id="detail-phone">—</dd></div>
+        </dl>
+        <div class="detail-message"><span>Nachricht</span><p id="detail-message">—</p></div>
+    </dialog>
+</body>
+</html>

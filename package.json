@@ -6,7 +6,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "admin:hash": "node scripts/generate-admin-password-hash.js"
   },
   "engines": {
     "node": ">=20.6.0"

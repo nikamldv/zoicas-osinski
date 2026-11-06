@@ -32,6 +32,7 @@ jobs:
           mkdir -p _site
           cp index.html _site/
           cp -R Css assets js public _site/
+          rm -f _site/Css/admin.css _site/js/admin.js _site/public/admin.html
 
       - name: Upload website artifact
         uses: actions/upload-pages-artifact@v4

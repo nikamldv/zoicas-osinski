@@ -46,6 +46,31 @@ npm start
 
 سایت در `http://127.0.0.1:3000/` باز می‌شود. `GET /api/health` وضعیت اتصال MySQL را نشان می‌دهد.
 
+## ۴. تنظیم داشبورد مدیریت
+
+داشبورد خصوصی در مسیر `/admin.html` قرار دارد و پیام‌ها و درخواست‌های کاری را می‌خواند. برای ورود، یک نام مدیر و گذرواژهٔ قوی بسازید. گذرواژه در فایل تنظیمات به صورت hash ذخیره می‌شود، نه متن ساده:
+
+```powershell
+npm run admin:hash
+```
+
+گذرواژه را در ورودی مخفی وارد کنید و مقدار `ADMIN_PASSWORD_HASH=...` را در فایل `.env` بگذارید. سپس `ADMIN_USERNAME` را تنظیم کنید.
+
+برای داشبورد یک حساب دیتابیس جدا بسازید. این حساب فقط مجوز خواندن درخواست‌ها را می‌گیرد:
+
+```sql
+CREATE USER 'zoicas_dashboard'@'127.0.0.1' IDENTIFIED BY 'یک_گذرواژه_جدا_و_طولانی';
+GRANT SELECT ON zoicas_osinski.contact_submissions TO 'zoicas_dashboard'@'127.0.0.1';
+GRANT SELECT ON zoicas_osinski.career_applications TO 'zoicas_dashboard'@'127.0.0.1';
+FLUSH PRIVILEGES;
+```
+
+مقدارهای `MYSQL_ADMIN_USER` و `MYSQL_ADMIN_PASSWORD` را در `.env` وارد کنید. اگر MySQL روی میزبان دیگری است، host حساب را مطابق تنظیمات همان میزبان بسازید. حساب عمومی `zoicas_app` همچنان فقط مجوز ثبت فرم‌ها را دارد.
+
+در IONOS مقدار `COOKIE_SECURE=true` را برای HTTPS تنظیم کنید. پس از راه‌اندازی مجدد سرور، داشبورد را از `https://your-domain/admin.html` باز کنید. نشست مدیر پس از مدت تنظیم‌شده منقضی می‌شود و با restart سرور باطل می‌شود.
+
+GitHub Pages فقط فایل‌های ایستا را اجرا می‌کند و API سرور Node.js یا MySQL را اجرا نمی‌کند. به همین دلیل فایل داشبورد از خروجی GitHub Pages کنار گذاشته شده است؛ صفحهٔ مدیریت باید روی میزبانی‌ای باز شود که `server.js` و MySQL را اجرا می‌کند.
+
 ## دیدن درخواست‌های ذخیره‌شده
 
 با حساب مدیریتی MySQL این پرس‌وجوها را اجرا کنید:
