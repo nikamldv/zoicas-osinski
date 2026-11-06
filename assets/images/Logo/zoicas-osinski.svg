@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 104" role="img" aria-labelledby="title desc">
+  <title id="title">Zoicas &amp; Osinski</title>
+  <desc id="desc">Reinigungsservice, Haushaltshilfe und Renovierung</desc>
+  <defs>
+    <linearGradient id="roof" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#36c5ff"/>
+      <stop offset="1" stop-color="#168cff"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M14 48 49 17l35 31" stroke="url(#roof)" stroke-width="7"/>
+    <path d="M24 44v38h50V44" stroke="#36c5ff" stroke-width="5"/>
+    <path d="M43 82V59h13v23" stroke="#36c5ff" stroke-width="4"/>
+    <path d="M61 33c2-10 11-15 21-14-1 10-7 17-19 18" stroke="#a6d936" stroke-width="4"/>
+    <path d="M62 36 75 24" stroke="#a6d936" stroke-width="3"/>
+  </g>
+  <text x="101" y="49" fill="#fff" font-family="Manrope, Arial, sans-serif" font-size="28" font-weight="800" letter-spacing="-.8">ZOICAS <tspan fill="#a6d936">&amp;</tspan> OSINSKI</text>
+  <path d="M103 62h14" stroke="#a6d936" stroke-width="3" stroke-linecap="round"/>
+  <text x="125" y="68" fill="#c5d3e2" font-family="'DM Sans', Arial, sans-serif" font-size="10" font-weight="700" letter-spacing="2.5">REINIGUNG · HAUSHALT · RENOVIERUNG</text>
+</svg>

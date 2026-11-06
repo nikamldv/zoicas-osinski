@@ -1,0 +1,211 @@
+
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <meta name="description" content="Kontaktieren Sie Zoicas & Osinski für Reinigung, Haushaltshilfe, Entrümpelung und Renovierung in Schweinfurt und Umgebung.">
+
+    <meta name="theme-color" content="#071A36">
+
+    <title>Anfrage &amp; Kontakt | Zoicas &amp; Osinski</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+    <link rel="stylesheet" href="../Css/cinematic.css">
+</head>
+
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+
+        <a href="index.html#home" class="brand">
+            <img src="../assets/images/Logo/zoicas-osinski.svg" alt="Zoicas & Osinski Logo">
+        </a>
+
+        <button class="menu-toggle"
+                aria-label="Menü öffnen"
+                aria-expanded="false">
+            <span></span>
+            <span></span>
+            <span></span>
+        </button>
+
+        <nav class="main-nav" aria-label="Hauptnavigation">
+            <a href="index.html#home">Startseite</a>
+            <div class="nav-dropdown">
+                <button class="nav-dropdown-toggle" type="button" aria-expanded="false" aria-controls="leistungen-menu">Leistungen <span aria-hidden="true">&#9662;</span></button>
+                <div class="nav-dropdown-menu" id="leistungen-menu">
+                    <a href="index.html#leistungen">Alle Leistungen</a>
+                <a href="leistungen/haushaltshilfe.html">Haushaltshilfe</a>
+                <a href="leistungen/reinigung.html">Reinigungsservice</a>
+                <a href="leistungen/haushaltsaufloesung.html">Haushaltsaufl&ouml;sung</a>
+                <a href="leistungen/entruempelung.html">Entr&uuml;mpelung</a>
+                </div>
+            </div>
+            <a href="leistungen/renovierung.html">Renovierung</a>
+            <a href="ueber-uns.html">&Uuml;ber uns</a>
+            <a href="referenzen.html">Referenzen</a>
+            <a href="karriere.html">Karriere</a>
+            <a href="kontakt.html" class="mobile-nav-cta">Kontakt aufnehmen &rarr;</a>
+        </nav>
+
+        <a href="#kontaktformular" class="header-cta">
+            Angebot anfragen <span>↗</span>
+        </a>
+
+    </div>
+</header>
+
+<main>
+
+    <section class="contact-section contact-page-section" id="kontaktformular">
+
+        <div class="contact-intro">
+            <span class="section-kicker">WIR SIND FÜR SIE DA</span>
+
+            <h1>
+                Ihr Projekt beginnt
+                <span>mit einem Gespräch.</span>
+            </h1>
+
+            <p>
+                Wir beraten Sie zu Reinigung, Haushaltshilfe, Entrümpelung und Renovierung.
+                Beschreiben Sie kurz Ihr Anliegen oder rufen Sie uns direkt an.
+            </p>
+
+            <div class="contact-location">
+                Schweinfurt und Umgebung bis 200 km
+            </div>
+
+            <div class="contact-people">
+                <h2>Direkt erreichen</h2>
+
+                <a class="contact-person" href="tel:+4915562875968">
+                    <span><small>Ihre Ansprechpartnerin</small><strong>Maria Zoicas</strong></span>
+                    <b>+49 1556 2875968</b>
+                </a>
+
+                <a class="contact-person" href="tel:+4915787757403">
+                    <span><small>Ihr Ansprechpartner</small><strong>Robert Osinski</strong></span>
+                    <b>+49 1578 7757403</b>
+                </a>
+
+                <a class="contact-person" href="mailto:zoicasundosinski@gmail.com">
+                    <span><small>Schreiben Sie uns</small><strong>E-Mail</strong></span>
+                    <b>Nachricht senden&nbsp;↗</b>
+                </a>
+            </div>
+        </div>
+
+        <form class="contact-form contact-page-form" id="contact-form" aria-describedby="contact-form-note">
+
+            <div class="contact-form-heading">
+                <span class="section-kicker">IHRE ANFRAGE</span>
+                <h2>Wobei können wir helfen?</h2>
+                <p>Füllen Sie das Formular aus. Wir melden uns, um Ihr Anliegen abzustimmen.</p>
+            </div>
+
+            <div class="form-honeypot" aria-hidden="true">
+                <label for="contact-website">Bitte leer lassen</label>
+                <input type="text" id="contact-website" name="website" tabindex="-1" autocomplete="off">
+            </div>
+
+
+            <div class="contact-form-row">
+                <div class="contact-form-field">
+                    <label for="name">Ihr Name <span aria-hidden="true">*</span></label>
+                    <input type="text" id="name" name="name" autocomplete="name"
+                           placeholder="Vor- und Nachname" required>
+                </div>
+
+                <div class="contact-form-field">
+                    <label for="email">E-Mail-Adresse <span aria-hidden="true">*</span></label>
+                    <input type="email" id="email" name="email" autocomplete="email"
+                           placeholder="name@beispiel.de" required>
+                </div>
+            </div>
+
+            <div class="contact-form-field">
+            <label for="service">Gewünschte Dienstleistung <span aria-hidden="true">*</span></label>
+            <select id="service" name="service" required>
+                <option value="">Bitte auswählen</option>
+                <option>Haushaltshilfe</option>
+                <option>Reinigungsservice</option>
+                <option>Haushaltsauflösung</option>
+                <option>Entrümpelung</option>
+                <option>Renovierung & Modernisierung</option>
+                <option>Sonstiges</option>
+            </select>
+            </div>
+
+            <div class="contact-form-field">
+            <label for="message">Ihre Nachricht <span aria-hidden="true">*</span></label>
+            <textarea id="message" name="message"
+                      rows="5"
+                      placeholder="Wie können wir Ihnen helfen?"
+                      required></textarea>
+            </div>
+
+            <button type="submit" class="button button-primary">
+                Anfrage senden <span>↗</span>
+            </button>
+
+            <p class="form-note" id="contact-form-note" role="status" aria-live="polite">
+                Alle mit * markierten Felder sind Pflichtfelder. Ihre Angaben werden zur Bearbeitung Ihrer Anfrage gespeichert. Details finden Sie in der
+                <a href="datenschutz.html">Datenschutzerkl&auml;rung</a>.
+            </p>
+
+        </form>
+
+    </section>
+
+</main>
+
+<footer class="site-footer">
+    <div class="footer-main">
+        <div class="footer-column footer-about">
+            <a href="index.html#home" class="footer-brand">ZOICAS &amp; OSINSKI<span>REINIGUNGSSERVICE</span></a>
+            <p>Mehr Zeit f&uuml;r Sie. Mehr Qualit&auml;t f&uuml;r Ihr Zuhause.</p>
+            <p class="footer-region">Schweinfurt und Umgebung bis 200 km</p>
+        </div>
+        <nav class="footer-column" aria-label="Footer navigation">
+            <h3>Navigation</h3>
+            <a href="index.html#home">Startseite</a>
+            <a href="index.html#leistungen">Leistungen</a>
+            <a href="ueber-uns.html">&Uuml;ber uns</a>
+            <a href="referenzen.html">Referenzen</a>
+            <a href="karriere.html">Karriere</a>
+            <a href="kontakt.html">Kontakt</a>
+        </nav>
+        <nav class="footer-column" aria-label="Leistungen im Footer">
+            <h3>Unsere Leistungen</h3>
+            <a href="leistungen/haushaltshilfe.html">Haushaltshilfe</a>
+            <a href="leistungen/reinigung.html">Reinigungsservice</a>
+            <a href="leistungen/haushaltsaufloesung.html">Haushaltsaufl&ouml;sung</a>
+            <a href="leistungen/entruempelung.html">Entr&uuml;mpelung</a>
+            <a href="leistungen/renovierung.html">Renovierung</a>
+        </nav>
+        <div class="footer-column footer-contact">
+            <h3>Kontakt</h3>
+            <a href="mailto:zoicasundosinski@gmail.com">zoicasundosinski@gmail.com</a>
+            <a href="tel:+4915562875968">Maria Zoicas</a>
+            <a href="tel:+4915787757403">Robert Osinski</a>
+        </div>
+    </div>
+    <div class="footer-bottom">
+        <span>&copy; 2026 Zoicas &amp; Osinski. Alle Rechte vorbehalten.</span>
+        <div><a href="impressum.html">Impressum</a><a href="datenschutz.html">Datenschutz</a></div>
+        <span class="footer-credit">Webdesign &amp; Entwicklung: FN</span>
+    </div>
+</footer>
+
+<script src="../js/cinematic.js"></script>
+
+</body>
+</html>
