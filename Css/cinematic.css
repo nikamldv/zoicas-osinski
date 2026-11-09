@@ -1386,7 +1386,6 @@ section {
         grid-template-columns: repeat(2, minmax(0,1fr));
     }
 }
-
 @media (max-width: 760px) {
     .service-page-hero {
         min-height: 0;
@@ -4468,3 +4467,36 @@ textarea:focus-visible {
     -webkit-backdrop-filter: blur(14px);
     backdrop-filter: blur(14px);
 }
+
+/* ================= LIGHTWEIGHT 3D DETAILS =================
+   CSS-only card depth keeps the page fast and works without extra libraries. */
+
+.services-grid,
+.benefits-grid,
+.references-grid {
+    perspective: 1200px;
+}
+
+.service-card,
+.benefit-item,
+.reference-placeholder {
+    transform-style: preserve-3d;
+    will-change: transform;
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .service-card:hover {
+        transform: translateY(-10px) rotateX(2deg) rotateY(-2deg);
+        box-shadow: 18px 25px 42px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.14);
+    }
+
+    .benefit-item:hover {
+        transform: translateY(-8px) rotateX(2deg) rotateY(2deg);
+    }
+
+    .reference-placeholder:hover {
+        transform: translateY(-8px) rotateX(1.5deg) rotateY(-1.5deg);
+        box-shadow: 17px 25px 45px rgba(0,0,0,.27);
+    }
+}
+
