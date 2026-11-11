@@ -30,7 +30,7 @@ jobs:
       - name: Prepare static website
         run: |
           mkdir -p _site
-          cp index.html _site/
+          cp index.html sitemap.xml robots.txt _site/
           cp -R Css assets js public _site/
           rm -f _site/Css/admin.css _site/js/admin.js _site/public/admin.html
 

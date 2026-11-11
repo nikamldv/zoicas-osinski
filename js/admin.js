@@ -8,7 +8,12 @@ const dashboardMessage = byId("dashboard-message");
 const statusLabels = {
     new: "Neu",
     in_progress: "In Bearbeitung",
-    done: "Erledigt"
+    done: "Erledigt",
+    offer_sent: "Angebot gesendet",
+    accepted: "Angenommen",
+    declined: "Abgelehnt",
+    completed: "Abgeschlossen",
+    pending: "Neu", confirmed: "Bestätigt", cancelled: "Storniert"
 };
 
 let currentType = "contact";
@@ -82,11 +87,16 @@ function escapeHtml(value) {
 
 function updateViewHeading() {
     const career = currentType === "career";
-    byId("page-title").textContent = career ? "Bewerbungen" : "Kontaktanfragen";
-    byId("records-title").textContent = career ? "Aktuelle Bewerbungen" : "Aktuelle Kontaktanfragen";
-    byId("service-heading").textContent = career ? "BEREICH" : "LEISTUNG";
+    const quote = currentType === "quote", appointment = currentType === "appointment", customer = currentType === "customer";
+    byId("page-title").textContent = customer ? "Kunden" : appointment ? "Termine" : quote ? "Angebotsanfragen" : career ? "Bewerbungen" : "Kontaktanfragen";
+    byId("records-title").textContent = customer ? "Registrierte Kunden" : appointment ? "Gebuchte Termine" : quote ? "Aktuelle Angebotsanfragen" : career ? "Aktuelle Bewerbungen" : "Aktuelle Kontaktanfragen";
+    byId("service-heading").textContent = appointment || quote ? "DIENSTLEISTUNG / ORT" : career ? "BEREICH" : "LEISTUNG";
     document.querySelectorAll(".nav-item").forEach(button => {
         button.classList.toggle("is-active", button.dataset.type === currentType);
+    });
+    const quoteOnlyStatuses = new Set(["offer_sent", "accepted", "declined", "completed"]);
+    byId("status-filter").querySelectorAll("option").forEach(option => {
+        option.hidden = quoteOnlyStatuses.has(option.value) ? !quote : option.value === "done" ? quote : false;
     });
 }
 
@@ -108,24 +118,35 @@ async function loadSummary() {
     }
 }
 
+async function loadQuoteNavCount() {
+    try {
+        const result = await api("/api/admin/quotes?status=new&page=1");
+        byId("nav-quote-count").textContent = result.total;
+    } catch {
+        // The quote migration may not be installed yet; the existing dashboard remains usable.
+        byId("nav-quote-count").textContent = "—";
+    }
+}
+
 function renderRecords(rows) {
     currentRows = rows;
     recordsBody.innerHTML = rows.map((row, index) => {
-        const label = currentType === "career" ? row.area : row.requested_service;
+        const quote = currentType === "quote", appointment = currentType === "appointment";
+        const label = (quote || appointment) ? `${appointment ? row.service : row.requested_service || "—"}<div class="person-phone">${row.city || ""}</div>` : currentType === "career" ? row.area : row.requested_service;
         const status = statusLabels[row.status] ? row.status : "new";
         const phone = row.phone ? `<div class="person-phone">${escapeHtml(row.phone)}</div>` : "";
         return `
             <tr>
                 <td class="date-cell">${escapeHtml(formatDate(row.created_at))}</td>
                 <td class="person-cell">
-                    <strong>${escapeHtml(row.full_name)}</strong>
+                    <strong>${escapeHtml((quote || appointment) ? `${row.first_name || ""} ${row.last_name || ""}`.trim() : row.full_name)}</strong>
                     <a href="mailto:${escapeHtml(row.email)}">${escapeHtml(row.email)}</a>
                     ${phone}
                 </td>
-                <td class="service-cell">${escapeHtml(label || "—")}</td>
-                <td class="message-cell"><span class="message-preview">${escapeHtml(row.message || "")}</span></td>
+                <td class="service-cell">${quote ? label : escapeHtml(label || "—")}</td>
+                <td class="message-cell"><span class="message-preview">${escapeHtml(quote ? (row.object_type || "") : (row.message || ""))}</span></td>
                 <td class="status-cell">
-                    <span class="status-pill" data-status="${status}">${statusLabels[status]}</span>
+                    ${(quote || appointment) ? `<select class="status-select" data-managed-status="${escapeHtml(row.id)}">${Object.entries(statusLabels).filter(([value]) => value !== "done" && (appointment ? ["pending","confirmed","in_progress","completed","cancelled"].includes(value) : !["pending","confirmed","cancelled"].includes(value))).map(([value, text]) => `<option value="${value}" ${value === status ? "selected" : ""}>${text}</option>`).join("")}</select>` : `<span class="status-pill" data-status="${status}">${statusLabels[status]}</span>`}
                 </td>
                 <td><button class="detail-button" type="button" data-record-index="${index}">Ansehen</button></td>
             </tr>`;
@@ -151,7 +172,9 @@ async function loadSubmissions() {
     });
 
     try {
-        const result = await api(`/api/admin/submissions?${params.toString()}`);
+        const endpoint = currentType === "quote" ? "/api/admin/quotes" : currentType === "appointment" ? "/api/admin/appointments" : currentType === "customer" ? "/api/admin/customers" : "/api/admin/submissions";
+        const result = await api(`${endpoint}?${params.toString()}`);
+        if (currentType === "quote") byId("nav-quote-count").textContent = result.rows.filter(row => row.status === "new").length;
         renderRecords(result.rows);
         const first = result.total === 0 ? 0 : (result.page - 1) * result.pageSize + 1;
         const last = Math.min(result.page * result.pageSize, result.total);
@@ -178,12 +201,34 @@ async function loadSubmissions() {
 }
 
 async function reloadDashboard() {
-    await Promise.all([loadSummary(), loadSubmissions()]);
+    await Promise.all([loadSummary(), loadSubmissions(), loadQuoteNavCount()]);
 }
 
-function openDetails(index) {
+async function openDetails(index) {
     const row = currentRows[index];
     if (!row) return;
+    if (currentType === "appointment") {
+        try { const result = await api(`/api/admin/appointments/${row.id}`); const appointment = result.appointment; byId("detail-type").textContent = `TERMIN #${appointment.id}`; byId("detail-name").textContent = `${appointment.first_name} ${appointment.last_name}`; byId("detail-date").textContent = `${appointment.preferred_date} · ${String(appointment.start_time).slice(0,5)} Uhr`; byId("detail-service").textContent = appointment.service; byId("detail-message").textContent = appointment.message || "—"; const email = byId("detail-email"); email.textContent = appointment.email; email.href = `mailto:${appointment.email}`; byId("detail-phone-row").hidden = false; byId("detail-phone").textContent = appointment.phone; byId("detail-quote-extra").hidden = false; byId("detail-quote-values").textContent = `${appointment.object_type} · ${appointment.address}, ${appointment.postal_code} ${appointment.city}`; byId("detail-files").hidden = true; byId("detail-dialog").showModal(); } catch (error) { setNotice(error.message); } return;
+    }
+    if (currentType === "quote") {
+        try {
+            const result = await api(`/api/admin/quotes/${row.id}`);
+            const quote = result.quote;
+            byId("detail-type").textContent = `ANGEBOTSANFRAGE #${quote.id}`;
+            byId("detail-name").textContent = `${quote.first_name} ${quote.last_name}`;
+            byId("detail-date").textContent = formatDate(quote.created_at);
+            byId("detail-service").textContent = quote.requested_service || "—";
+            byId("detail-message").textContent = quote.message || quote.additional_information || "—";
+            const email = byId("detail-email"); email.textContent = quote.email; email.href = `mailto:${quote.email}`;
+            byId("detail-phone-row").hidden = false; byId("detail-phone").textContent = quote.phone || "—";
+            byId("detail-quote-extra").hidden = false;
+            byId("detail-quote-values").textContent = `${quote.object_type} · ${quote.address}, ${quote.postal_code} ${quote.city}${quote.area_m2 ? ` · ${quote.area_m2} m²` : ""}${quote.frequency ? ` · ${quote.frequency}` : ""}${quote.preferred_date ? ` · Wunschtermin: ${quote.preferred_date}` : ""}`;
+            byId("detail-files").hidden = result.files.length === 0;
+            byId("detail-file-links").innerHTML = result.files.map(file => `<a href="/api/admin/quotes/${quote.id}/files/${file.id}">${escapeHtml(file.original_name)}</a>`).join("<br>") || "—";
+            byId("detail-dialog").showModal();
+        } catch (error) { setNotice(error.message); }
+        return;
+    }
     const career = currentType === "career";
     byId("detail-type").textContent = career ? "BEWERBUNG" : "KONTAKTANFRAGE";
     byId("detail-name").textContent = row.full_name || "—";
@@ -196,6 +241,8 @@ function openDetails(index) {
     else email.removeAttribute("href");
     byId("detail-phone-row").hidden = !row.phone;
     byId("detail-phone").textContent = row.phone || "—";
+    byId("detail-quote-extra").hidden = true;
+    byId("detail-files").hidden = true;
     byId("detail-dialog").showModal();
 }
 
@@ -241,6 +288,7 @@ document.querySelectorAll(".nav-item").forEach(button => {
         if (currentType === button.dataset.type) return;
         currentType = button.dataset.type;
         currentPage = 1;
+        byId("status-filter").value = "all";
         updateViewHeading();
         loadSubmissions();
     });
@@ -275,6 +323,17 @@ byId("refresh-button").addEventListener("click", reloadDashboard);
 recordsBody.addEventListener("click", event => {
     const button = event.target.closest("[data-record-index]");
     if (button?.classList.contains("detail-button")) openDetails(Number(button.dataset.recordIndex));
+});
+
+recordsBody.addEventListener("change", async event => {
+    const select = event.target.closest("[data-managed-status]");
+    if (!select) return;
+    select.disabled = true;
+    try {
+        const endpoint = currentType === "appointment" ? "/api/admin/appointments" : "/api/admin/quotes";
+        await api(`${endpoint}/${select.dataset.managedStatus}`, { method: "PATCH", body: JSON.stringify({ status: select.value }) });
+        await reloadDashboard();
+    } catch (error) { setNotice(error.message); } finally { select.disabled = false; }
 });
 
 byId("logout-button").addEventListener("click", async () => {

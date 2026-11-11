@@ -1,3 +1,4 @@
 .env
 database/bootstrap-user.temp.sql
 node_modules/
+storage/quote-uploads/

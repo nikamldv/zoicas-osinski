@@ -71,6 +71,52 @@ FLUSH PRIVILEGES;
 
 GitHub Pages فقط فایل‌های ایستا را اجرا می‌کند و API سرور Node.js یا MySQL را اجرا نمی‌کند. به همین دلیل فایل داشبورد از خروجی GitHub Pages کنار گذاشته شده است؛ صفحهٔ مدیریت باید روی میزبانی‌ای باز شود که `server.js` و MySQL را اجرا می‌کند.
 
+## ۵. درخواست آنلاینِ پیشنهاد قیمت (Phase 3)
+
+ابتدا migration افزایشی را با حساب مدیریتی MySQL اجرا کنید. این migration هیچ جدول یا دادهٔ قبلی را حذف نمی‌کند:
+
+```powershell
+Get-Content database/migrations/001_quote_requests.sql | mysql -u root -p
+```
+
+سپس مجوزها را با حساب مدیریتی اجرا کنید (دستورها در انتهای migration نیز آمده‌اند):
+
+```sql
+GRANT INSERT ON zoicas_osinski.quote_requests TO 'zoicas_app'@'127.0.0.1';
+GRANT INSERT ON zoicas_osinski.quote_request_files TO 'zoicas_app'@'127.0.0.1';
+GRANT SELECT, UPDATE ON zoicas_osinski.quote_requests TO 'zoicas_dashboard'@'127.0.0.1';
+GRANT SELECT ON zoicas_osinski.quote_request_files TO 'zoicas_dashboard'@'127.0.0.1';
+FLUSH PRIVILEGES;
+```
+
+فرم عمومی در `/public/angebot.html` داده‌ها را با `POST /api/quotes` ارسال می‌کند. فایل‌ها فقط JPG، PNG یا PDF هستند، حداکثر ۵ فایل و هر فایل حداکثر ۵ MB. آن‌ها خارج از مسیر عمومی سایت در `storage/quote-uploads` ذخیره می‌شوند، نام تصادفی دارند و فقط مدیر واردشده از طریق API خصوصی می‌تواند آن‌ها را دریافت کند.
+
+APIهای مدیر:
+
+- `GET /api/admin/quotes`
+- `GET /api/admin/quotes/:id`
+- `PATCH /api/admin/quotes/:id`
+- `GET /api/admin/quotes/:id/files/:fileId`
+
+## ۶. رزرو آنلاین (Phase 4)
+
+پیش از اجرا backup جدید در `database/schema-backups/pre-appointments-migration.sql` ساخته شده است. سپس migration افزایشی زیر را با حساب مدیر MySQL اجرا کنید:
+
+```powershell
+Get-Content database/migrations/002_appointments.sql | mysql -u root -p
+```
+
+برای ساعت‌های رزرو، ساعت فرضی منتشر نکنید. فقط پس از تأیید ساعت‌های کاری شرکت، در `.env` وارد کنید:
+
+```env
+BOOKING_SLOT_TIMES=09:00,10:00,11:00
+BOOKING_SLOT_DURATION_MINUTES=60
+```
+
+وقتی این مقادیر خالی باشند، صفحهٔ رزرو به‌درستی هیچ زمان آزادی نمایش نمی‌دهد. APIهای آن `/api/appointments/availability`، `/api/appointments` و endpointهای خصوصی `/api/admin/appointments` هستند.
+
+متغیرهای SMTP در `.env.example` فقط برای آماده‌سازی آینده هستند. تا زمانی که یک سرویس ایمیل جداگانه پیکربندی نشود، هیچ ایمیلی ارسال نمی‌شود.
+
 ## دیدن درخواست‌های ذخیره‌شده
 
 با حساب مدیریتی MySQL این پرس‌وجوها را اجرا کنید:

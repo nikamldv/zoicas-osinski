@@ -210,6 +210,19 @@ button { color: inherit; }
 .filter-select { height: 40px; min-width: 145px; padding: 0 30px 0 11px; border: 1px solid #e0e7ee; border-radius: 8px; outline: 0; color: #415a74; background: #fff; font-size: .75rem; }
 .dashboard-message { margin: 0 24px 13px; padding: 11px 13px; border-radius: 8px; color: #994c35; background: #fff4ef; font-size: .78rem; }
 .dashboard-message.is-success { color: #257357; background: #edf8f3; }
+
+.status-select {
+    max-width: 150px;
+    padding: 7px 9px;
+    border: 1px solid #d8e1e8;
+    border-radius: 7px;
+    background: #fff;
+    color: #17314d;
+    font: inherit;
+    font-size: 12px;
+}
+
+.detail-message a { color: #167fc5; text-decoration: underline; text-underline-offset: 3px; }
 .table-wrap { position: relative; min-height: 195px; overflow-x: auto; border-top: 1px solid #edf0f4; }
 table { width: 100%; border-collapse: collapse; text-align: left; }
 thead { background: #fafbfd; }

@@ -49,6 +49,15 @@
                     <span>Bewerbungen</span>
                     <span id="nav-career-count" class="nav-count">0</span>
                 </button>
+                <button class="nav-item" type="button" data-type="quote">
+                    <span class="nav-icon" aria-hidden="true">€</span>
+                    <span>Angebotsanfragen</span>
+                    <span id="nav-quote-count" class="nav-count">0</span>
+                </button>
+                <button class="nav-item" type="button" data-type="appointment">
+                    <span class="nav-icon" aria-hidden="true">◷</span><span>Termine</span><span id="nav-appointment-count" class="nav-count">0</span>
+                </button>
+                <button class="nav-item" type="button" data-type="customer"><span class="nav-icon" aria-hidden="true">◉</span><span>Kunden</span><span class="nav-count">—</span></button>
             </nav>
             <div class="sidebar-bottom">
                 <a class="back-link" href="../index.html">Website ansehen <span aria-hidden="true">↗</span></a>
@@ -113,6 +122,10 @@
                         <option value="all">Alle Status</option>
                         <option value="new">Neu</option>
                         <option value="in_progress">In Bearbeitung</option>
+                        <option value="offer_sent">Angebot gesendet</option>
+                        <option value="accepted">Angenommen</option>
+                        <option value="declined">Abgelehnt</option>
+                        <option value="completed">Abgeschlossen</option>
                         <option value="done">Erledigt</option>
                     </select>
                 </div>
@@ -163,6 +176,8 @@
             <div id="detail-phone-row" hidden><dt>Telefon</dt><dd id="detail-phone">—</dd></div>
         </dl>
         <div class="detail-message"><span>Nachricht</span><p id="detail-message">—</p></div>
+        <div id="detail-quote-extra" class="detail-message" hidden><span>Objekt &amp; Anfrage</span><p id="detail-quote-values">—</p></div>
+        <div id="detail-files" class="detail-message" hidden><span>Dateien</span><p id="detail-file-links">—</p></div>
     </dialog>
 </body>
 </html>

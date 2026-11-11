@@ -1,0 +1,10 @@
+User-agent: *
+Allow: /
+Disallow: /admin.html
+Disallow: /public/kundenportal.html
+Disallow: /public/kunden-anmelden.html
+Disallow: /public/kunden-registrieren.html
+Disallow: /public/kundenbereich.html
+Disallow: /api/
+
+Sitemap: https://nikamldv.github.io/zoicas-osinski/sitemap.xml
