@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="robots" content="noindex,nofollow">
+    <title>Mitarbeiterportal | Zoicas &amp; Osinski</title>
+    <link rel="stylesheet" href="../Css/cinematic.css">
+    <script src="../js/employee-portal.js" defer></script>
+</head>
+<body class="service-page">
+    <header class="employee-brandbar"><a href="../index.html#home" class="employee-brand"><img src="../assets/images/Logo/zoicas-osinski.svg" alt="Zoicas &amp; Osinski"></a></header>
+    <main class="employee-portal-shell">
+        <section id="employee-dashboard" class="employee-dashboard" hidden>
+            <aside class="employee-sidebar">
+                <strong> Mitarbeiterportal <small>ZOICAS &amp; OSINSKI</small></strong>
+                <button class="is-active" data-employee-view="overview" type="button">Übersicht</button>
+                <button data-employee-view="tasks" type="button">Meine Aufgaben</button>
+                <button data-employee-view="appointments" type="button">Meine Termine</button>
+                <button data-employee-view="work" type="button">Arbeitszeit</button>
+                <button data-employee-view="documents" type="button">Dokumentation</button>
+                <button data-employee-view="profile" type="button">Mein Profil</button>
+                <button id="employee-logout" type="button">Abmelden</button>
+            </aside>
+            <section class="employee-content">
+                <header><p class="section-kicker">MITARBEITERBEREICH</p><h1 id="employee-title">Willkommen</h1><p id="employee-subtitle">Ihre heutigen Aufgaben und Arbeitszeiten im Überblick.</p></header>
+                <p id="employee-notice" class="dashboard-message" role="status" aria-live="polite" hidden></p>
+
+                <div id="employee-overview" class="employee-view">
+                    <div class="portal-data">
+                        <article><strong id="overview-open">—</strong><p>Offene Aufgaben</p></article>
+                        <article><strong id="overview-today">—</strong><p>Aufgaben für heute</p></article>
+                        <article><strong id="overview-hours">—</strong><p>Erfasste Stunden heute</p></article>
+                    </div>
+                    <section class="employee-panel"><h2>Heutige Aufgaben</h2><div id="overview-tasks" class="employee-list"></div></section>
+                </div>
+
+                <div id="employee-tasks" class="employee-view" hidden>
+                    <section class="employee-panel"><h2>Meine Aufgaben</h2><div id="task-list" class="employee-list"></div></section>
+                </div>
+
+                <div id="employee-appointments" class="employee-view" hidden>
+                    <section class="employee-panel"><h2>Meine Termine</h2><div id="appointment-list" class="employee-list"></div></section>
+                </div>
+
+                <div id="employee-work" class="employee-view" hidden>
+                    <section class="employee-panel"><h2>Arbeitszeit erfassen</h2><form id="work-log-form" class="employee-form"><label>Datum<input name="work_date" type="date" required></label><label>Beginn<input name="start_time" type="time" required></label><label>Ende<input name="end_time" type="time" required></label><label>Pause (Min.)<input name="break_minutes" type="number" min="0" max="720" value="0" required></label><label>Aufgabe<select id="work-task" name="task_id"><option value="">Ohne Zuordnung</option></select></label><label class="wide">Notiz<textarea name="notes" maxlength="4000"></textarea></label><button class="button button-primary" type="submit">Arbeitszeit speichern</button></form></section><section class="employee-panel"><h2>Meine Einträge</h2><div id="work-log-list" class="employee-list"></div></section>
+                </div>
+
+                <div id="employee-documents" class="employee-view" hidden>
+                    <section class="employee-panel"><h2>Dokumentation hochladen</h2><form id="document-form" class="employee-form" enctype="multipart/form-data"><label>Aufgabe<select id="document-task" name="task_id" required><option value="">Aufgabe wählen</option></select></label><label>Datei<input name="document" type="file" accept="image/jpeg,image/png,application/pdf" required></label><label class="wide">Beschreibung<textarea name="description" maxlength="1000"></textarea></label><button class="button button-primary" type="submit">Dokument hochladen</button></form><p class="form-note">Erlaubt: JPG, PNG oder PDF, maximal 5 MB. Dateien bleiben privat.</p></section><section class="employee-panel"><h2>Meine Dokumente</h2><div id="document-list" class="employee-list"></div></section>
+                </div>
+
+                <div id="employee-profile" class="employee-view" hidden>
+                    <section class="employee-panel"><h2>Mein Profil</h2><form id="employee-profile-form" class="employee-form"><label>Vorname<input name="first_name" required maxlength="80"></label><label>Nachname<input name="last_name" required maxlength="80"></label><label>E-Mail<input id="employee-email" name="email" disabled></label><label>Telefon<input name="phone" required maxlength="40"></label><label>Position<input id="employee-position" name="position" disabled></label><button class="button button-primary" type="submit">Profil speichern</button></form></section><section class="employee-panel"><h2>Passwort ändern</h2><form id="employee-password-form" class="employee-form"><label>Aktuelles Passwort<input name="current_password" type="password" required></label><label>Neues Passwort<input name="new_password" type="password" required minlength="12"></label><label>Passwort wiederholen<input name="password_confirmation" type="password" required minlength="12"></label><button class="button button-primary" type="submit">Passwort ändern</button></form></section>
+                </div>
+            </section>
+        </section>
+    </main>
+</body>
+</html>

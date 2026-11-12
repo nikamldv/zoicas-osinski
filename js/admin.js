@@ -87,17 +87,14 @@ function escapeHtml(value) {
 
 function updateViewHeading() {
     const career = currentType === "career";
-    const quote = currentType === "quote", appointment = currentType === "appointment", customer = currentType === "customer";
-    byId("page-title").textContent = customer ? "Kunden" : appointment ? "Termine" : quote ? "Angebotsanfragen" : career ? "Bewerbungen" : "Kontaktanfragen";
-    byId("records-title").textContent = customer ? "Registrierte Kunden" : appointment ? "Gebuchte Termine" : quote ? "Aktuelle Angebotsanfragen" : career ? "Aktuelle Bewerbungen" : "Aktuelle Kontaktanfragen";
-    byId("service-heading").textContent = appointment || quote ? "DIENSTLEISTUNG / ORT" : career ? "BEREICH" : "LEISTUNG";
-    document.querySelectorAll(".nav-item").forEach(button => {
-        button.classList.toggle("is-active", button.dataset.type === currentType);
-    });
+    const quote = currentType === "quote", appointment = currentType === "appointment", customer = currentType === "customer", employee = currentType === "employee";
+    byId("page-title").textContent = employee ? "Mitarbeiter" : customer ? "Kunden" : appointment ? "Termine" : quote ? "Angebotsanfragen" : career ? "Bewerbungen" : "Kontaktanfragen";
+    byId("records-title").textContent = employee ? "Mitarbeiterverwaltung" : customer ? "Registrierte Kunden" : appointment ? "Gebuchte Termine" : quote ? "Aktuelle Angebotsanfragen" : career ? "Aktuelle Bewerbungen" : "Aktuelle Kontaktanfragen";
+    byId("service-heading").textContent = employee ? "POSITION / ROLLE" : appointment || quote ? "DIENSTLEISTUNG / ORT" : career ? "BEREICH" : "LEISTUNG";
+    byId("create-employee-button").hidden = !employee;
+    document.querySelectorAll(".nav-item").forEach(button => button.classList.toggle("is-active", button.dataset.type === currentType));
     const quoteOnlyStatuses = new Set(["offer_sent", "accepted", "declined", "completed"]);
-    byId("status-filter").querySelectorAll("option").forEach(option => {
-        option.hidden = quoteOnlyStatuses.has(option.value) ? !quote : option.value === "done" ? quote : false;
-    });
+    byId("status-filter").querySelectorAll("option").forEach(option => { option.hidden = quoteOnlyStatuses.has(option.value) ? !quote : option.value === "done" ? quote : false; });
 }
 
 async function loadSummary() {
@@ -128,8 +125,30 @@ async function loadQuoteNavCount() {
     }
 }
 
+async function loadEmployeeNavCount() {
+    try {
+        const result = await api("/api/admin/employees?page=1");
+        byId("nav-employee-count").textContent = result.total;
+    } catch {
+        byId("nav-employee-count").textContent = "—";
+    }
+}
+
 function renderRecords(rows) {
     currentRows = rows;
+    if (currentType === "employee") {
+        recordsBody.innerHTML = rows.map((row, index) => `
+            <tr><td class="date-cell">${escapeHtml(formatDate(row.created_at))}</td>
+            <td class="person-cell"><strong>${escapeHtml(`${row.first_name} ${row.last_name}`)}</strong><a href="mailto:${escapeHtml(row.email)}">${escapeHtml(row.email)}</a><div class="person-phone">${escapeHtml(row.employee_number)}</div></td>
+            <td class="service-cell">${escapeHtml(row.position || "—")}<div class="person-phone">${escapeHtml(row.role)}</div></td>
+            <td class="message-cell"><span class="message-preview">${escapeHtml(row.phone || "—")}</span></td>
+            <td class="status-cell"><span class="status-pill" data-status="${row.status === "ACTIVE" ? "done" : "new"}">${escapeHtml(row.status)}</span></td>
+            <td><button class="detail-button" type="button" data-record-index="${index}">Ansehen</button></td></tr>`).join("");
+        const empty = rows.length === 0;
+        byId("empty-state").hidden = !empty;
+        document.querySelector(".table-wrap table").hidden = empty;
+        return;
+    }
     recordsBody.innerHTML = rows.map((row, index) => {
         const quote = currentType === "quote", appointment = currentType === "appointment";
         const label = (quote || appointment) ? `${appointment ? row.service : row.requested_service || "—"}<div class="person-phone">${row.city || ""}</div>` : currentType === "career" ? row.area : row.requested_service;
@@ -172,13 +191,13 @@ async function loadSubmissions() {
     });
 
     try {
-        const endpoint = currentType === "quote" ? "/api/admin/quotes" : currentType === "appointment" ? "/api/admin/appointments" : currentType === "customer" ? "/api/admin/customers" : "/api/admin/submissions";
+        const endpoint = currentType === "employee" ? "/api/admin/employees" : currentType === "quote" ? "/api/admin/quotes" : currentType === "appointment" ? "/api/admin/appointments" : currentType === "customer" ? "/api/admin/customers" : "/api/admin/submissions";
         const result = await api(`${endpoint}?${params.toString()}`);
         if (currentType === "quote") byId("nav-quote-count").textContent = result.rows.filter(row => row.status === "new").length;
         renderRecords(result.rows);
         const first = result.total === 0 ? 0 : (result.page - 1) * result.pageSize + 1;
         const last = Math.min(result.page * result.pageSize, result.total);
-        byId("result-count").textContent = `${result.total} Einträge`;
+        byId("result-count").textContent = `${result.total} ${currentType === "employee" ? "Mitarbeiter" : "Einträge"}`;
         byId("page-summary").textContent = result.total === 0
             ? "Keine Einträge"
             : `Einträge ${first}–${last} von ${result.total}`;
@@ -201,7 +220,7 @@ async function loadSubmissions() {
 }
 
 async function reloadDashboard() {
-    await Promise.all([loadSummary(), loadSubmissions(), loadQuoteNavCount()]);
+    await Promise.all([loadSummary(), loadSubmissions(), loadQuoteNavCount(), loadEmployeeNavCount()]);
 }
 
 async function openDetails(index) {
@@ -225,6 +244,23 @@ async function openDetails(index) {
             byId("detail-quote-values").textContent = `${quote.object_type} · ${quote.address}, ${quote.postal_code} ${quote.city}${quote.area_m2 ? ` · ${quote.area_m2} m²` : ""}${quote.frequency ? ` · ${quote.frequency}` : ""}${quote.preferred_date ? ` · Wunschtermin: ${quote.preferred_date}` : ""}`;
             byId("detail-files").hidden = result.files.length === 0;
             byId("detail-file-links").innerHTML = result.files.map(file => `<a href="/api/admin/quotes/${quote.id}/files/${file.id}">${escapeHtml(file.original_name)}</a>`).join("<br>") || "—";
+            byId("detail-dialog").showModal();
+        } catch (error) { setNotice(error.message); }
+        return;
+    }
+    if (currentType === "employee") {
+        try {
+            const result = await api(`/api/admin/employees/${row.id}`);
+            const employee = result.employee;
+            byId("detail-type").textContent = `MITARBEITER #${employee.id}`;
+            byId("detail-name").textContent = `${employee.first_name} ${employee.last_name}`;
+            byId("detail-date").textContent = formatDate(employee.created_at);
+            byId("detail-service").textContent = `${employee.position || "—"} · ${employee.role}`;
+            byId("detail-message").textContent = employee.notes || "Keine internen Notizen.";
+            const email = byId("detail-email"); email.textContent = employee.email; email.href = `mailto:${employee.email}`;
+            byId("detail-phone-row").hidden = false; byId("detail-phone").textContent = employee.phone;
+            byId("detail-quote-extra").hidden = false; byId("detail-quote-values").textContent = `${employee.employee_number} · ${employee.status}`;
+            byId("detail-files").hidden = true;
             byId("detail-dialog").showModal();
         } catch (error) { setNotice(error.message); }
         return;
@@ -319,6 +355,28 @@ byId("next-page").addEventListener("click", () => {
 });
 
 byId("refresh-button").addEventListener("click", reloadDashboard);
+
+byId("create-employee-button").addEventListener("click", () => {
+    byId("employee-form-note").hidden = true;
+    byId("employee-dialog").showModal();
+});
+
+byId("employee-create-form").addEventListener("submit", async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const note = byId("employee-form-note");
+    try {
+        const payload = Object.fromEntries(new FormData(form));
+        await api("/api/admin/employees", { method: "POST", body: JSON.stringify(payload) });
+        form.reset();
+        byId("employee-dialog").close();
+        setNotice("Mitarbeiter wurde angelegt.", "success");
+        await reloadDashboard();
+    } catch (error) {
+        note.textContent = error.message;
+        note.hidden = false;
+    }
+});
 
 recordsBody.addEventListener("click", event => {
     const button = event.target.closest("[data-record-index]");

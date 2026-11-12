@@ -331,3 +331,5 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+/* Phase 6 employee dialog uses the existing administration controls. */
+.admin-employee-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:22px}.admin-employee-form label{display:grid;gap:7px;color:#344a62;font-size:12px;font-weight:700}.admin-employee-form input,.admin-employee-form select,.admin-employee-form textarea{width:100%;padding:11px;border:1px solid #d9e4ec;border-radius:9px;background:#fff;color:#102943;font:inherit}.admin-employee-form textarea{min-height:80px;resize:vertical}.admin-form-wide{grid-column:1/-1}.admin-employee-form .form-message{grid-column:1/-1;margin:0}.admin-employee-form .button{justify-self:start}@media(max-width:600px){.admin-employee-form{grid-template-columns:1fr}}

@@ -6,6 +6,17 @@
 
 document.addEventListener("DOMContentLoaded", () => {
 
+    const themeKey = "zo-theme";
+    if (localStorage.getItem(themeKey) === "light") document.documentElement.dataset.theme = "light";
+    document.querySelectorAll(".header-inner").forEach(headerInner => {
+        if (headerInner.querySelector(".theme-toggle")) return;
+        const toggle = document.createElement("button");
+        toggle.className = "theme-toggle"; toggle.type = "button";
+        const renderTheme = () => { const light = document.documentElement.dataset.theme === "light"; toggle.innerHTML = `<span aria-hidden="true">${light ? "☾" : "☀"}</span><span class="theme-toggle-text">${light ? "Dunkel" : "Hell"}</span>`; };
+        toggle.addEventListener("click", () => { const light = document.documentElement.dataset.theme !== "light"; document.documentElement.dataset.theme = light ? "light" : "dark"; localStorage.setItem(themeKey, light ? "light" : "dark"); renderTheme(); });
+        headerInner.append(toggle); renderTheme();
+    });
+
     // One shared public navigation/footer keeps every website page consistent.
     const isServicePage = window.location.pathname.includes("/leistungen/");
     const publicPrefix = isServicePage ? "../" : window.location.pathname.includes("/public/") ? "" : "public/";
@@ -13,18 +24,83 @@ document.addEventListener("DOMContentLoaded", () => {
     const servicePrefix = isServicePage ? "" : `${publicPrefix}leistungen/`;
     const navMarkup = `
         <a href="${homePrefix}index.html#home">Startseite</a>
-        <a href="${homePrefix}index.html#leistungen">Leistungen</a>
+        <div class="nav-dropdown"><button class="nav-dropdown-toggle" type="button" aria-expanded="false">Leistungen <span>⌄</span></button><div class="nav-dropdown-menu">
+            <a href="${homePrefix}index.html#leistungen">Alle Leistungen</a>
+            <a href="${servicePrefix}reinigung.html">Reinigungsservice</a>
+            <a href="${servicePrefix}haushaltshilfe.html">Haushaltshilfe</a>
+            <a href="${servicePrefix}haushaltsaufloesung.html">Haushaltsauflösung</a>
+            <a href="${servicePrefix}entruempelung.html">Entrümpelung</a>
+            <a href="${servicePrefix}renovierung.html">Renovierung</a>
+            <a href="${servicePrefix}bueroreinigung.html">Büroreinigung</a>
+            <a href="${servicePrefix}fensterreinigung.html">Fensterreinigung</a>
+            <a href="${servicePrefix}grundreinigung.html">Grundreinigung</a>
+            <a href="${servicePrefix}treppenhausreinigung.html">Treppenhausreinigung</a>
+            <a href="${servicePrefix}bauendreinigung.html">Bauendreinigung</a>
+            <a href="${servicePrefix}praxis-gewerbereinigung.html">Praxis-/Gewerbereinigung</a>
+        </div></div>
         <a href="${publicPrefix}ueber-uns.html">Über uns</a>
-        <a href="${publicPrefix}einsatzgebiete.html">Einsatzgebiete</a>
         <a href="${publicPrefix}referenzen.html">Referenzen</a>
         <a href="${publicPrefix}karriere.html">Karriere</a>
-        <a href="${publicPrefix}faq.html">FAQ</a>
-        <a class="portal-link" href="${publicPrefix}kundenportal.html">Kundenportal</a>
-        <a class="mobile-nav-cta" href="${publicPrefix}kontakt.html">Kontakt aufnehmen →</a>`;
+        <a href="${publicPrefix}kontakt.html">Kontakt</a>`;
     document.querySelectorAll(".main-nav").forEach(nav => { nav.innerHTML = navMarkup; });
     document.querySelectorAll(".header-cta").forEach(link => { link.href = `${publicPrefix}angebot.html`; link.textContent = "Angebot anfordern →"; });
-    document.querySelectorAll(".site-footer").forEach(footer => {
+    document.querySelectorAll(".site-footer[data-normalize-footer]").forEach(footer => {
         footer.innerHTML = `<div class="footer-main"><div class="footer-column footer-about"><a href="${homePrefix}index.html#home" class="footer-brand">ZOICAS &amp; OSINSKI<span>REINIGUNGSSERVICE</span></a><p>Mehr Zeit für Sie. Mehr Qualität für Ihr Zuhause.</p><a class="footer-region" href="${publicPrefix}einsatzgebiete.html">Erfurt &amp; Umgebung bis 200 km</a></div><nav class="footer-column"><h3>Navigation</h3><a href="${homePrefix}index.html#home">Startseite</a><a href="${homePrefix}index.html#leistungen">Leistungen</a><a href="${publicPrefix}ueber-uns.html">Über uns</a><a href="${publicPrefix}referenzen.html">Referenzen</a><a href="${publicPrefix}karriere.html">Karriere</a></nav><nav class="footer-column"><h3>Service</h3><a href="${publicPrefix}angebot.html">Angebot anfordern</a><a href="${publicPrefix}termin-buchen.html">Termin buchen</a><a href="${publicPrefix}faq.html">FAQ</a><a href="${publicPrefix}kundenportal.html">Kundenportal</a></nav><div class="footer-column footer-contact"><h3>Kontakt</h3><a href="tel:+4915562875968">+49 1556 2875968</a><a href="mailto:zoicasundosinski@gmail.com">zoicasundosinski@gmail.com</a><a href="${publicPrefix}kontakt.html">Kontakt aufnehmen →</a></div></div><div class="footer-bottom"><span>© 2026 Zoicas &amp; Osinski.</span><div><a href="${publicPrefix}impressum.html">Impressum</a><a href="${publicPrefix}datenschutz.html">Datenschutz</a></div></div>`;
+    });
+
+    document.querySelectorAll(".site-footer[data-normalize-footer] .footer-main nav:first-of-type").forEach(nav => {
+        [["einsatzgebiete.html", "Einsatzgebiete"], ["galerie.html", "Galerie"], ["bewertungen.html", "Bewertungen"]].forEach(([file, label]) => {
+            if (Array.from(nav.links).some(link => link.textContent.trim() === label)) return;
+            const link = document.createElement("a");
+            link.href = `${publicPrefix}${file}`;
+            link.textContent = label;
+            nav.append(link);
+        });
+    });
+    document.querySelectorAll(".site-footer[data-normalize-footer] .footer-main nav:nth-of-type(2)").forEach(nav => {
+        const heading = nav.querySelector("h3");
+        if (heading) heading.innerHTML = `<a href="${homePrefix}index.html#leistungen">Leistungen</a>`;
+        if (!Array.from(nav.links).some(link => link.textContent.trim() === "Alle Leistungen")) {
+            const overview = document.createElement("a");
+            overview.href = `${homePrefix}index.html#leistungen`;
+            overview.textContent = "Alle Leistungen";
+            heading?.insertAdjacentElement("afterend", overview);
+        }
+        [["reinigung.html", "Reinigungsservice"], ["haushaltshilfe.html", "Haushaltshilfe"], ["haushaltsaufloesung.html", "Haushaltsauflösung"], ["entruempelung.html", "Entrümpelung"], ["renovierung.html", "Renovierung"], ["bueroreinigung.html", "Büroreinigung"], ["fensterreinigung.html", "Fensterreinigung"], ["grundreinigung.html", "Grundreinigung"], ["treppenhausreinigung.html", "Treppenhausreinigung"], ["bauendreinigung.html", "Bauendreinigung"], ["praxis-gewerbereinigung.html", "Praxis-/Gewerbereinigung"]].forEach(([file, label]) => {
+            if (Array.from(nav.links).some(link => link.textContent.trim() === label)) return;
+            const link = document.createElement("a");
+            link.href = `${servicePrefix}${file}`;
+            link.textContent = label;
+            nav.append(link);
+        });
+    });
+
+    const footerServices = [
+        ["reinigung.html", "Reinigungsservice"], ["haushaltshilfe.html", "Haushaltshilfe"],
+        ["haushaltsaufloesung.html", "Haushaltsauflösung"], ["entruempelung.html", "Entrümpelung"],
+        ["renovierung.html", "Renovierung"], ["bueroreinigung.html", "Büroreinigung"],
+        ["fensterreinigung.html", "Fensterreinigung"], ["grundreinigung.html", "Grundreinigung"],
+        ["treppenhausreinigung.html", "Treppenhausreinigung"], ["bauendreinigung.html", "Bauendreinigung"],
+        ["praxis-gewerbereinigung.html", "Praxis-/Gewerbereinigung"]
+    ];
+    document.querySelectorAll(".site-footer[data-normalize-footer] .footer-main nav:nth-of-type(2)").forEach(nav => {
+        nav.classList.add("footer-services");
+        nav.innerHTML = `<h3><a href="${homePrefix}index.html#leistungen">Leistungen</a></h3><div class="footer-services-dropdown"><button type="button" aria-expanded="false">Alle Leistungen <span>⌄</span></button><div class="footer-services-menu">${footerServices.map(([file, label]) => `<a href="${servicePrefix}${file}">${label}</a>`).join("")}</div></div>`;
+        const dropdown = nav.querySelector(".footer-services-dropdown");
+        const button = dropdown.querySelector("button");
+        button.addEventListener("click", () => { const open = dropdown.classList.toggle("open"); button.setAttribute("aria-expanded", String(open)); });
+    });
+
+    // Use direct footer children as a final safeguard for every existing footer markup variant.
+    document.querySelectorAll(".site-footer[data-normalize-footer] .footer-main").forEach(main => {
+        const footerNavs = Array.from(main.children).filter(child => child.tagName === "NAV");
+        const serviceNav = footerNavs[1];
+        if (!serviceNav) return;
+        serviceNav.classList.add("footer-services");
+        serviceNav.innerHTML = `<h3>Unsere Leistungen</h3><div class="footer-services-dropdown"><button type="button" aria-expanded="false">Leistungen <span>⌄</span></button><div class="footer-services-menu"><a href="${homePrefix}index.html#leistungen">Alle Leistungen</a>${footerServices.map(([file, label]) => `<a href="${servicePrefix}${file}">${label}</a>`).join("")}</div></div>`;
+        const dropdown = serviceNav.querySelector(".footer-services-dropdown");
+        const button = dropdown.querySelector("button");
+        button.addEventListener("click", () => { const open = dropdown.classList.toggle("open"); button.setAttribute("aria-expanded", String(open)); });
     });
 
     // Keep the growing services menu and essential public pages reachable from every page.
@@ -91,12 +167,14 @@ document.addEventListener("DOMContentLoaded", () => {
                 "aria-expanded",
                 String(isOpen)
             );
+            menuToggle.setAttribute("aria-label", isOpen ? "Menü schließen" : "Menü öffnen");
         });
 
         navLinks.forEach(link => {
             link.addEventListener("click", () => {
                 mainNav.classList.remove("active");
                 menuToggle.setAttribute("aria-expanded", "false");
+                menuToggle.setAttribute("aria-label", "Menü öffnen");
                 closeDropdowns();
             });
         });
@@ -109,6 +187,7 @@ document.addEventListener("DOMContentLoaded", () => {
             if (!clickedInsideMenu) {
                 mainNav.classList.remove("active");
                 menuToggle.setAttribute("aria-expanded", "false");
+                menuToggle.setAttribute("aria-label", "Menü öffnen");
                 closeDropdowns();
             }
         });
@@ -118,6 +197,7 @@ document.addEventListener("DOMContentLoaded", () => {
             closeDropdowns();
             mainNav.classList.remove("active");
             menuToggle.setAttribute("aria-expanded", "false");
+            menuToggle.setAttribute("aria-label", "Menü öffnen");
         });
     }
 
