@@ -17,6 +17,8 @@
                 <button class="is-active" data-employee-view="overview" type="button">Übersicht</button>
                 <button data-employee-view="tasks" type="button">Meine Aufgaben</button>
                 <button data-employee-view="appointments" type="button">Meine Termine</button>
+                <button data-employee-view="orders" type="button">Meine Aufträge</button>
+                <button data-employee-view="schedule" type="button">Mein Zeitplan</button>
                 <button data-employee-view="work" type="button">Arbeitszeit</button>
                 <button data-employee-view="documents" type="button">Dokumentation</button>
                 <button data-employee-view="profile" type="button">Mein Profil</button>
@@ -43,12 +45,20 @@
                     <section class="employee-panel"><h2>Meine Termine</h2><div id="appointment-list" class="employee-list"></div></section>
                 </div>
 
+                <div id="employee-orders" class="employee-view" hidden>
+                    <section class="employee-panel"><h2>Meine Aufträge</h2><div id="employee-order-list" class="employee-list"></div></section>
+                </div>
+
+                <div id="employee-schedule" class="employee-view" hidden>
+                    <section class="employee-panel"><div class="employee-schedule-head"><h2>Mein Zeitplan</h2><div><button id="employee-schedule-previous" class="button button-light" type="button">←</button><input id="employee-schedule-date" type="date"><button id="employee-schedule-next" class="button button-light" type="button">→</button><button id="employee-schedule-week" class="button button-light" type="button">Woche</button></div></div><div id="employee-schedule-list" class="employee-schedule-list"></div></section>
+                </div>
+
                 <div id="employee-work" class="employee-view" hidden>
-                    <section class="employee-panel"><h2>Arbeitszeit erfassen</h2><form id="work-log-form" class="employee-form"><label>Datum<input name="work_date" type="date" required></label><label>Beginn<input name="start_time" type="time" required></label><label>Ende<input name="end_time" type="time" required></label><label>Pause (Min.)<input name="break_minutes" type="number" min="0" max="720" value="0" required></label><label>Aufgabe<select id="work-task" name="task_id"><option value="">Ohne Zuordnung</option></select></label><label class="wide">Notiz<textarea name="notes" maxlength="4000"></textarea></label><button class="button button-primary" type="submit">Arbeitszeit speichern</button></form></section><section class="employee-panel"><h2>Meine Einträge</h2><div id="work-log-list" class="employee-list"></div></section>
+                    <section class="employee-panel"><h2>Arbeitszeit erfassen</h2><form id="work-log-form" class="employee-form"><label>Datum<input name="work_date" type="date" required></label><label>Beginn<input name="start_time" type="time" required></label><label>Ende<input name="end_time" type="time" required></label><label>Pause (Min.)<input name="break_minutes" type="number" min="0" max="720" value="0" required></label><label>Aufgabe<select id="work-task" name="task_id"><option value="">Ohne Zuordnung</option></select></label><label>Auftrag<select id="work-order" name="order_id"><option value="">Ohne Zuordnung</option></select></label><label class="wide">Notiz<textarea name="notes" maxlength="4000"></textarea></label><button class="button button-primary" type="submit">Arbeitszeit speichern</button></form></section><section class="employee-panel"><h2>Meine Einträge</h2><div id="work-log-list" class="employee-list"></div></section>
                 </div>
 
                 <div id="employee-documents" class="employee-view" hidden>
-                    <section class="employee-panel"><h2>Dokumentation hochladen</h2><form id="document-form" class="employee-form" enctype="multipart/form-data"><label>Aufgabe<select id="document-task" name="task_id" required><option value="">Aufgabe wählen</option></select></label><label>Datei<input name="document" type="file" accept="image/jpeg,image/png,application/pdf" required></label><label class="wide">Beschreibung<textarea name="description" maxlength="1000"></textarea></label><button class="button button-primary" type="submit">Dokument hochladen</button></form><p class="form-note">Erlaubt: JPG, PNG oder PDF, maximal 5 MB. Dateien bleiben privat.</p></section><section class="employee-panel"><h2>Meine Dokumente</h2><div id="document-list" class="employee-list"></div></section>
+                    <section class="employee-panel"><h2>Dokumentation hochladen</h2><form id="document-form" class="employee-form" enctype="multipart/form-data"><label>Aufgabe<select id="document-task" name="task_id" required><option value="">Aufgabe wählen</option></select></label><label>Auftrag<select id="document-order" name="order_id"><option value="">Ohne Auftragsbezug</option></select></label><label>Datei<input name="document" type="file" accept="image/jpeg,image/png,application/pdf" required></label><label class="wide">Beschreibung<textarea name="description" maxlength="1000"></textarea></label><button class="button button-primary" type="submit">Dokument hochladen</button></form><p class="form-note">Erlaubt: JPG, PNG oder PDF, maximal 5 MB. Dateien bleiben privat und sind nur berechtigten Mitarbeitenden zugänglich.</p></section><section class="employee-panel"><h2>Meine Dokumente</h2><div id="document-list" class="employee-list"></div></section>
                 </div>
 
                 <div id="employee-profile" class="employee-view" hidden>

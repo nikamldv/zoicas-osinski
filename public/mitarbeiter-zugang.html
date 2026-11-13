@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <meta name="theme-color" content="#071a36">
+    <title>Zugang aktivieren | Zoicas &amp; Osinski</title>
+    <link rel="stylesheet" href="../Css/cinematic.css">
+    <script src="../js/employee-activation.js" defer></script>
+</head>
+<body class="service-page">
+    <header class="employee-brandbar"><a href="../index.html#home" class="employee-brand"><img src="../assets/images/Logo/zoicas-osinski.svg" alt="Zoicas &amp; Osinski"></a></header>
+    <main class="employee-login-shell">
+        <section class="employee-login-intro">
+            <p class="section-kicker">ZOICAS &amp; OSINSKI / TEAM</p>
+            <h1>Ihr Zugang.<br><span>Persönlich geschützt.</span></h1>
+            <p>Bitte legen Sie ein persönliches Passwort für Ihr Mitarbeiterportal fest. Dieser Link kann nur einmal verwendet werden.</p>
+        </section>
+        <section class="employee-login-card" aria-labelledby="activation-title">
+            <a class="portal-back" href="mitarbeiter-anmelden.html">← Zur Anmeldung</a>
+            <p class="section-kicker">SICHERER ZUGANG</p>
+            <h2 id="activation-title">Zugang aktivieren</h2>
+            <p>Ihr Passwort muss mindestens 12 Zeichen sowie Groß- und Kleinbuchstaben und eine Zahl enthalten.</p>
+            <form id="employee-activation-form" class="portal-profile">
+                <input id="employee-invite-token" name="token" type="hidden">
+                <label for="employee-new-password">Neues Passwort<input id="employee-new-password" name="password" type="password" autocomplete="new-password" required minlength="12" maxlength="256"></label>
+                <label for="employee-password-confirmation">Passwort wiederholen<input id="employee-password-confirmation" name="password_confirmation" type="password" autocomplete="new-password" required minlength="12" maxlength="256"></label>
+                <button class="button button-primary" type="submit">Zugang aktivieren <span>→</span></button>
+            </form>
+            <p id="employee-activation-note" class="form-note" role="status" aria-live="polite"></p>
+        </section>
+    </main>
+</body>
+</html>

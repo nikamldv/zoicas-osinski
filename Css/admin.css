@@ -210,6 +210,7 @@ button { color: inherit; }
 .filter-select { height: 40px; min-width: 145px; padding: 0 30px 0 11px; border: 1px solid #e0e7ee; border-radius: 8px; outline: 0; color: #415a74; background: #fff; font-size: .75rem; }
 .dashboard-message { margin: 0 24px 13px; padding: 11px 13px; border-radius: 8px; color: #994c35; background: #fff4ef; font-size: .78rem; }
 .dashboard-message.is-success { color: #257357; background: #edf8f3; }
+.dashboard-message.is-warning { color: #745f18; background: #fff8de; }
 
 .status-select {
     max-width: 150px;
@@ -263,7 +264,7 @@ tbody tr:hover { background: #fbfdff; }
 
 .detail-dialog { width: min(92vw, 530px); max-height: min(84vh, 780px); overflow-y: auto; padding: 31px; border: 1px solid #e2e8ee; border-radius: 16px; color: var(--admin-ink); box-shadow: 0 25px 80px rgba(3,16,34,.28); }
 .detail-dialog::backdrop { background: rgba(5,20,39,.62); backdrop-filter: blur(3px); }
-.detail-dialog form { position: absolute; top: 16px; right: 16px; }
+.detail-dialog > form[method="dialog"] { position: absolute; top: 16px; right: 16px; }
 .dialog-close { width: 34px; height: 34px; border: 0; border-radius: 50%; color: #64798d; background: #f0f4f7; cursor: pointer; font-size: 1.35rem; line-height: 1; }
 .dialog-close:hover { color: #223e5b; background: #e4edf4; }
 .detail-dialog h2 { padding-right: 36px; font-size: 1.55rem; }
@@ -274,6 +275,20 @@ tbody tr:hover { background: #fbfdff; }
 .detail-meta dd { overflow-wrap: anywhere; margin: 6px 0 0; color: #39536d; font-size: .8rem; font-weight: 600; }
 .detail-message { margin-top: 20px; }
 .detail-message p { margin: 8px 0 0; color: #455b70; font-size: .84rem; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dialog-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 22px; }
+.dialog-actions .button { margin-top: 0; }
+.employee-task-summary a { color: #357eae; text-decoration: none; }
+.employee-task-summary a:hover { text-decoration: underline; }
+
+.order-dialog { width: min(94vw, 840px); }
+.order-dialog h3 { margin: 28px 0 14px; font: 700 1rem "Manrope", sans-serif; }
+.order-assignment-section { margin-top: 28px; padding-top: 4px; border-top: 1px solid var(--admin-line); }
+.assignment-list { display: grid; gap: 8px; margin-bottom: 16px; }
+.assignment-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid #e2eaf1; border-radius: 9px; background: #f9fbfd; color: #405b76; font-size: .78rem; }
+.assignment-row strong { color: #1f3e5d; }
+.assignment-actions { display: flex; gap: 7px; flex-wrap: wrap; }
+.assignment-actions button { min-height: 31px; padding: 0 9px; border: 1px solid #d6e2eb; border-radius: 7px; color: #315c7e; background: #fff; cursor: pointer; font: inherit; font-size: .7rem; }
+.assignment-actions .danger { color: #9b3b3b; border-color: #f0d2d2; }
 
 button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid rgba(49,139,198,.35); outline-offset: 2px; }
 
@@ -315,6 +330,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
     .privacy-note { align-items: flex-start; line-height: 1.55; }
 }
 
+@media (max-width: 560px) {
+    .order-dialog { width: calc(100vw - 20px); padding: 24px 17px; }
+    .assignment-row { align-items: flex-start; flex-direction: column; }
+}
+
 @media (max-width: 430px) {
     .topbar { flex-direction: column; }
     .topbar-right { width: 100%; flex-direction: row; justify-content: space-between; align-items: center; }
@@ -331,5 +351,112 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
-/* Phase 6 employee dialog uses the existing administration controls. */
-.admin-employee-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:22px}.admin-employee-form label{display:grid;gap:7px;color:#344a62;font-size:12px;font-weight:700}.admin-employee-form input,.admin-employee-form select,.admin-employee-form textarea{width:100%;padding:11px;border:1px solid #d9e4ec;border-radius:9px;background:#fff;color:#102943;font:inherit}.admin-employee-form textarea{min-height:80px;resize:vertical}.admin-form-wide{grid-column:1/-1}.admin-employee-form .form-message{grid-column:1/-1;margin:0}.admin-employee-form .button{justify-self:start}@media(max-width:600px){.admin-employee-form{grid-template-columns:1fr}}
+/* Employee creation dialog */
+.employee-dialog {
+    width: min(94vw, 920px);
+    max-height: min(88vh, 820px);
+    padding: 38px 42px 40px;
+}
+
+.employee-dialog h2 { font-size: clamp(1.65rem, 2.5vw, 2.1rem); }
+.employee-task-dialog { width: min(94vw, 760px); max-height: min(88vh, 780px); padding: 38px 42px 40px; }
+
+.employee-dialog-intro {
+    max-width: 620px;
+    margin: 11px 0 0;
+    color: #64798d;
+    font-size: .88rem;
+    line-height: 1.65;
+}
+
+.admin-employee-form {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px 20px;
+    margin-top: 28px;
+    position: static;
+    inset: auto;
+}
+
+.admin-employee-form label {
+    display: grid;
+    gap: 8px;
+    color: #344a62;
+    font-size: .78rem;
+    font-weight: 700;
+}
+
+.admin-employee-form input,
+.admin-employee-form select,
+.admin-employee-form textarea {
+    width: 100%;
+    min-height: 46px;
+    padding: 11px 13px;
+    border: 1px solid #d9e4ec;
+    border-radius: 10px;
+    outline: 0;
+    background: #fff;
+    color: #102943;
+    font: inherit;
+    transition: border-color .18s ease, box-shadow .18s ease;
+}
+
+.admin-employee-form input:focus,
+.admin-employee-form select:focus,
+.admin-employee-form textarea:focus {
+    border-color: #55a0d6;
+    box-shadow: 0 0 0 3px rgba(42,133,195,.13);
+}
+
+.admin-employee-form input[readonly] {
+    color: #6d8194;
+    background: #f5f8fb;
+    cursor: not-allowed;
+}
+
+.admin-employee-form textarea { min-height: 106px; resize: vertical; }
+.admin-form-wide { grid-column: 1 / -1; }
+
+.employee-invite-hint {
+    margin: 2px 0 0;
+    padding: 14px 16px;
+    border: 1px solid #d7eafa;
+    border-radius: 10px;
+    color: #31516e;
+    background: #eef7ff;
+    font-size: .82rem;
+    line-height: 1.55;
+}
+
+.admin-employee-form .form-message { grid-column: 1 / -1; margin: 0; }
+.admin-employee-form .button { min-width: 205px; justify-self: start; margin-top: 2px; }
+
+.schedule-panel { margin: 0 0 26px; padding: 28px; border: 1px solid #dce8f0; border-radius: 18px; background: #fff; box-shadow: 0 14px 32px rgba(18, 57, 89, .06); }
+.schedule-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.schedule-controls input { min-height: 42px; padding: 0 10px; border: 1px solid #d6e2eb; border-radius: 9px; color: #173550; font: inherit; }
+.schedule-grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); margin-top: 20px; }
+.schedule-day { min-width: 0; padding: 16px; border: 1px solid #dfe9f0; border-radius: 13px; background: #f9fcfe; }
+.schedule-day > h3 { margin: 0 0 13px; color: #193c5f; font-size: .95rem; }
+.schedule-employee { padding: 12px 0; border-top: 1px solid #e2ebf1; }
+.schedule-employee:first-of-type { border-top: 0; }
+.schedule-employee header { display: flex; justify-content: space-between; gap: 10px; color: #173550; font-size: .83rem; }
+.schedule-employee header small { color: #628099; font-weight: 600; }
+.schedule-lane { min-height: 38px; margin-top: 7px; padding: 5px; border-radius: 8px; background: #e9f1f6; }
+.schedule-block { display: grid; gap: 2px; padding: 7px 9px; border-radius: 6px; color: #fff; background: #176d9d; font-size: .72rem; }
+.schedule-block span { opacity: .9; }
+.schedule-free { display: block; padding: 6px 8px; color: #438147; font-size: .75rem; font-weight: 700; }
+.schedule-absence { margin-top: 7px; padding: 7px 9px; border-radius: 7px; color: #963b3b; background: #fdeaea; font-size: .72rem; font-weight: 800; }
+.absence-summary { margin-top: 22px; }.absence-summary h3 { color: #1b405f; font-size: .9rem; }
+.availability-box { grid-column: 1 / -1; padding: 13px; border: 1px solid #d9e7ef; border-radius: 10px; background: #f8fbfd; }.availability-box h4 { margin: 0 0 8px; color: #284a67; font-size: .82rem; }
+.availability-list { display: grid; gap: 7px; }.availability-row { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; border: 1px solid #dce7ee; border-radius: 8px; background: #fff; color: #27445e; text-align: left; font: inherit; font-size: .76rem; cursor: pointer; }.availability-row span { color: #668198; }.availability-row em { color: #52952b; font-style: normal; font-weight: 800; }.availability-row.is-available strong { color: #378244; }.availability-row.is-unavailable { opacity: .76; cursor: not-allowed; }.availability-row.is-unavailable strong { color: #ac4141; }
+.work-hours-rows { display: grid; gap: 8px; }.work-hours-row { display: grid !important; grid-template-columns: minmax(120px,1fr) 105px auto 105px; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid #e6edf2; color: #29475f !important; }.work-hours-row span:first-child { font-weight: 700; }.work-hours-row input[type="checkbox"] { width: auto; min-height: auto; margin-right: 5px; }.work-hours-row input[type="time"] { min-height: 38px; padding: 7px 9px; }
+
+@media (max-width: 600px) {
+    .employee-dialog { width: min(94vw, 520px); max-height: 92vh; padding: 32px 21px 26px; }
+    .employee-task-dialog { width: min(94vw, 520px); max-height: 92vh; padding: 32px 21px 26px; }
+    .employee-dialog-intro { font-size: .82rem; }
+    .admin-employee-form { grid-template-columns: 1fr; gap: 15px; margin-top: 23px; }
+    .admin-employee-form .button { width: 100%; }
+    .schedule-panel { padding: 18px 14px; }.schedule-controls { align-items: stretch; }.schedule-controls input, .schedule-controls .button { flex: 1 1 42%; }.availability-row { grid-template-columns: 1fr; gap: 3px; }
+    .work-hours-row { grid-template-columns: 1fr 1fr; }.work-hours-row > span:nth-child(3) { display: none; }
+}

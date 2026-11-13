@@ -59,6 +59,8 @@
                 </button>
                 <button class="nav-item" type="button" data-type="customer"><span class="nav-icon" aria-hidden="true">◉</span><span>Kunden</span><span class="nav-count">—</span></button>
                 <button class="nav-item" type="button" data-type="employee"><span class="nav-icon" aria-hidden="true">★</span><span>Mitarbeiter</span><span id="nav-employee-count" class="nav-count">—</span></button>
+                <button class="nav-item" type="button" data-type="order"><span class="nav-icon" aria-hidden="true">▣</span><span>Aufträge</span><span id="nav-order-count" class="nav-count">—</span></button>
+                <button class="nav-item" type="button" data-type="schedule"><span class="nav-icon" aria-hidden="true">▤</span><span>Einsatzplanung</span><span class="nav-count">↗</span></button>
             </nav>
             <div class="sidebar-bottom">
                 <a class="back-link" href="../index.html">Website ansehen <span aria-hidden="true">↗</span></a>
@@ -79,6 +81,7 @@
                 <div class="topbar-right">
                     <span class="live-indicator"><span></span> Datenbank verbunden</span>
                     <button id="create-employee-button" class="button button-primary" type="button" hidden>Mitarbeiter anlegen</button>
+                    <button id="create-order-button" class="button button-primary" type="button" hidden>Auftrag anlegen</button>
                     <button id="refresh-button" class="button button-light" type="button"><span aria-hidden="true">⟳</span> Aktualisieren</button>
                 </div>
             </header>
@@ -106,6 +109,13 @@
                 </article>
             </section>
 
+            <section id="schedule-panel" class="schedule-panel" hidden aria-labelledby="schedule-title">
+                <div class="records-heading"><div><p class="eyebrow">EINSATZPLANUNG</p><h2 id="schedule-title">Tagesansicht</h2></div><div class="schedule-controls"><button id="schedule-previous" class="button button-light" type="button">←</button><input id="schedule-date" type="date"><button id="schedule-next" class="button button-light" type="button">→</button><button id="schedule-week" class="button button-light" type="button">Wochenansicht</button><button id="create-absence-button" class="button button-primary" type="button">Abwesenheit eintragen</button></div></div>
+                <p id="schedule-note" class="form-note">Arbeitszeiten, Abwesenheiten und bereits geplante Einsätze im Überblick.</p>
+                <div id="schedule-grid" class="schedule-grid" aria-live="polite"></div>
+                <section class="absence-summary"><h3>Abwesenheiten</h3><div id="absence-list" class="assignment-list"></div></section>
+            </section>
+
             <section class="records-panel" aria-labelledby="records-title">
                 <div class="records-heading">
                     <div>
@@ -129,6 +139,15 @@
                         <option value="declined">Abgelehnt</option>
                         <option value="completed">Abgeschlossen</option>
                         <option value="done">Erledigt</option>
+                        <option value="ACTIVE">Aktiv</option>
+                        <option value="INACTIVE">Inaktiv</option>
+                        <option value="NEU">Neu</option>
+                        <option value="GEPLANT">Geplant</option>
+                        <option value="ZUGEWIESEN">Zugewiesen</option>
+                        <option value="IN_BEARBEITUNG">In Bearbeitung</option>
+                        <option value="PAUSIERT">Pausiert</option>
+                        <option value="ERLEDIGT">Erledigt</option>
+                        <option value="STORNIERT">Storniert</option>
                     </select>
                 </div>
 
@@ -180,19 +199,92 @@
         <div class="detail-message"><span>Nachricht</span><p id="detail-message">—</p></div>
         <div id="detail-quote-extra" class="detail-message" hidden><span>Objekt &amp; Anfrage</span><p id="detail-quote-values">—</p></div>
         <div id="detail-files" class="detail-message" hidden><span>Dateien</span><p id="detail-file-links">—</p></div>
+        <div id="employee-task-summary" class="detail-message" hidden><span>Aufgaben</span><p id="employee-task-list">—</p></div>
+        <div id="employee-detail-actions" class="dialog-actions" hidden>
+            <button id="edit-employee-button" class="button button-light" type="button">Mitarbeiter bearbeiten</button>
+            <button id="edit-work-hours-button" class="button button-light" type="button">Arbeitszeiten</button>
+            <button id="assign-task-button" class="button button-primary" type="button">Aufgabe zuweisen</button>
+        </div>
+        <button id="create-order-from-appointment" class="button button-primary" type="button" hidden>Auftrag aus Termin erstellen</button>
+        <button id="resend-employee-invite" class="button button-light" type="button" hidden>Einladung erneut senden</button>
     </dialog>
-    <dialog id="employee-dialog" class="detail-dialog" aria-labelledby="employee-dialog-title">
+    <dialog id="employee-dialog" class="detail-dialog employee-dialog" aria-labelledby="employee-dialog-title">
         <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
         <p class="eyebrow">MITARBEITERVERWALTUNG</p><h2 id="employee-dialog-title">Mitarbeiter anlegen</h2>
+        <p id="employee-dialog-intro" class="employee-dialog-intro">Erfassen Sie die Stammdaten. Nach dem Speichern erhält die Person einen sicheren Link zur eigenen Passwortvergabe.</p>
         <form id="employee-create-form" class="admin-employee-form">
             <label>Vorname<input name="first_name" required maxlength="80"></label><label>Nachname<input name="last_name" required maxlength="80"></label>
             <label>E-Mail<input name="email" type="email" required maxlength="254"></label><label>Telefon<input name="phone" required maxlength="40"></label>
-            <label>Mitarbeiternummer<input name="employee_number" required maxlength="40"></label><label>Position<input name="position" maxlength="120"></label>
+            <label>Mitarbeiternummer<input id="employee-number" name="employee_number" readonly maxlength="40" placeholder="Wird automatisch vergeben"></label><label>Position<input name="position" maxlength="120"></label>
             <label>Rolle<select name="role"><option>EMPLOYEE</option><option>MANAGER</option><option>ADMIN</option></select></label><label>Eintrittsdatum<input name="hire_date" type="date"></label>
-            <label>Passwort<input name="password" type="password" required minlength="12"></label><label>Passwort wiederholen<input name="password_confirmation" type="password" required minlength="12"></label>
+            <label id="employee-status-field" hidden>Status<select name="status"><option value="ACTIVE">Aktiv</option><option value="INACTIVE">Inaktiv</option></select></label>
+            <p class="admin-form-wide employee-invite-hint">Nach dem Speichern erhält die Person einen einmaligen, zeitlich begrenzten Link, um ihr eigenes Passwort festzulegen.</p>
             <label class="admin-form-wide">Interne Notiz<textarea name="notes" maxlength="4000"></textarea></label>
             <p id="employee-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Mitarbeiter speichern</button>
         </form>
+    </dialog>
+    <dialog id="employee-task-dialog" class="detail-dialog employee-task-dialog" aria-labelledby="employee-task-dialog-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <p class="eyebrow">AUFGABENVERWALTUNG</p><h2 id="employee-task-dialog-title">Aufgabe zuweisen</h2>
+        <p id="employee-task-dialog-intro" class="employee-dialog-intro"></p>
+        <form id="employee-task-form" class="admin-employee-form">
+            <input id="task-employee-id" name="employee_id" type="hidden">
+            <label class="admin-form-wide">Titel<input name="title" required maxlength="180"></label>
+            <label class="admin-form-wide">Beschreibung<textarea name="description" maxlength="4000"></textarea></label>
+            <label>Priorität<select name="priority"><option value="NORMAL">Normal</option><option value="LOW">Niedrig</option><option value="HIGH">Hoch</option><option value="URGENT">Dringend</option></select></label>
+            <label>Status<select name="status"><option value="OPEN">Offen</option><option value="IN_PROGRESS">In Bearbeitung</option><option value="COMPLETED">Abgeschlossen</option><option value="CANCELLED">Storniert</option></select></label>
+            <label>Datum<input name="scheduled_date" type="date"></label><label>Beginn<input name="start_time" type="time"></label>
+            <label>Ende<input name="end_time" type="time"></label>
+            <p id="employee-task-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Aufgabe speichern</button>
+        </form>
+    </dialog>
+    <dialog id="order-dialog" class="detail-dialog order-dialog" aria-labelledby="order-dialog-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <p class="eyebrow">AUFTRAGSVERWALTUNG</p><h2 id="order-dialog-title">Auftrag anlegen</h2>
+        <p id="order-dialog-intro" class="employee-dialog-intro">Erfassen Sie alle Angaben zum Auftrag. Pflichtfelder sind mit * markiert.</p>
+        <form id="order-form" class="admin-employee-form">
+            <input id="order-id" name="id" type="hidden">
+            <input id="order-appointment-id" name="appointment_id" type="hidden">
+            <label>Kunde *<select id="order-customer" name="customer_id" required><option value="">Kunde wählen</option></select></label>
+            <label>Leistung *<input name="service_type" required maxlength="160" placeholder="z. B. Reinigungsservice"></label>
+            <label class="admin-form-wide">Titel *<input name="title" required maxlength="180" placeholder="Kurze Auftragsbezeichnung"></label>
+            <label class="admin-form-wide">Beschreibung<textarea name="description" maxlength="4000"></textarea></label>
+            <label>Objektart<input name="object_type" maxlength="120"></label><label>Fläche (m²)<input name="area_sqm" type="number" min="0" step="0.01"></label>
+            <label>Frequenz<input name="frequency" maxlength="80" placeholder="einmalig / wöchentlich"></label><label>Wunschtermin<input name="preferred_date" type="date"></label>
+            <label>Adresse<input name="address" maxlength="180"></label><label>PLZ<input name="postal_code" maxlength="16"></label>
+            <label>Ort<input name="city" maxlength="120"></label><label>Geschätzte Dauer (Min.)<input name="estimated_duration_minutes" type="number" min="1" max="1440"></label>
+            <label>Status<select name="status"><option>NEU</option><option>GEPLANT</option><option>ZUGEWIESEN</option><option>IN_BEARBEITUNG</option><option>PAUSIERT</option><option>ERLEDIGT</option><option>STORNIERT</option></select></label>
+            <label>Priorität<select name="priority"><option>NORMAL</option><option>HOCH</option><option>DRINGEND</option></select></label>
+            <label class="admin-form-wide">Interne Notiz<textarea name="notes" maxlength="4000"></textarea></label>
+            <p id="order-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Auftrag speichern</button>
+        </form>
+        <section id="order-assignment-section" class="order-assignment-section" hidden>
+            <h3>Einsatzplanung</h3><div id="order-assignment-list" class="assignment-list"></div>
+            <form id="assignment-form" class="admin-employee-form">
+                <input name="assignment_id" type="hidden"><label>Mitarbeiter *<select id="assignment-employee" name="employee_id" required><option value="">Mitarbeiter wählen</option></select></label>
+                <label>Datum *<input name="assignment_date" type="date" required></label><label>Beginn *<input name="start_time" type="time" required></label><label>Ende *<input name="end_time" type="time" required></label>
+                <label>Status<select name="status"><option>GEPLANT</option><option>IN_BEARBEITUNG</option><option>ERLEDIGT</option><option>STORNIERT</option></select></label>
+                <label class="admin-form-wide">Notiz<textarea name="notes" maxlength="4000"></textarea></label>
+                <p id="assignment-form-note" class="form-message" hidden></p><button class="button button-light" type="submit">Einsatz speichern</button>
+            </form>
+            <section class="availability-box"><h4>Verfügbare Mitarbeiter</h4><div id="available-employee-list" class="availability-list"><p class="empty-copy">Datum und Uhrzeit für die Verfügbarkeitsprüfung wählen.</p></div></section>
+            <h3>Private Dokumentation</h3><div id="order-document-list" class="assignment-list"></div>
+        </section>
+    </dialog>
+    <dialog id="absence-dialog" class="detail-dialog employee-dialog" aria-labelledby="absence-dialog-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <p class="eyebrow">EINSATZPLANUNG</p><h2 id="absence-dialog-title">Abwesenheit eintragen</h2>
+        <form id="absence-form" class="admin-employee-form"><input name="absence_id" type="hidden">
+            <label>Mitarbeiter *<select id="absence-employee" name="employee_id" required></select></label><label>Typ *<select name="absence_type"><option>URLAUB</option><option>KRANK</option><option>FREI</option><option>SONSTIGE</option></select></label>
+            <label>Von *<input name="start_date" type="date" required></label><label>Bis *<input name="end_date" type="date" required></label>
+            <label class="admin-form-wide">Notiz<textarea name="notes" maxlength="1000"></textarea></label><p id="absence-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Abwesenheit speichern</button>
+        </form>
+    </dialog>
+    <dialog id="work-hours-dialog" class="detail-dialog employee-dialog" aria-labelledby="work-hours-dialog-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <p class="eyebrow">MITARBEITER-VERFÜGBARKEIT</p><h2 id="work-hours-dialog-title">Arbeitszeiten</h2>
+        <p id="work-hours-dialog-intro" class="employee-dialog-intro"></p>
+        <form id="work-hours-form" class="admin-employee-form"><input name="employee_id" type="hidden"><div id="work-hours-rows" class="work-hours-rows admin-form-wide"></div><p id="work-hours-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Arbeitszeiten speichern</button></form>
     </dialog>
 </body>
 </html>
