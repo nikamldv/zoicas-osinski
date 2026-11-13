@@ -1,0 +1,3 @@
+-- Pre-Phase 12 recovery checkpoint. No destructive SQL is included.
+-- Create an operational backup immediately before applying 012:
+-- mysqldump --single-transaction --routines --triggers zoicas_osinski > pre-012-documents-messages-notifications-audit.sql

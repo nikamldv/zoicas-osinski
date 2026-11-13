@@ -54,6 +54,16 @@
                     <span>Angebotsanfragen</span>
                     <span id="nav-quote-count" class="nav-count">0</span>
                 </button>
+                <button class="nav-item" type="button" data-type="offer">
+                    <span class="nav-icon" aria-hidden="true">€</span><span>Angebote</span><span id="nav-offer-count" class="nav-count">—</span>
+                </button>
+                <button class="nav-item" type="button" data-type="contract">
+                    <span class="nav-icon" aria-hidden="true">§</span><span>Verträge</span><span id="nav-contract-count" class="nav-count">—</span>
+                </button>
+                <button class="nav-item" type="button" data-type="recurring"><span class="nav-icon" aria-hidden="true">⟳</span><span>Wiederkehrende Aufträge</span><span id="nav-recurring-count" class="nav-count">—</span></button>
+                <button class="nav-item" type="button" data-type="invoice">
+                    <span class="nav-icon" aria-hidden="true">€</span><span>Rechnungen</span><span id="nav-invoice-count" class="nav-count">—</span>
+                </button>
                 <button class="nav-item" type="button" data-type="appointment">
                     <span class="nav-icon" aria-hidden="true">◷</span><span>Termine</span><span id="nav-appointment-count" class="nav-count">0</span>
                 </button>
@@ -82,6 +92,11 @@
                     <span class="live-indicator"><span></span> Datenbank verbunden</span>
                     <button id="create-employee-button" class="button button-primary" type="button" hidden>Mitarbeiter anlegen</button>
                     <button id="create-order-button" class="button button-primary" type="button" hidden>Auftrag anlegen</button>
+                    <button id="create-offer-button" class="button button-primary" type="button" hidden>Angebot anlegen</button>
+                    <button id="create-contract-button" class="button button-primary" type="button" hidden>Vertrag anlegen</button>
+                    <button id="create-recurring-button" class="button button-primary" type="button" hidden>Einsatzplan anlegen</button>
+                    <button id="generate-recurring-button" class="button button-light" type="button" hidden>Aufträge generieren</button>
+                    <button id="create-invoice-button" class="button button-primary" type="button" hidden>Rechnung anlegen</button>
                     <button id="refresh-button" class="button button-light" type="button"><span aria-hidden="true">⟳</span> Aktualisieren</button>
                 </div>
             </header>
@@ -148,7 +163,22 @@
                         <option value="PAUSIERT">Pausiert</option>
                         <option value="ERLEDIGT">Erledigt</option>
                         <option value="STORNIERT">Storniert</option>
+                        <option value="ENTWURF">Entwurf</option>
+                        <option value="GESENDET">Gesendet</option>
+                        <option value="ANGENOMMEN">Angenommen</option>
+                        <option value="ABGELEHNT">Abgelehnt</option>
+                        <option value="ABGELAUFEN">Abgelaufen</option>
+                        <option value="AKTIV">Aktiv</option>
+                        <option value="GEKUENDIGT">Gekündigt</option>
+                        <option value="BEENDET">Beendet</option>
+                        <option value="AUSGESTELLT">Ausgestellt</option>
+                        <option value="BEZAHLT">Bezahlt</option>
+                        <option value="TEILBEZAHLT">Teilbezahlt</option>
+                        <option value="ÜBERFÄLLIG">Überfällig</option>
                     </select>
+                    <input id="invoice-customer-filter" class="filter-select" type="number" min="1" placeholder="Kunden-ID" hidden>
+                    <input id="invoice-order-filter" class="filter-select" type="number" min="1" placeholder="Auftrags-ID" hidden>
+                    <input id="invoice-due-filter" class="filter-select" type="date" hidden>
                 </div>
 
                 <div id="dashboard-message" class="dashboard-message" role="status" aria-live="polite" hidden></div>
@@ -206,6 +236,7 @@
             <button id="assign-task-button" class="button button-primary" type="button">Aufgabe zuweisen</button>
         </div>
         <button id="create-order-from-appointment" class="button button-primary" type="button" hidden>Auftrag aus Termin erstellen</button>
+        <button id="create-offer-from-request" class="button button-primary" type="button" hidden>Angebot aus Anfrage erstellen</button>
         <button id="resend-employee-invite" class="button button-light" type="button" hidden>Einladung erneut senden</button>
     </dialog>
     <dialog id="employee-dialog" class="detail-dialog employee-dialog" aria-labelledby="employee-dialog-title">
@@ -285,6 +316,71 @@
         <p class="eyebrow">MITARBEITER-VERFÜGBARKEIT</p><h2 id="work-hours-dialog-title">Arbeitszeiten</h2>
         <p id="work-hours-dialog-intro" class="employee-dialog-intro"></p>
         <form id="work-hours-form" class="admin-employee-form"><input name="employee_id" type="hidden"><div id="work-hours-rows" class="work-hours-rows admin-form-wide"></div><p id="work-hours-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Arbeitszeiten speichern</button></form>
+    </dialog>
+    <dialog id="offer-dialog" class="detail-dialog order-dialog commercial-dialog" aria-labelledby="offer-dialog-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <p class="eyebrow">ANGEBOTSVERWALTUNG</p><h2 id="offer-dialog-title">Angebot anlegen</h2>
+        <p id="offer-dialog-intro" class="employee-dialog-intro">Positionen und Beträge werden serverseitig berechnet.</p>
+        <form id="offer-form" class="admin-employee-form">
+            <input name="id" type="hidden"><label>Kunde *<select id="offer-customer" name="customer_id" required><option value="">Kunde wählen</option></select></label>
+            <label>Ansprechpartner<input name="contact_person" maxlength="160"></label><label>Leistungsart *<input name="service_type" required maxlength="160"></label>
+            <label>Startdatum<input name="start_date" type="date"></label><label>Gültig bis<input name="valid_until" type="date"></label>
+            <label>Fläche (m²)<input name="area_sqm" type="number" min="0" step="0.01"></label><label>Häufigkeit<input name="frequency" maxlength="100"></label>
+            <label>Adresse<input name="object_address" maxlength="180"></label><label>PLZ<input name="postal_code" maxlength="16"></label><label>Ort<input name="city" maxlength="120"></label>
+            <label>Status<select name="status"><option>ENTWURF</option><option>GESENDET</option><option>ANGENOMMEN</option><option>ABGELEHNT</option><option>ABGELAUFEN</option><option>STORNIERT</option></select></label>
+            <label class="admin-form-wide">Leistungsbeschreibung *<textarea name="service_description" required maxlength="8000"></textarea></label>
+            <label class="admin-form-wide">Hinweis für Kunden<textarea name="customer_notes" maxlength="8000"></textarea></label>
+            <label class="admin-form-wide">Interne Notiz<textarea name="internal_notes" maxlength="8000"></textarea></label>
+            <section class="commercial-items admin-form-wide"><div class="commercial-section-heading"><h3>Leistungspositionen</h3><button id="add-quote-item" class="button button-light" type="button">Position hinzufügen</button></div><div id="quote-items"></div><div id="quote-totals" class="quote-totals">Netto: 0,00 € · MwSt.: 0,00 € · Brutto: 0,00 €</div></section>
+            <p id="offer-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Angebot speichern</button>
+        </form>
+        <div id="offer-actions" class="dialog-actions" hidden><button id="create-order-from-offer" class="button button-primary" type="button">Auftrag aus Angebot erstellen</button></div>
+    </dialog>
+    <dialog id="contract-dialog" class="detail-dialog order-dialog commercial-dialog" aria-labelledby="contract-dialog-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <p class="eyebrow">VERTRAGSVERWALTUNG</p><h2 id="contract-dialog-title">Vertrag anlegen</h2>
+        <form id="contract-form" class="admin-employee-form"><input name="id" type="hidden">
+            <label>Kunde *<select id="contract-customer" name="customer_id" required><option value="">Kunde wählen</option></select></label><label>Aus Angebot<select id="contract-quote" name="quote_id"><option value="">Ohne Angebot</option></select></label>
+            <label>Startdatum *<input name="start_date" type="date" required></label><label>Enddatum<input name="end_date" type="date"></label><label>Kündigungsfrist (Tage)<input name="cancellation_notice_days" type="number" min="0" max="3650"></label>
+            <label>Leistungsart *<input name="service_type" required maxlength="160"></label><label>Intervall *<select name="interval_type"><option>EINMALIG</option><option>WOECHENTLICH</option><option>ZWEIMAL_WOECHENTLICH</option><option>MEHRMALS_WOECHENTLICH</option><option>MONATLICH</option><option selected>INDIVIDUELL</option></select></label><label>Intervall-Details<input name="interval_details" maxlength="255"></label>
+            <label>Netto *<input name="net_amount" type="number" min="0" step="0.01" required></label><label>MwSt. (%) *<input name="tax_rate" type="number" min="0" max="100" step="0.01" required></label><label>Zahlungsintervall<input name="payment_interval" maxlength="80" placeholder="monatlich"></label>
+            <label>Status<select name="status"><option>ENTWURF</option><option>AKTIV</option><option>PAUSIERT</option><option>GEKUENDIGT</option><option>ABGELAUFEN</option><option>BEENDET</option></select></label>
+            <label class="admin-form-wide">Leistungsbeschreibung *<textarea name="service_description" required maxlength="8000"></textarea></label><label class="admin-form-wide">Interne Notiz<textarea name="internal_notes" maxlength="8000"></textarea></label>
+            <p id="contract-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Vertrag speichern</button>
+        </form>
+    </dialog>
+    <dialog id="invoice-dialog" class="detail-dialog order-dialog commercial-dialog" aria-labelledby="invoice-dialog-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <p class="eyebrow">RECHNUNGSVERWALTUNG</p><h2 id="invoice-dialog-title">Rechnung anlegen</h2>
+        <p class="employee-dialog-intro">Beträge und Zahlungsstatus werden serverseitig berechnet.</p>
+        <form id="invoice-form" class="admin-employee-form">
+            <input name="id" type="hidden"><label>Kunde *<select id="invoice-customer" name="customer_id" required><option value="">Kunde wählen</option></select></label><label>Auftrag<select id="invoice-order" name="order_id"><option value="">Ohne Auftrag</option></select></label>
+            <label>Rechnungsdatum *<input name="invoice_date" type="date" required></label><label>Zahlungsziel *<input name="due_date" type="date" required></label><label>Leistungszeitraum von<input name="service_period_from" type="date"></label><label>Leistungszeitraum bis<input name="service_period_to" type="date"></label>
+            <label>Status<select name="status"><option>ENTWURF</option><option>AUSGESTELLT</option><option>GESENDET</option></select></label><label class="admin-form-wide">Notiz<textarea name="notes" maxlength="8000"></textarea></label>
+            <section class="commercial-items admin-form-wide"><div class="commercial-section-heading"><h3>Rechnungspositionen</h3><button id="add-invoice-item" class="button button-light" type="button">Position hinzufügen</button></div><div id="invoice-items"></div><div id="invoice-totals" class="quote-totals">Netto: 0,00 € · MwSt.: 0,00 € · Brutto: 0,00 €</div></section>
+            <p id="invoice-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Rechnung speichern</button>
+        </form>
+        <section id="invoice-payments-panel" class="commercial-items" hidden><div class="commercial-section-heading"><h3>Zahlungen</h3></div><div id="invoice-payment-list"></div><form id="invoice-payment-form" class="admin-employee-form"><input name="invoice_id" type="hidden"><label>Zahlungsdatum *<input name="payment_date" type="date" required></label><label>Betrag *<input name="amount" type="number" min="0.01" step="0.01" required></label><label>Zahlungsart *<select name="payment_method"><option>BANKÜBERWEISUNG</option><option>BAR</option><option>KARTENZAHLUNG</option><option>SONSTIGE</option></select></label><label>Referenz<input name="payment_reference" maxlength="180"></label><label class="admin-form-wide">Notiz<textarea name="notes" maxlength="4000"></textarea></label><button class="button button-primary" type="submit">Zahlung erfassen</button></form></section>
+    </dialog>
+    <dialog id="recurring-dialog" class="detail-dialog order-dialog commercial-dialog" aria-labelledby="recurring-dialog-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <p class="eyebrow">AUTOMATISIERUNG</p><h2 id="recurring-dialog-title">Wiederkehrenden Einsatzplan anlegen</h2>
+        <p class="employee-dialog-intro">Nur aktive Verträge werden automatisiert. Dubletten- und Verfügbarkeitsprüfungen bleiben aktiv.</p>
+        <form id="recurring-form" class="admin-employee-form"><input name="id" type="hidden">
+            <label>Aktiver Vertrag *<select id="recurring-contract" name="contract_id" required><option value="">Vertrag wählen</option></select></label>
+            <label>Bevorzugter Mitarbeiter<select id="recurring-employee" name="preferred_employee_id"><option value="">Automatisch vorschlagen</option></select></label>
+            <label>Startdatum *<input name="start_date" type="date" required></label><label>Enddatum<input name="end_date" type="date"></label>
+            <label>Intervall *<select name="recurrence_type"><option>EINMALIG</option><option>WOECHENTLICH</option><option>ZWEIMAL_WOECHENTLICH</option><option>MEHRMALS_WOECHENTLICH</option><option>MONATLICH</option><option>INDIVIDUELL</option></select></label>
+            <label>Wochentage (1=Mo bis 7=So)<input name="weekdays" maxlength="32" placeholder="z. B. 1,4"></label>
+            <label>Beginn *<input name="preferred_start_time" type="time" required></label><label>Dauer (Min.) *<input name="duration_minutes" type="number" min="15" max="1440" step="15" required></label>
+            <label>Aktiv<select name="active"><option value="1">Ja</option><option value="0">Nein</option></select></label>
+            <p id="recurring-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Einsatzplan speichern</button>
+        </form>
+    </dialog>
+    <dialog id="generator-dialog" class="detail-dialog employee-dialog" aria-labelledby="generator-dialog-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <p class="eyebrow">AUTOMATISIERUNG</p><h2 id="generator-dialog-title">Aufträge generieren</h2>
+        <form id="generator-form" class="admin-employee-form"><label>Zeitraum *<select name="days"><option value="7">Nächste 7 Tage</option><option value="14">Nächste 14 Tage</option><option value="30">Nächste 30 Tage</option></select></label><p id="generator-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Kontrolliert generieren</button></form>
     </dialog>
 </body>
 </html>

@@ -1,0 +1,11 @@
+-- Phase 9 pre-migration manifest (non-destructive backup reference).
+-- Existing production tables intentionally preserved by 009:
+-- customers, quote_requests, quote_request_files, appointments,
+-- orders, order_assignments, employee_work_logs, task_documents,
+-- employees, employee_work_hours and employee_absences.
+--
+-- Run before the migration when a full physical backup is required:
+-- mysqldump --single-transaction --routines --triggers zoicas_osinski > pre-009-full.sql
+--
+-- 009_quotes_contracts.sql only creates quotes, quote_items and contracts, and
+-- adds nullable commercial-document/snapshot columns to orders.

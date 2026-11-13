@@ -451,6 +451,18 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .availability-list { display: grid; gap: 7px; }.availability-row { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; border: 1px solid #dce7ee; border-radius: 8px; background: #fff; color: #27445e; text-align: left; font: inherit; font-size: .76rem; cursor: pointer; }.availability-row span { color: #668198; }.availability-row em { color: #52952b; font-style: normal; font-weight: 800; }.availability-row.is-available strong { color: #378244; }.availability-row.is-unavailable { opacity: .76; cursor: not-allowed; }.availability-row.is-unavailable strong { color: #ac4141; }
 .work-hours-rows { display: grid; gap: 8px; }.work-hours-row { display: grid !important; grid-template-columns: minmax(120px,1fr) 105px auto 105px; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid #e6edf2; color: #29475f !important; }.work-hours-row span:first-child { font-weight: 700; }.work-hours-row input[type="checkbox"] { width: auto; min-height: auto; margin-right: 5px; }.work-hours-row input[type="time"] { min-height: 38px; padding: 7px 9px; }
 
+/* Phase 9: commercial documents */
+.invoice-payment-list { display: grid; gap: 9px; }
+#invoice-payments-panel { margin: 0 0 18px; }
+#invoice-payments-panel .admin-employee-form { margin-top: 14px; }
+.commercial-dialog { width: min(96vw, 960px); max-height: min(90vh, 900px); }
+.commercial-items { display: grid; gap: 14px; margin-top: 8px; padding: 18px; border: 1px solid #d8e5ed; border-radius: 14px; background: #f8fbfd; }
+.commercial-section-heading, .quote-item-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.commercial-section-heading h3 { margin: 0; color: #193c5f; font-size: 1rem; }
+.quote-item-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 13px; padding: 16px; border: 1px solid #dce7ee; border-radius: 12px; background: #fff; }
+.quote-item-heading { grid-column: 1 / -1; color: #1b405f; }.quote-item-heading .danger { border: 0; color: #a23e3e; background: transparent; font: inherit; font-weight: 700; cursor: pointer; }
+.quote-totals { padding: 13px 14px; border-radius: 9px; color: #153955; background: #eaf4fa; font-weight: 800; text-align: right; }
+
 @media (max-width: 600px) {
     .employee-dialog { width: min(94vw, 520px); max-height: 92vh; padding: 32px 21px 26px; }
     .employee-task-dialog { width: min(94vw, 520px); max-height: 92vh; padding: 32px 21px 26px; }
@@ -459,4 +471,5 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
     .admin-employee-form .button { width: 100%; }
     .schedule-panel { padding: 18px 14px; }.schedule-controls { align-items: stretch; }.schedule-controls input, .schedule-controls .button { flex: 1 1 42%; }.availability-row { grid-template-columns: 1fr; gap: 3px; }
     .work-hours-row { grid-template-columns: 1fr 1fr; }.work-hours-row > span:nth-child(3) { display: none; }
+    .commercial-dialog { width: calc(100vw - 16px); padding: 28px 17px; }.quote-item-row { grid-template-columns: 1fr; }.commercial-section-heading { align-items: stretch; flex-direction: column; }.commercial-section-heading .button { width: 100%; }
 }

@@ -1,0 +1,15 @@
+-- Phase 10 pre-migration manifest (non-destructive backup reference).
+-- Preserve all Phase 1-9 tables and data, including their indexes and foreign keys.
+-- Required current structures: customers, quote_requests, quotes, quote_items,
+-- contracts, appointments, orders, order_assignments, employee_work_logs,
+-- task_documents, employee_tasks, employee_work_hours and employee_absences.
+--
+-- Before executing 010 in production, create a physical schema-and-data backup:
+-- mysqldump --single-transaction --routines --triggers --events zoicas_osinski > pre-010-full.sql
+--
+-- Record the application grants separately with a MySQL administrator:
+-- SHOW GRANTS FOR 'zoicas_app'@'127.0.0.1';
+-- SHOW GRANTS FOR 'zoicas_dashboard'@'127.0.0.1';
+--
+-- Phase 10 is additive. It creates invoice tables only and does not alter
+-- existing order price snapshots or historic Phase 1-9 records.

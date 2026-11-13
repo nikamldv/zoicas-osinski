@@ -1,0 +1,5 @@
+-- Phase 11 pre-migration checkpoint. This file is non-destructive and records
+-- the backup command to run before applying migration 011 in another environment.
+-- mysqldump --single-transaction --routines --triggers --events zoicas_osinski > pre-011-full.sql
+-- The Phase 11 migration is additive: recurring_schedules, automation_logs and
+-- nullable automation metadata on orders. Existing Phase 1-10 data is retained.

@@ -11,7 +11,7 @@ const ROOT = __dirname;
 const STATIC_ROOTS = ["public", "assets", "Css", "js"]
     .map(directory => path.resolve(ROOT, directory));
 
-if (fs.existsSync(path.join(ROOT, ".env")) && typeof process.loadEnvFile === "function") {
+if (process.env.LOAD_DOTENV !== "false" && fs.existsSync(path.join(ROOT, ".env")) && typeof process.loadEnvFile === "function") {
     process.loadEnvFile(path.join(ROOT, ".env"));
 }
 
@@ -140,6 +140,13 @@ const orderStatuses = new Set(["NEU", "GEPLANT", "ZUGEWIESEN", "IN_BEARBEITUNG",
 const orderPriorities = new Set(["NORMAL", "HOCH", "DRINGEND"]);
 const assignmentStatuses = new Set(["GEPLANT", "IN_BEARBEITUNG", "ERLEDIGT", "STORNIERT"]);
 const absenceTypes = new Set(["URLAUB", "KRANK", "FREI", "SONSTIGE"]);
+const commercialQuoteStatuses = new Set(["ENTWURF", "GESENDET", "ANGENOMMEN", "ABGELEHNT", "ABGELAUFEN", "STORNIERT"]);
+const contractStatuses = new Set(["ENTWURF", "AKTIV", "PAUSIERT", "GEKUENDIGT", "ABGELAUFEN", "BEENDET"]);
+const invoiceStatuses = new Set(["ENTWURF", "AUSGESTELLT", "GESENDET", "BEZAHLT", "TEILBEZAHLT", "ÜBERFÄLLIG", "STORNIERT"]);
+const invoiceUnits = new Set(["Stück", "m²", "Stunde", "Pauschale", "Monat", "Einsatz"]);
+const paymentMethods = new Set(["BANKÜBERWEISUNG", "BAR", "KARTENZAHLUNG", "SONSTIGE"]);
+const contractIntervals = new Set(["EINMALIG", "WOECHENTLICH", "ZWEIMAL_WOECHENTLICH", "MEHRMALS_WOECHENTLICH", "MONATLICH", "INDIVIDUELL"]);
+const automationResults = new Set(["SUCCESS", "SKIPPED", "FAILED", "NO_AVAILABILITY"]);
 
 function sendJson(response, statusCode, payload) {
     const body = JSON.stringify(payload);
@@ -463,7 +470,7 @@ async function handleAdminCustomers(request, response, pathname, searchParams) {
 
 async function handleAdminQuotes(request, response, pathname, searchParams) {
     if (!adminPool) return sendJson(response, 503, { message: "Die Datenbankrechte für das Dashboard sind noch nicht eingerichtet." });
-    const match = pathname.match(/^\/api\/admin\/quotes(?:\/(\d+))?(?:\/files\/(\d+))?$/);
+    const match = pathname.match(/^\/api\/admin\/quote-requests(?:\/(\d+))?(?:\/files\/(\d+))?$/);
     const quoteId = match?.[1] ? Number(match[1]) : null;
     const fileId = match?.[2] ? Number(match[2]) : null;
 
@@ -943,6 +950,168 @@ async function availabilityForSlot(database, date, startTime, endTime, { exceptA
     });
 }
 
+function dateOnly(value) {
+    // mysql2 returns DATE columns as Date objects. Converting those with
+    // String(date).slice(0, 10) produces e.g. "Fri Nov 13", which is not an
+    // ISO date and silently prevents the generator from finding occurrences.
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        // DATE is timezone-less. mysql2 materializes it in the local business
+        // timezone, so the local calendar parts (not UTC parts) preserve it.
+        return new Date(Date.UTC(value.getFullYear(), value.getMonth(), value.getDate()));
+    }
+    return new Date(`${String(value).slice(0, 10)}T00:00:00Z`);
+}
+
+function isoDate(value) {
+    return value.toISOString().slice(0, 10);
+}
+
+function addDays(value, days) {
+    const next = dateOnly(value);
+    next.setUTCDate(next.getUTCDate() + days);
+    return isoDate(next);
+}
+
+function parseScheduleWeekdays(value, recurrenceType, startDate) {
+    const weekdays = [...new Set(String(value || "").split(",").map(item => Number(item.trim())).filter(day => Number.isInteger(day) && day >= 1 && day <= 7))].sort((a, b) => a - b);
+    if (recurrenceType === "EINMALIG" || recurrenceType === "MONATLICH") return weekdays;
+    if (weekdays.length) return weekdays;
+    return [weekdayForDate(startDate)];
+}
+
+function scheduleDates(schedule, fromDate, toDate) {
+    const first = dateOnly(schedule.start_date), from = dateOnly(fromDate), until = dateOnly(schedule.end_date || toDate), to = dateOnly(toDate);
+    const lower = first > from ? first : from, upper = until < to ? until : to;
+    if (lower > upper) return [];
+    const recurrence = schedule.recurrence_type;
+    if (recurrence === "EINMALIG") return first >= lower && first <= upper ? [isoDate(first)] : [];
+    const weekdays = parseScheduleWeekdays(schedule.weekdays, recurrence, schedule.start_date);
+    const dates = [];
+    for (let cursor = new Date(lower); cursor <= upper; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+        const day = isoDate(cursor);
+        if (recurrence === "MONATLICH") {
+            const expectedDay = first.getUTCDate();
+            const lastDay = new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 0)).getUTCDate();
+            if (cursor.getUTCDate() === Math.min(expectedDay, lastDay)) dates.push(day);
+        } else if (recurrence === "WOECHENTLICH" || recurrence === "ZWEIMAL_WOECHENTLICH" || recurrence === "MEHRMALS_WOECHENTLICH" || recurrence === "INDIVIDUELL") {
+            if (weekdays.includes(weekdayForDate(day))) dates.push(day);
+        }
+    }
+    return dates;
+}
+
+function endTimeForDuration(startTime, durationMinutes) {
+    const end = timeToMinutes(startTime) + Number(durationMinutes);
+    return end > 0 && end <= 1440 ? minutesToTime(end) : null;
+}
+
+function recurringSchedulePayload(body) {
+    const contractId = Number(body?.contract_id), startDate = readText(body?.start_date, 10), endDate = readText(body?.end_date, 10, { optional: true });
+    const recurrenceType = readText(body?.recurrence_type, 32), startTime = readText(body?.preferred_start_time, 5);
+    const durationMinutes = Number(body?.duration_minutes), employeeId = body?.preferred_employee_id === "" || body?.preferred_employee_id == null ? null : Number(body.preferred_employee_id);
+    const active = body?.active === false || body?.active === "0" ? 0 : 1;
+    const weekdays = parseScheduleWeekdays(body?.weekdays, recurrenceType, startDate).join(",");
+    if (!Number.isSafeInteger(contractId) || contractId < 1 || !isIsoDate(startDate) || (endDate && !isIsoDate(endDate)) || (endDate && startDate > endDate) || !contractIntervals.has(recurrenceType) || !isClockTime(startTime) || !Number.isInteger(durationMinutes) || durationMinutes < 15 || durationMinutes > 1440 || !endTimeForDuration(startTime, durationMinutes) || (employeeId !== null && (!Number.isSafeInteger(employeeId) || employeeId < 1))) return null;
+    if (["WOECHENTLICH", "ZWEIMAL_WOECHENTLICH", "MEHRMALS_WOECHENTLICH", "INDIVIDUELL"].includes(recurrenceType) && !weekdays) return null;
+    if (recurrenceType === "ZWEIMAL_WOECHENTLICH" && weekdays.split(",").filter(Boolean).length !== 2) return null;
+    if (recurrenceType === "MEHRMALS_WOECHENTLICH" && weekdays.split(",").filter(Boolean).length < 2) return null;
+    return { contractId, startDate, endDate: endDate || null, recurrenceType, weekdays: weekdays || null, startTime, durationMinutes, employeeId, active };
+}
+
+async function logAutomation(connection, { contractId, scheduleId, date, action, result, orderId = null, errorMessage = null }) {
+    if (!automationResults.has(result)) result = "FAILED";
+    await connection.execute("INSERT INTO automation_logs (contract_id,schedule_id,execution_date,action,result,generated_order_id,error_message) VALUES (?,?,?,?,?,?,?)", [contractId || null, scheduleId || null, date, action, result, orderId, errorMessage ? String(errorMessage).slice(0, 1000) : null]);
+}
+
+async function createRecurringOrderNumber(connection) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+        const number = `AU-${new Date().getFullYear()}-${crypto.randomInt(100000, 1000000)}`;
+        const [existing] = await connection.execute("SELECT id FROM orders WHERE order_number=?", [number]);
+        if (!existing[0]) return number;
+    }
+    throw new Error("order_number_generation_failed");
+}
+
+async function generateRecurringOrders({ days = 7, contractId = null } = {}) {
+    const windowDays = Math.min(Math.max(Number(days) || 7, 1), 30);
+    const today = new Date().toISOString().slice(0, 10), until = addDays(today, windowDays - 1);
+    const summary = { checkedContracts: 0, created: 0, existing: 0, noAvailability: 0, failed: 0, windowDays, from: today, to: until };
+    const filters = ["s.active=1", "c.status='AKTIV'", "c.start_date<=?", "(c.end_date IS NULL OR c.end_date>=?)"], values = [until, today];
+    if (contractId !== null) { filters.push("s.contract_id=?"); values.push(contractId); }
+    const [schedules] = await adminPool.execute(`SELECT s.*,c.customer_id,c.quote_id,c.contract_number,c.service_description,c.service_type,c.net_amount,c.tax_rate,c.tax_amount,c.gross_amount,c.start_date AS contract_start_date,c.end_date AS contract_end_date,cu.address AS customer_address,cu.postal_code AS customer_postal_code,cu.city AS customer_city,q.object_address,q.postal_code AS quote_postal_code,q.city AS quote_city FROM recurring_schedules s JOIN contracts c ON c.id=s.contract_id JOIN customers cu ON cu.id=c.customer_id LEFT JOIN quotes q ON q.id=c.quote_id WHERE ${filters.join(" AND ")} ORDER BY s.next_run_date IS NULL,s.next_run_date,s.id`, values);
+    summary.checkedContracts = schedules.length;
+    for (const schedule of schedules) {
+        const dates = scheduleDates(schedule, today, until);
+        const connection = await adminPool.getConnection();
+        try {
+            await connection.beginTransaction();
+            for (const date of dates) {
+                const endTime = endTimeForDuration(String(schedule.preferred_start_time).slice(0, 5), schedule.duration_minutes);
+                const plannedStart = `${date} ${String(schedule.preferred_start_time).slice(0, 5)}:00`, plannedEnd = `${date} ${endTime}:00`;
+                const [existing] = await connection.execute("SELECT id FROM orders WHERE contract_id=? AND planned_start=? FOR UPDATE", [schedule.contract_id, plannedStart]);
+                if (existing[0]) { summary.existing += 1; await logAutomation(connection, { contractId: schedule.contract_id, scheduleId: schedule.id, date, action: "GENERATE_ORDER", result: "SKIPPED", orderId: existing[0].id, errorMessage: "Auftrag bereits vorhanden" }); continue; }
+                const availability = await availabilityForSlot(connection, date, String(schedule.preferred_start_time).slice(0, 5), endTime);
+                let employee = schedule.preferred_employee_id ? availability.find(row => row.id === Number(schedule.preferred_employee_id) && row.available) : availability.find(row => row.available);
+                const orderNumber = await createRecurringOrderNumber(connection);
+                const address = schedule.object_address || schedule.customer_address || null, postalCode = schedule.quote_postal_code || schedule.customer_postal_code || null, city = schedule.quote_city || schedule.customer_city || null;
+                const [created] = await connection.execute("INSERT INTO orders (order_number,customer_id,contract_id,automation_schedule_id,service_type,title,description,address,postal_code,city,preferred_date,planned_start,planned_end,is_automated,status,priority,estimated_duration_minutes,notes,price_net_snapshot,price_tax_snapshot,price_gross_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'NORMAL',?,?,?,?,?)", [orderNumber,schedule.customer_id,schedule.contract_id,schedule.id,schedule.service_type,`${schedule.service_type} – ${schedule.contract_number}`,schedule.service_description,address,postalCode,city,date,plannedStart,plannedEnd,1,employee ? "ZUGEWIESEN" : "GEPLANT",schedule.duration_minutes,"Automatisch aus Vertrag erzeugt.",schedule.net_amount,schedule.tax_amount,schedule.gross_amount]);
+                if (employee) await connection.execute("INSERT INTO order_assignments (order_id,employee_id,assignment_date,start_time,end_time,status,notes) VALUES (?,?,?,?,?,'GEPLANT',?)", [created.insertId, employee.id, date, String(schedule.preferred_start_time).slice(0, 5), endTime, "Automatisch vorgeschlagen/zugeordnet."]);
+                summary.created += 1;
+                if (!employee) summary.noAvailability += 1;
+                await logAutomation(connection, { contractId: schedule.contract_id, scheduleId: schedule.id, date, action: "GENERATE_ORDER", result: employee ? "SUCCESS" : "NO_AVAILABILITY", orderId: created.insertId, errorMessage: employee ? null : "Kein verfügbarer Mitarbeiter" });
+            }
+            const future = scheduleDates(schedule, addDays(until, 1), schedule.end_date || addDays(until, 366))[0] || null;
+            await connection.execute("UPDATE recurring_schedules SET next_run_date=?,last_generated_at=NOW() WHERE id=?", [future, schedule.id]);
+            await connection.commit();
+        } catch (error) {
+            await connection.rollback(); summary.failed += 1;
+            try { await logAutomation(connection, { contractId: schedule.contract_id, scheduleId: schedule.id, date: today, action: "GENERATE_ORDER", result: "FAILED", errorMessage: error.code || "generation_error" }); } catch {}
+        } finally { connection.release(); }
+    }
+    return summary;
+}
+
+async function handleAdminRecurringOrders(request, response, pathname, searchParams) {
+    if (!adminPool) return sendJson(response, 503, { message: "Die Datenbankrechte für die Automation sind nicht eingerichtet." });
+    const scheduleMatch = pathname.match(/^\/api\/admin\/recurring-orders(?:\/(\d+))?$/);
+    if (pathname === "/api/admin/automation-logs" && request.method === "GET") {
+        const [rows] = await adminPool.execute("SELECT l.*,c.contract_number,o.order_number FROM automation_logs l LEFT JOIN contracts c ON c.id=l.contract_id LEFT JOIN orders o ON o.id=l.generated_order_id ORDER BY l.created_at DESC LIMIT 200");
+        return sendJson(response, 200, { rows });
+    }
+    if (pathname === "/api/admin/recurring-orders/generate") {
+        if (request.method !== "POST" || !isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
+        let body; try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "Ungültige Generator-Daten." }); }
+        const days = Number(body.days || 7), contractId = body.contract_id === "" || body.contract_id == null ? null : Number(body.contract_id);
+        if (!Number.isInteger(days) || days < 1 || days > 30 || (contractId !== null && (!Number.isSafeInteger(contractId) || contractId < 1))) return sendJson(response, 400, { message: "Der Zeitraum muss zwischen 1 und 30 Tagen liegen." });
+        return sendJson(response, 201, { summary: await generateRecurringOrders({ days, contractId }) });
+    }
+    if (!scheduleMatch) return sendJson(response, 404, { message: "API-Endpunkt nicht gefunden." });
+    const scheduleId = scheduleMatch[1] ? Number(scheduleMatch[1]) : null;
+    if (!scheduleId && request.method === "GET") {
+        const contract = searchParams.get("contract_id") ? Number(searchParams.get("contract_id")) : null;
+        if (contract !== null && (!Number.isSafeInteger(contract) || contract < 1)) return sendJson(response, 400, { message: "Ungültiger Vertrag." });
+        const [rows] = await adminPool.execute(`SELECT s.*,c.contract_number,c.service_type,c.status AS contract_status,cu.first_name,cu.last_name,cu.customer_number,e.first_name AS employee_first_name,e.last_name AS employee_last_name,(SELECT l.result FROM automation_logs l WHERE l.schedule_id=s.id ORDER BY l.created_at DESC LIMIT 1) AS last_result,(SELECT l.created_at FROM automation_logs l WHERE l.schedule_id=s.id ORDER BY l.created_at DESC LIMIT 1) AS last_logged_at FROM recurring_schedules s JOIN contracts c ON c.id=s.contract_id JOIN customers cu ON cu.id=c.customer_id LEFT JOIN employees e ON e.id=s.preferred_employee_id${contract ? " WHERE s.contract_id=?" : ""} ORDER BY s.active DESC,s.next_run_date,s.id`, contract ? [contract] : []);
+        return sendJson(response, 200, { rows });
+    }
+    if (scheduleId && request.method === "GET") {
+        const [rows] = await adminPool.execute("SELECT s.*,c.contract_number,c.customer_id,c.service_type,c.status AS contract_status FROM recurring_schedules s JOIN contracts c ON c.id=s.contract_id WHERE s.id=?", [scheduleId]);
+        return rows[0] ? sendJson(response, 200, { schedule: rows[0] }) : sendJson(response, 404, { message: "Wiederkehrender Auftrag nicht gefunden." });
+    }
+    if (request.method !== (scheduleId ? "PATCH" : "POST") || !isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
+    let body; try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "Ungültige Plan-Daten." }); }
+    const schedule = recurringSchedulePayload(body); if (!schedule) return sendJson(response, 400, { message: "Bitte prüfen Sie Intervall, Wochentage und Einsatzzeit." });
+    const [contracts] = await adminPool.execute("SELECT id,start_date,end_date,status FROM contracts WHERE id=?", [schedule.contractId]);
+    const contract = contracts[0]; if (!contract || contract.status !== "AKTIV") return sendJson(response, 400, { message: "Nur aktive Verträge können automatisiert werden." });
+    if (schedule.employeeId !== null) { const [employees] = await adminPool.execute("SELECT id FROM employees WHERE id=? AND status='ACTIVE'", [schedule.employeeId]); if (!employees[0]) return sendJson(response, 400, { message: "Der bevorzugte Mitarbeiter ist nicht aktiv." }); }
+    const recurrence = { start_date: schedule.startDate, end_date: schedule.endDate, recurrence_type: schedule.recurrenceType, weekdays: schedule.weekdays };
+    const nextRunDate = scheduleDates(recurrence, schedule.startDate, schedule.endDate || addDays(schedule.startDate, 366))[0] || schedule.startDate;
+    if (!scheduleId) {
+        try { const [created] = await adminPool.execute("INSERT INTO recurring_schedules (contract_id,start_date,end_date,recurrence_type,weekdays,preferred_start_time,duration_minutes,preferred_employee_id,next_run_date,active) VALUES (?,?,?,?,?,?,?,?,?,?)", [schedule.contractId,schedule.startDate,schedule.endDate,schedule.recurrenceType,schedule.weekdays,schedule.startTime,schedule.durationMinutes,schedule.employeeId,nextRunDate,schedule.active]); return sendJson(response, 201, { id: created.insertId, message: "Wiederkehrender Einsatzplan gespeichert." }); } catch (error) { if (error.code === "ER_DUP_ENTRY") return sendJson(response,409,{message:"Für diesen Vertrag existiert bereits ein Einsatzplan."}); throw error; }
+    }
+    const [result] = await adminPool.execute("UPDATE recurring_schedules SET contract_id=?,start_date=?,end_date=?,recurrence_type=?,weekdays=?,preferred_start_time=?,duration_minutes=?,preferred_employee_id=?,next_run_date=?,active=? WHERE id=?", [schedule.contractId,schedule.startDate,schedule.endDate,schedule.recurrenceType,schedule.weekdays,schedule.startTime,schedule.durationMinutes,schedule.employeeId,nextRunDate,schedule.active,scheduleId]);
+    return result.affectedRows ? sendJson(response, 200, { id: scheduleId, message: "Wiederkehrender Einsatzplan gespeichert." }) : sendJson(response, 404, { message: "Wiederkehrender Auftrag nicht gefunden." });
+}
+
 async function handleAdminAvailability(request, response, pathname, searchParams) {
     if (!adminPool) return sendJson(response, 503, { message: "Die Datenbankrechte für die Einsatzplanung sind noch nicht eingerichtet." });
     const workHoursMatch = pathname.match(/^\/api\/admin\/employees\/(\d+)\/work-hours$/);
@@ -1087,6 +1256,328 @@ async function handleAdminOrders(request, response, pathname, searchParams) {
     return result.affectedRows ? sendJson(response, 200, { id: orderId, message: "Auftrag gespeichert." }) : sendJson(response, 404, { message: "Auftrag nicht gefunden." });
 }
 
+function money(value, { allowEmpty = true } = {}) {
+    if (value === "" || value == null) return allowEmpty ? 0 : null;
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 && number <= 99999999 ? Math.round(number * 100) / 100 : null;
+}
+
+function quoteItemPayload(input, sortOrder) {
+    const title = readText(input?.title, 180);
+    const description = readText(input?.description, 4000, { optional: true, multiline: true });
+    const unit = readText(input?.unit, 40);
+    const quantity = money(input?.quantity, { allowEmpty: false });
+    const unitPrice = money(input?.unit_price, { allowEmpty: false });
+    const discount = money(input?.discount_amount);
+    const taxRate = money(input?.tax_rate, { allowEmpty: false });
+    if (!title || description === null || !unit || quantity === null || quantity <= 0 || unitPrice === null || discount === null || taxRate === null || taxRate > 100) return null;
+    const net = Math.max(0, Math.round((quantity * unitPrice - discount) * 100) / 100);
+    const tax = Math.round(net * taxRate) / 100;
+    return { sortOrder, title, description: description || null, quantity, unit, unitPrice, discount, net, taxRate, tax, gross: Math.round((net + tax) * 100) / 100 };
+}
+
+function quotePayloadValidation(body) {
+    const customerId = Number(body?.customer_id);
+    const requestId = body?.quote_request_id === "" || body?.quote_request_id == null ? null : Number(body.quote_request_id);
+    const area = body?.area_sqm === "" || body?.area_sqm == null ? null : money(body.area_sqm, { allowEmpty: false });
+    const values = {
+        customerId,
+        requestId,
+        contactPerson: readText(body?.contact_person, 160, { optional: true }),
+        serviceDescription: readText(body?.service_description, 8000, { multiline: true }),
+        objectAddress: readText(body?.object_address, 180, { optional: true }),
+        postalCode: readText(body?.postal_code, 16, { optional: true }),
+        city: readText(body?.city, 120, { optional: true }),
+        serviceType: readText(body?.service_type, 160),
+        area,
+        frequency: readText(body?.frequency, 100, { optional: true }),
+        startDate: readText(body?.start_date, 10, { optional: true }),
+        validUntil: readText(body?.valid_until, 10, { optional: true }),
+        internalNotes: readText(body?.internal_notes, 8000, { optional: true, multiline: true }),
+        customerNotes: readText(body?.customer_notes, 8000, { optional: true, multiline: true }),
+        status: readText(body?.status || "ENTWURF", 20)
+    };
+    const issues = [];
+    if (!Number.isSafeInteger(customerId) || customerId < 1) issues.push("customer_id");
+    if (requestId !== null && (!Number.isSafeInteger(requestId) || requestId < 1)) issues.push("quote_request_id");
+    if (!values.serviceDescription) issues.push("service_description");
+    if (!values.serviceType) issues.push("service_type");
+    // Fläche ist im Admin-Formular optional. Ein leerer Wert wird daher als NULL gespeichert.
+    if (body?.area_sqm !== "" && body?.area_sqm != null && values.area === null) issues.push("area_sqm");
+    if (!commercialQuoteStatuses.has(values.status)) issues.push("status");
+    if (values.startDate && !isIsoDate(values.startDate)) issues.push("start_date");
+    if (values.validUntil && !isIsoDate(values.validUntil)) issues.push("valid_until");
+    if (values.startDate && values.validUntil && values.startDate > values.validUntil) issues.push("date_range");
+    return { values, issues };
+}
+
+function quotePayload(body) {
+    const result = quotePayloadValidation(body);
+    return result.issues.length ? null : result.values;
+}
+
+async function recalculateQuote(connection, quoteId) {
+    const [rows] = await connection.execute("SELECT COALESCE(SUM(net_amount),0) AS net_amount,COALESCE(SUM(tax_amount),0) AS tax_amount,COALESCE(SUM(gross_amount),0) AS gross_amount FROM quote_items WHERE quote_id=?", [quoteId]);
+    const total = rows[0];
+    await connection.execute("UPDATE quotes SET net_amount=?,tax_amount=?,gross_amount=? WHERE id=?", [total.net_amount, total.tax_amount, total.gross_amount, quoteId]);
+    return total;
+}
+
+async function createDocumentNumber(connection, table, prefix, id) {
+    const number = `${prefix}-${new Date().getFullYear()}-${String(id).padStart(4, "0")}`;
+    await connection.execute(`UPDATE ${table} SET ${table === "quotes" ? "quote_number" : "contract_number"}=? WHERE id=?`, [number, id]);
+    return number;
+}
+
+async function handleAdminCommercial(request, response, pathname, searchParams) {
+    if (!adminPool) return sendJson(response, 503, { message: "Die Datenbankrechte für Angebote und Verträge sind noch nicht eingerichtet." });
+    const quoteMatch = pathname.match(/^\/api\/admin\/quotes(?:\/(\d+)(?:\/items(?:\/(\d+))?|\/create-order)?)?$/);
+    const contractMatch = pathname.match(/^\/api\/admin\/contracts(?:\/(\d+))?$/);
+    const quoteId = quoteMatch?.[1] ? Number(quoteMatch[1]) : null;
+    const itemId = quoteMatch?.[2] ? Number(quoteMatch[2]) : null;
+    const orderFromQuote = pathname.endsWith("/create-order");
+    const contractId = contractMatch?.[1] ? Number(contractMatch[1]) : null;
+
+    if (quoteMatch) {
+        const itemsRoute = pathname.includes("/items");
+        if (orderFromQuote) {
+            if (request.method !== "POST") return sendJson(response, 405, { message: "Methode nicht erlaubt." });
+            if (!isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
+            const [quotes] = await adminPool.execute("SELECT * FROM quotes WHERE id=?", [quoteId]);
+            const quote = quotes[0];
+            if (!quote) return sendJson(response, 404, { message: "Angebot nicht gefunden." });
+            if (quote.status !== "ANGENOMMEN") return sendJson(response, 409, { message: "Nur angenommene Angebote können in Aufträge umgewandelt werden." });
+            const [existing] = await adminPool.execute("SELECT id,order_number FROM orders WHERE sales_quote_id=? LIMIT 1", [quoteId]);
+            if (existing[0]) return sendJson(response, 409, { message: `Für dieses Angebot existiert bereits der Auftrag ${existing[0].order_number}.` });
+            let result, orderNumber, lastError;
+            for (let attempt = 0; attempt < 5; attempt += 1) {
+                orderNumber = `AU-${new Date().getFullYear()}-${crypto.randomInt(100000, 1000000)}`;
+                try {
+                    [result] = await adminPool.execute("INSERT INTO orders (order_number,customer_id,sales_quote_id,service_type,title,description,object_type,area_sqm,frequency,address,postal_code,city,preferred_date,status,priority,estimated_duration_minutes,notes,price_net_snapshot,price_tax_snapshot,price_gross_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'NEU','NORMAL',NULL,?,?,?,?)", [orderNumber, quote.customer_id, quote.id, quote.service_type, `${quote.service_type} – ${quote.quote_number}`, quote.service_description, null, quote.area_sqm, quote.frequency, quote.object_address, quote.postal_code, quote.city, quote.start_date, quote.internal_notes, quote.net_amount, quote.tax_amount, quote.gross_amount]);
+                    break;
+                } catch (error) { lastError = error; if (error.code !== "ER_DUP_ENTRY") throw error; }
+            }
+            if (!result) throw lastError || new Error("Order number generation failed");
+            return sendJson(response, 201, { id: result.insertId, orderNumber, message: "Auftrag aus Angebot erstellt." });
+        }
+        if (itemsRoute) {
+            if (!quoteId) return sendJson(response, 404, { message: "Angebot nicht gefunden." });
+            if (request.method === "GET") { const [rows] = await adminPool.execute("SELECT * FROM quote_items WHERE quote_id=? ORDER BY sort_order,id", [quoteId]); return sendJson(response, 200, { rows }); }
+            if (!isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
+            if (request.method === "DELETE") {
+                if (!itemId) return sendJson(response, 400, { message: "Position fehlt." });
+                const connection = await adminPool.getConnection();
+                try { await connection.beginTransaction(); const [result] = await connection.execute("DELETE FROM quote_items WHERE id=? AND quote_id=?", [itemId, quoteId]); if (!result.affectedRows) { await connection.rollback(); return sendJson(response, 404, { message: "Position nicht gefunden." }); } const totals = await recalculateQuote(connection, quoteId); await connection.commit(); return sendJson(response, 200, { message: "Position entfernt.", totals }); } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
+            }
+            if (!['POST', 'PATCH'].includes(request.method)) return sendJson(response, 405, { message: "Methode nicht erlaubt." });
+            let body; try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "Ungültige Positionsdaten." }); }
+            const item = quoteItemPayload(body, Number(body.sort_order) || 1); if (!item) return sendJson(response, 400, { message: "Bitte prüfen Sie die Angebotsposition." });
+            const connection = await adminPool.getConnection();
+            try {
+                await connection.beginTransaction(); let result;
+                if (request.method === "POST") [result] = await connection.execute("INSERT INTO quote_items (quote_id,sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [quoteId,item.sortOrder,item.title,item.description,item.quantity,item.unit,item.unitPrice,item.discount,item.net,item.taxRate,item.tax,item.gross]);
+                else { if (!itemId) { await connection.rollback(); return sendJson(response,400,{message:"Position fehlt."}); } [result] = await connection.execute("UPDATE quote_items SET sort_order=?,title=?,description=?,quantity=?,unit=?,unit_price=?,discount_amount=?,net_amount=?,tax_rate=?,tax_amount=?,gross_amount=? WHERE id=? AND quote_id=?",[item.sortOrder,item.title,item.description,item.quantity,item.unit,item.unitPrice,item.discount,item.net,item.taxRate,item.tax,item.gross,itemId,quoteId]); }
+                if (!result.affectedRows) { await connection.rollback(); return sendJson(response,404,{message:"Position nicht gefunden."}); }
+                const totals = await recalculateQuote(connection, quoteId); await connection.commit(); return sendJson(response, request.method === "POST" ? 201 : 200, { id: request.method === "POST" ? result.insertId : itemId, totals, message: "Position gespeichert." });
+            } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
+        }
+        if (quoteId && request.method === "GET") {
+            const [rows] = await adminPool.execute("SELECT q.*,c.customer_number,c.first_name,c.last_name,c.email FROM quotes q JOIN customers c ON c.id=q.customer_id WHERE q.id=?", [quoteId]);
+            if (!rows[0]) return sendJson(response,404,{message:"Angebot nicht gefunden."});
+            const [items] = await adminPool.execute("SELECT * FROM quote_items WHERE quote_id=? ORDER BY sort_order,id", [quoteId]); return sendJson(response,200,{quote:rows[0],items});
+        }
+        if (!quoteId && request.method === "GET") {
+            const status = String(searchParams.get("status") || "all"), search = String(searchParams.get("search") || "").trim().slice(0,100);
+            if (status !== "all" && !commercialQuoteStatuses.has(status)) return sendJson(response,400,{message:"Ungültiger Status."});
+            const where=[], values=[]; if(status!=="all"){where.push("q.status=?");values.push(status);} if(search){where.push("(q.quote_number LIKE ? OR q.service_type LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ? OR c.customer_number LIKE ?)");for(let i=0;i<5;i+=1)values.push(`%${search}%`);}
+            const clause=where.length?` WHERE ${where.join(" AND ")}`:""; const [rows]=await adminPool.execute(`SELECT q.id,q.quote_number,q.service_type,q.status,q.valid_until,q.net_amount,q.tax_amount,q.gross_amount,q.created_at,c.first_name,c.last_name,c.customer_number FROM quotes q JOIN customers c ON c.id=q.customer_id${clause} ORDER BY q.created_at DESC,q.id DESC LIMIT 100`,values); return sendJson(response,200,{rows,total:rows.length});
+        }
+        if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+        if (request.method === "DELETE") { const [result]=await adminPool.execute("UPDATE quotes SET status='STORNIERT' WHERE id=?",[quoteId]); return result.affectedRows?sendJson(response,200,{message:"Angebot storniert."}):sendJson(response,404,{message:"Angebot nicht gefunden."}); }
+        if (!['POST','PATCH'].includes(request.method)) return sendJson(response,405,{message:"Methode nicht erlaubt."});
+        let body; try { body=await readJson(request); } catch { return sendJson(response,400,{message:"Ungültige Angebotsdaten."}); }
+        const quote=quotePayload(body);
+        if(!quote) {
+            // Log field names only: enough for server-side diagnosis without recording customer content.
+            console.warn("[admin] quote validation rejected:", quotePayloadValidation(body).issues.join(",") || "unknown");
+            return sendJson(response,400,{message:"Bitte prüfen Sie die Angebotsdaten."});
+        }
+        const [customers]=await adminPool.execute("SELECT id FROM customers WHERE id=?",[quote.customerId]); if(!customers[0])return sendJson(response,404,{message:"Kunde nicht gefunden."});
+        if(quote.requestId!==null){const [requests]=await adminPool.execute("SELECT id,customer_id FROM quote_requests WHERE id=?",[quote.requestId]);if(!requests[0])return sendJson(response,404,{message:"Angebotsanfrage nicht gefunden."});if(requests[0].customer_id&&Number(requests[0].customer_id)!==quote.customerId)return sendJson(response,400,{message:"Die Anfrage gehört zu einem anderen Kunden."});}
+        const fields=[quote.customerId,quote.requestId,quote.contactPerson||null,quote.serviceDescription,quote.objectAddress||null,quote.postalCode||null,quote.city||null,quote.serviceType,quote.area,quote.frequency||null,quote.startDate||null,quote.validUntil||null,quote.internalNotes||null,quote.customerNotes||null,quote.status];
+        const connection=await adminPool.getConnection();
+        try { await connection.beginTransaction(); let id=quoteId,number;
+            if(request.method==='POST'){const items=Array.isArray(body.items)?body.items:[];if(!items.length){await connection.rollback();return sendJson(response,400,{message:"Mindestens eine Angebotsposition ist erforderlich."});}[{insertId:id}]=await connection.execute("INSERT INTO quotes (customer_id,quote_request_id,contact_person,service_description,object_address,postal_code,city,service_type,area_sqm,frequency,start_date,valid_until,internal_notes,customer_notes,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",fields);number=await createDocumentNumber(connection,"quotes","ANG",id);for(let index=0;index<items.length;index+=1){const item=quoteItemPayload(items[index],index+1);if(!item){await connection.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie alle Angebotspositionen."});}await connection.execute("INSERT INTO quote_items (quote_id,sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",[id,item.sortOrder,item.title,item.description,item.quantity,item.unit,item.unitPrice,item.discount,item.net,item.taxRate,item.tax,item.gross]);}}
+            else { const [result]=await connection.execute("UPDATE quotes SET customer_id=?,quote_request_id=?,contact_person=?,service_description=?,object_address=?,postal_code=?,city=?,service_type=?,area_sqm=?,frequency=?,start_date=?,valid_until=?,internal_notes=?,customer_notes=?,status=? WHERE id=?",[...fields,id]);if(!result.affectedRows){await connection.rollback();return sendJson(response,404,{message:"Angebot nicht gefunden."});} if(Array.isArray(body.items)){await connection.execute("DELETE FROM quote_items WHERE quote_id=?",[id]);if(!body.items.length){await connection.rollback();return sendJson(response,400,{message:"Mindestens eine Angebotsposition ist erforderlich."});}for(let index=0;index<body.items.length;index+=1){const item=quoteItemPayload(body.items[index],index+1);if(!item){await connection.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie alle Angebotspositionen."});}await connection.execute("INSERT INTO quote_items (quote_id,sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",[id,item.sortOrder,item.title,item.description,item.quantity,item.unit,item.unitPrice,item.discount,item.net,item.taxRate,item.tax,item.gross]);}} }
+            const totals=await recalculateQuote(connection,id); await connection.commit(); return sendJson(response,request.method==='POST'?201:200,{id,quoteNumber:number,message:request.method==='POST'?"Angebot erstellt.":"Angebot gespeichert.",totals});
+        } catch(error){await connection.rollback();throw error;} finally {connection.release();}
+    }
+    if (contractMatch) {
+        if (contractId && request.method === "GET") { const [rows]=await adminPool.execute("SELECT c.*,cu.customer_number,cu.first_name,cu.last_name,q.quote_number FROM contracts c JOIN customers cu ON cu.id=c.customer_id LEFT JOIN quotes q ON q.id=c.quote_id WHERE c.id=?",[contractId]);return rows[0]?sendJson(response,200,{contract:rows[0]}):sendJson(response,404,{message:"Vertrag nicht gefunden."}); }
+        if (!contractId && request.method === "GET") { const status=String(searchParams.get("status")||"all"),search=String(searchParams.get("search")||"").trim().slice(0,100);if(status!=="all"&&!contractStatuses.has(status))return sendJson(response,400,{message:"Ungültiger Status."});const where=[],values=[];if(status!=="all"){where.push("co.status=?");values.push(status)}if(search){where.push("(co.contract_number LIKE ? OR co.service_type LIKE ? OR cu.first_name LIKE ? OR cu.last_name LIKE ? OR cu.customer_number LIKE ?)");for(let i=0;i<5;i+=1)values.push(`%${search}%`)}const clause=where.length?` WHERE ${where.join(" AND ")}`:"";const [rows]=await adminPool.execute(`SELECT co.id,co.contract_number,co.service_type,co.interval_type,co.start_date,co.end_date,co.status,co.gross_amount,co.created_at,cu.first_name,cu.last_name,cu.customer_number FROM contracts co JOIN customers cu ON cu.id=co.customer_id${clause} ORDER BY co.created_at DESC,co.id DESC LIMIT 100`,values);return sendJson(response,200,{rows,total:rows.length}); }
+        if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+        if (request.method === "DELETE") { const [result]=await adminPool.execute("UPDATE contracts SET status='BEENDET' WHERE id=?",[contractId]);return result.affectedRows?sendJson(response,200,{message:"Vertrag beendet."}):sendJson(response,404,{message:"Vertrag nicht gefunden."}); }
+        if (!['POST','PATCH'].includes(request.method)) return sendJson(response,405,{message:"Methode nicht erlaubt."});
+        let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Vertragsdaten."})};const customerId=Number(body.customer_id),quoteIdValue=body.quote_id==null||body.quote_id===""?null:Number(body.quote_id),startDate=readText(body.start_date,10),endDate=readText(body.end_date,10,{optional:true}),serviceDescription=readText(body.service_description,8000,{multiline:true}),serviceType=readText(body.service_type,160),interval=readText(body.interval_type||"INDIVIDUELL",32),details=readText(body.interval_details,255,{optional:true}),payment=readText(body.payment_interval,80,{optional:true}),status=readText(body.status||"ENTWURF",20),notes=readText(body.internal_notes,8000,{optional:true,multiline:true}),notice=body.cancellation_notice_days==null||body.cancellation_notice_days===""?null:Number(body.cancellation_notice_days),taxRate=money(body.tax_rate,{allowEmpty:false}),net=money(body.net_amount,{allowEmpty:false});
+        if(!Number.isSafeInteger(customerId)||customerId<1||quoteIdValue!==null&&(!Number.isSafeInteger(quoteIdValue)||quoteIdValue<1)||!isIsoDate(startDate)||(endDate&&!isIsoDate(endDate))||(endDate&&endDate<startDate)||!serviceDescription||!serviceType||!contractIntervals.has(interval)||!contractStatuses.has(status)||!Number.isSafeInteger(notice)&&notice!==null||notice!==null&&(notice<0||notice>3650)||taxRate===null||taxRate>100||net===null)return sendJson(response,400,{message:"Bitte prüfen Sie die Vertragsdaten."});
+        const tax=Math.round(net*taxRate)/100,gross=Math.round((net+tax)*100)/100;const [customers]=await adminPool.execute("SELECT id FROM customers WHERE id=?",[customerId]);if(!customers[0])return sendJson(response,404,{message:"Kunde nicht gefunden."});if(quoteIdValue!==null){const [quotes]=await adminPool.execute("SELECT id,customer_id FROM quotes WHERE id=?",[quoteIdValue]);if(!quotes[0])return sendJson(response,404,{message:"Angebot nicht gefunden."});if(Number(quotes[0].customer_id)!==customerId)return sendJson(response,400,{message:"Das Angebot gehört zu einem anderen Kunden."});}
+        const fields=[customerId,quoteIdValue,startDate,endDate||null,notice,readText(body.cancellation_date,10,{optional:true})||null,readText(body.termination_date,10,{optional:true})||null,readText(body.termination_note,8000,{optional:true,multiline:true})||null,serviceDescription,serviceType,interval,details||null,net,taxRate,tax,gross,payment||null,status,notes||null];const connection=await adminPool.getConnection();try{await connection.beginTransaction();let id=contractId,number;if(request.method==='POST'){const [result]=await connection.execute("INSERT INTO contracts (customer_id,quote_id,start_date,end_date,cancellation_notice_days,cancellation_date,termination_date,termination_note,service_description,service_type,interval_type,interval_details,net_amount,tax_rate,tax_amount,gross_amount,payment_interval,status,internal_notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",fields);id=result.insertId;number=await createDocumentNumber(connection,"contracts","VER",id);}else{const [result]=await connection.execute("UPDATE contracts SET customer_id=?,quote_id=?,start_date=?,end_date=?,cancellation_notice_days=?,cancellation_date=?,termination_date=?,termination_note=?,service_description=?,service_type=?,interval_type=?,interval_details=?,net_amount=?,tax_rate=?,tax_amount=?,gross_amount=?,payment_interval=?,status=?,internal_notes=? WHERE id=?",[...fields,id]);if(!result.affectedRows){await connection.rollback();return sendJson(response,404,{message:"Vertrag nicht gefunden."});}}await connection.commit();return sendJson(response,request.method==='POST'?201:200,{id,contractNumber:number,message:request.method==='POST'?"Vertrag erstellt.":"Vertrag gespeichert."});}catch(error){await connection.rollback();throw error;}finally{connection.release();}
+    }
+    return sendJson(response,404,{message:"API-Endpunkt nicht gefunden."});
+}
+
+function invoiceItemPayload(input, sortOrder) {
+    const title = readText(input?.title, 180);
+    const description = readText(input?.description, 4000, { optional: true, multiline: true });
+    const unit = readText(input?.unit, 40);
+    const quantity = money(input?.quantity, { allowEmpty: false });
+    const unitPrice = money(input?.unit_price, { allowEmpty: false });
+    const discount = money(input?.discount_amount);
+    const taxRate = money(input?.tax_rate, { allowEmpty: false });
+    if (!title || description === null || !invoiceUnits.has(unit) || quantity === null || quantity <= 0 || unitPrice === null || discount === null || taxRate === null || taxRate > 100) return null;
+    const base = Math.round(quantity * unitPrice * 100) / 100;
+    if (discount > base) return null;
+    const net = Math.round((base - discount) * 100) / 100;
+    const tax = Math.round(net * taxRate) / 100;
+    return { sortOrder, title, description: description || null, quantity, unit, unitPrice, discount, net, taxRate, tax, gross: Math.round((net + tax) * 100) / 100 };
+}
+
+function invoicePayload(body) {
+    const customerId = Number(body?.customer_id);
+    const orderId = body?.order_id === "" || body?.order_id == null ? null : Number(body.order_id);
+    const quoteId = body?.sales_quote_id === "" || body?.sales_quote_id == null ? null : Number(body.sales_quote_id);
+    const contractId = body?.contract_id === "" || body?.contract_id == null ? null : Number(body.contract_id);
+    const invoiceDate = readText(body?.invoice_date, 10);
+    const periodFrom = readText(body?.service_period_from, 10, { optional: true });
+    const periodTo = readText(body?.service_period_to, 10, { optional: true });
+    const dueDate = readText(body?.due_date, 10);
+    const status = readText(body?.status || "ENTWURF", 20);
+    const notes = readText(body?.notes, 8000, { optional: true, multiline: true });
+    if (!Number.isSafeInteger(customerId) || customerId < 1 || (orderId !== null && (!Number.isSafeInteger(orderId) || orderId < 1)) || (quoteId !== null && (!Number.isSafeInteger(quoteId) || quoteId < 1)) || (contractId !== null && (!Number.isSafeInteger(contractId) || contractId < 1)) || !isIsoDate(invoiceDate) || !isIsoDate(dueDate) || dueDate < invoiceDate || (periodFrom && !isIsoDate(periodFrom)) || (periodTo && !isIsoDate(periodTo)) || (periodFrom && periodTo && periodFrom > periodTo) || !invoiceStatuses.has(status) || !["ENTWURF", "AUSGESTELLT", "GESENDET"].includes(status) || notes === null) return null;
+    return { customerId, orderId, quoteId, contractId, invoiceDate, periodFrom: periodFrom || null, periodTo: periodTo || null, dueDate, status, notes: notes || null };
+}
+
+async function customerInvoiceSnapshot(connection, customerId) {
+    const [rows] = await connection.execute("SELECT customer_number,first_name,last_name,address,postal_code,city FROM customers WHERE id=?", [customerId]);
+    const customer = rows[0];
+    if (!customer) return null;
+    return { number: customer.customer_number || null, name: `${customer.first_name} ${customer.last_name}`.trim(), address: customer.address || null, postalCode: customer.postal_code || null, city: customer.city || null };
+}
+
+async function recalculateInvoice(connection, invoiceId) {
+    const [[items]] = await connection.execute("SELECT COALESCE(SUM(net_amount),0) AS net_amount,COALESCE(SUM(tax_amount),0) AS tax_amount,COALESCE(SUM(gross_amount),0) AS gross_amount FROM invoice_items WHERE invoice_id=?", [invoiceId]);
+    const [[payments]] = await connection.execute("SELECT COALESCE(SUM(amount),0) AS paid_amount FROM invoice_payments WHERE invoice_id=?", [invoiceId]);
+    const [[invoice]] = await connection.execute("SELECT status,due_date FROM invoices WHERE id=? FOR UPDATE", [invoiceId]);
+    if (!invoice) return null;
+    const gross = Number(items.gross_amount || 0), paid = Math.min(Number(payments.paid_amount || 0), gross), outstanding = Math.max(0, Math.round((gross - paid) * 100) / 100);
+    let status = invoice.status;
+    if (status !== "STORNIERT") {
+        if (gross > 0 && paid >= gross) status = "BEZAHLT";
+        else if (paid > 0) status = "TEILBEZAHLT";
+        else if (status !== "ENTWURF" && String(invoice.due_date).slice(0, 10) < new Date().toISOString().slice(0, 10)) status = "ÜBERFÄLLIG";
+    }
+    await connection.execute("UPDATE invoices SET net_amount=?,tax_amount=?,gross_amount=?,paid_amount=?,outstanding_amount=?,status=? WHERE id=?", [items.net_amount, items.tax_amount, items.gross_amount, paid, outstanding, status, invoiceId]);
+    return { net_amount: items.net_amount, tax_amount: items.tax_amount, gross_amount: items.gross_amount, paid_amount: paid, outstanding_amount: outstanding, status };
+}
+
+async function createInvoiceNumber(connection, id) {
+    const number = `RE-${new Date().getFullYear()}-${String(id).padStart(4, "0")}`;
+    await connection.execute("UPDATE invoices SET invoice_number=? WHERE id=?", [number, id]);
+    return number;
+}
+
+async function refreshOverdueInvoices(connection) {
+    await connection.execute("UPDATE invoices SET status='ÜBERFÄLLIG' WHERE due_date < CURDATE() AND outstanding_amount > 0 AND status IN ('AUSGESTELLT','GESENDET','TEILBEZAHLT')");
+}
+
+async function handleAdminInvoices(request, response, pathname, searchParams) {
+    if (!adminPool) return sendJson(response, 503, { message: "Die Datenbankrechte für Rechnungen sind noch nicht eingerichtet." });
+    const fromOrder = pathname.match(/^\/api\/admin\/orders\/(\d+)\/create-invoice$/);
+    const match = pathname.match(/^\/api\/admin\/invoices(?:\/(\d+)(?:\/(items|payments)(?:\/(\d+))?)?)?$/);
+    const invoiceId = match?.[1] ? Number(match[1]) : null, resource = match?.[2] || "", resourceId = match?.[3] ? Number(match[3]) : null;
+    if (fromOrder) {
+        if (request.method !== "POST" || !isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
+        const orderId = Number(fromOrder[1]), connection = await adminPool.getConnection();
+        try {
+            await connection.beginTransaction();
+            const [orders] = await connection.execute("SELECT * FROM orders WHERE id=? FOR UPDATE", [orderId]); const order = orders[0];
+            if (!order) { await connection.rollback(); return sendJson(response, 404, { message: "Auftrag nicht gefunden." }); }
+            const [existing] = await connection.execute("SELECT id,invoice_number FROM invoices WHERE order_id=?", [orderId]);
+            if (existing[0]) { await connection.rollback(); return sendJson(response, 409, { message: `Für diesen Auftrag existiert bereits die Rechnung ${existing[0].invoice_number}.` }); }
+            const snapshot = await customerInvoiceSnapshot(connection, order.customer_id); if (!snapshot) { await connection.rollback(); return sendJson(response, 404, { message: "Kunde nicht gefunden." }); }
+            const today = new Date().toISOString().slice(0, 10), due = new Date(Date.now() + 14 * 86400000).toISOString().slice(0, 10);
+            const [created] = await connection.execute("INSERT INTO invoices (customer_id,order_id,sales_quote_id,contract_id,customer_number_snapshot,customer_name_snapshot,billing_address_snapshot,billing_postal_code_snapshot,billing_city_snapshot,invoice_date,service_period_from,service_period_to,due_date,status,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [order.customer_id,order.id,order.sales_quote_id || null,order.contract_id || null,snapshot.number,snapshot.name,snapshot.address,snapshot.postalCode,snapshot.city,today,order.preferred_date || null,order.preferred_date || null,due,"ENTWURF",`Aus Auftrag ${order.order_number} erstellt.`]);
+            const id = created.insertId, net = Number(order.price_net_snapshot || 0), tax = Number(order.price_tax_snapshot || 0), gross = Number(order.price_gross_snapshot || 0), taxRate = net > 0 ? Math.round((tax / net) * 10000) / 100 : 0;
+            await connection.execute("INSERT INTO invoice_items (invoice_id,sort_order,title,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?)", [id,1,order.title,1,"Pauschale",net,0,net,taxRate,tax,gross]);
+            const number = await createInvoiceNumber(connection, id); const totals = await recalculateInvoice(connection, id); await connection.commit();
+            return sendJson(response, 201, { id, invoiceNumber: number, totals, message: "Rechnungsentwurf aus Auftrag erstellt." });
+        } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
+    }
+    if (!match) return sendJson(response, 404, { message: "API-Endpunkt nicht gefunden." });
+    if (resource) {
+        if (!invoiceId) return sendJson(response, 404, { message: "Rechnung nicht gefunden." });
+        if (request.method === "GET" && !resourceId) {
+            const table = resource === "items" ? "invoice_items" : "invoice_payments";
+            const [rows] = await adminPool.execute(`SELECT * FROM ${table} WHERE invoice_id=? ORDER BY ${resource === "items" ? "sort_order,id" : "payment_date,id"}`, [invoiceId]); return sendJson(response, 200, { rows });
+        }
+        if (!isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
+        if (!["POST", "PATCH", "DELETE"].includes(request.method)) return sendJson(response, 405, { message: "Methode nicht erlaubt." });
+        const connection = await adminPool.getConnection();
+        try {
+            await connection.beginTransaction(); const [[invoice]] = await connection.execute("SELECT id,status,gross_amount FROM invoices WHERE id=? FOR UPDATE", [invoiceId]);
+            if (!invoice) { await connection.rollback(); return sendJson(response, 404, { message: "Rechnung nicht gefunden." }); }
+            if (resource === "items" && invoice.status !== "ENTWURF") { await connection.rollback(); return sendJson(response, 409, { message: "Positionen können nur im Entwurf geändert werden." }); }
+            if (resource === "payments" && invoice.status === "STORNIERT") { await connection.rollback(); return sendJson(response, 409, { message: "Für stornierte Rechnungen sind keine Zahlungen möglich." }); }
+            if (request.method === "DELETE") {
+                if (!resourceId) { await connection.rollback(); return sendJson(response, 400, { message: "Eintrag fehlt." }); }
+                const [result] = await connection.execute(`DELETE FROM ${resource === "items" ? "invoice_items" : "invoice_payments"} WHERE id=? AND invoice_id=?`, [resourceId, invoiceId]);
+                if (!result.affectedRows) { await connection.rollback(); return sendJson(response, 404, { message: "Eintrag nicht gefunden." }); }
+            } else {
+                let body; try { body = await readJson(request); } catch { await connection.rollback(); return sendJson(response, 400, { message: "Ungültige Daten." }); }
+                if (resource === "items") {
+                    if (invoice.status !== "ENTWURF") { await connection.rollback(); return sendJson(response, 409, { message: "Positionen können nur im Entwurf geändert werden." }); }
+                    const item = invoiceItemPayload(body, Number(body.sort_order) || 1); if (!item) { await connection.rollback(); return sendJson(response, 400, { message: "Bitte prüfen Sie die Rechnungsposition." }); }
+                    if (request.method === "POST") await connection.execute("INSERT INTO invoice_items (invoice_id,sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [invoiceId,item.sortOrder,item.title,item.description,item.quantity,item.unit,item.unitPrice,item.discount,item.net,item.taxRate,item.tax,item.gross]);
+                    else { if (!resourceId) { await connection.rollback(); return sendJson(response,400,{message:"Position fehlt."}); } await connection.execute("UPDATE invoice_items SET sort_order=?,title=?,description=?,quantity=?,unit=?,unit_price=?,discount_amount=?,net_amount=?,tax_rate=?,tax_amount=?,gross_amount=? WHERE id=? AND invoice_id=?", [item.sortOrder,item.title,item.description,item.quantity,item.unit,item.unitPrice,item.discount,item.net,item.taxRate,item.tax,item.gross,resourceId,invoiceId]); }
+                } else {
+                    if (invoice.status === "STORNIERT") { await connection.rollback(); return sendJson(response, 409, { message: "Für stornierte Rechnungen sind keine Zahlungen möglich." }); }
+                    const paymentDate = readText(body.payment_date,10), amount = money(body.amount,{allowEmpty:false}), method = readText(body.payment_method,32), reference = readText(body.payment_reference,180,{optional:true}), notes = readText(body.notes,4000,{optional:true,multiline:true});
+                    if (!isIsoDate(paymentDate) || amount === null || amount <= 0 || !paymentMethods.has(method) || reference === null || notes === null) { await connection.rollback(); return sendJson(response,400,{message:"Bitte prüfen Sie die Zahlungsdaten."}); }
+                    const [[paid]] = await connection.execute("SELECT COALESCE(SUM(amount),0) AS total FROM invoice_payments WHERE invoice_id=? AND id<>?", [invoiceId, resourceId || 0]); if (Number(paid.total) + amount > Number(invoice.gross_amount) + 0.0001) { await connection.rollback(); return sendJson(response,409,{message:"Die Zahlung übersteigt den offenen Rechnungsbetrag."}); }
+                    if (request.method === "POST") await connection.execute("INSERT INTO invoice_payments (invoice_id,payment_date,amount,payment_method,payment_reference,notes) VALUES (?,?,?,?,?,?)", [invoiceId,paymentDate,amount,method,reference || null,notes || null]);
+                    else { if (!resourceId) { await connection.rollback(); return sendJson(response,400,{message:"Zahlung fehlt."}); } await connection.execute("UPDATE invoice_payments SET payment_date=?,amount=?,payment_method=?,payment_reference=?,notes=? WHERE id=? AND invoice_id=?", [paymentDate,amount,method,reference || null,notes || null,resourceId,invoiceId]); }
+                }
+            }
+            const totals = await recalculateInvoice(connection, invoiceId); await connection.commit(); return sendJson(response, request.method === "POST" ? 201 : 200, { totals, message: resource === "items" ? "Rechnungsposition gespeichert." : "Zahlung gespeichert." });
+        } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
+    }
+    if (!invoiceId && request.method === "GET") {
+        await refreshOverdueInvoices(adminPool);
+        const status=String(searchParams.get("status")||"all"),search=String(searchParams.get("search")||"").trim().slice(0,100),customer=Number(searchParams.get("customer_id")||0),order=Number(searchParams.get("order_id")||0),due=String(searchParams.get("due")||"");
+        if ((status!=="all"&&!invoiceStatuses.has(status)) || (customer&&(!Number.isSafeInteger(customer)||customer<1)) || (order&&(!Number.isSafeInteger(order)||order<1)) || (due&&!isIsoDate(due))) return sendJson(response,400,{message:"Ungültige Filter."});
+        const where=[],values=[]; if(status!=="all"){where.push("i.status=?");values.push(status)} if(customer){where.push("i.customer_id=?");values.push(customer)} if(order){where.push("i.order_id=?");values.push(order)} if(due){where.push("i.due_date=?");values.push(due)} if(search){where.push("(i.invoice_number LIKE ? OR i.customer_name_snapshot LIKE ? OR c.customer_number LIKE ?)");for(let n=0;n<3;n+=1)values.push(`%${search}%`)} const clause=where.length?` WHERE ${where.join(" AND ")}`:"";
+        const [rows]=await adminPool.execute(`SELECT i.*,c.first_name,c.last_name,c.customer_number,o.order_number FROM invoices i JOIN customers c ON c.id=i.customer_id LEFT JOIN orders o ON o.id=i.order_id${clause} ORDER BY i.invoice_date DESC,i.id DESC LIMIT 100`,values); return sendJson(response,200,{rows,total:rows.length});
+    }
+    if (invoiceId && request.method === "GET") { const [rows]=await adminPool.execute("SELECT i.*,o.order_number,q.quote_number,co.contract_number FROM invoices i LEFT JOIN orders o ON o.id=i.order_id LEFT JOIN quotes q ON q.id=i.sales_quote_id LEFT JOIN contracts co ON co.id=i.contract_id WHERE i.id=?",[invoiceId]); if(!rows[0])return sendJson(response,404,{message:"Rechnung nicht gefunden."}); const [items]=await adminPool.execute("SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY sort_order,id",[invoiceId]); const [payments]=await adminPool.execute("SELECT * FROM invoice_payments WHERE invoice_id=? ORDER BY payment_date,id",[invoiceId]); return sendJson(response,200,{invoice:rows[0],items,payments}); }
+    if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+    if (request.method === "DELETE") {
+        const [invoices] = await adminPool.execute("SELECT status,paid_amount FROM invoices WHERE id=?", [invoiceId]);
+        const invoice = invoices[0];
+        if (!invoice) return sendJson(response,404,{message:"Rechnung nicht gefunden."});
+        if (invoice.status === "STORNIERT") return sendJson(response,409,{message:"Die Rechnung ist bereits storniert."});
+        if (Number(invoice.paid_amount) > 0) return sendJson(response,409,{message:"Rechnungen mit Zahlungen können nicht storniert werden."});
+        await adminPool.execute("UPDATE invoices SET status='STORNIERT' WHERE id=?",[invoiceId]);
+        return sendJson(response,200,{message:"Rechnung storniert."});
+    }
+    if (!["POST","PATCH"].includes(request.method)) return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Rechnungsdaten."})}; const data=invoicePayload(body); if(!data)return sendJson(response,400,{message:"Bitte prüfen Sie die Rechnungsdaten."});
+    const connection=await adminPool.getConnection(); try { await connection.beginTransaction(); if(request.method==="PATCH"){const [[existing]] = await connection.execute("SELECT status FROM invoices WHERE id=? FOR UPDATE",[invoiceId]);if(!existing){await connection.rollback();return sendJson(response,404,{message:"Rechnung nicht gefunden."})}if(existing.status!=="ENTWURF"){await connection.rollback();return sendJson(response,409,{message:"Ausgestellte Rechnungen können nicht mehr geändert werden."})}} const snapshot=await customerInvoiceSnapshot(connection,data.customerId); if(!snapshot){await connection.rollback();return sendJson(response,404,{message:"Kunde nicht gefunden."})}; if(data.orderId!==null){const [orders]=await connection.execute("SELECT id,customer_id FROM orders WHERE id=?",[data.orderId]);if(!orders[0]||Number(orders[0].customer_id)!==data.customerId){await connection.rollback();return sendJson(response,400,{message:"Der Auftrag gehört nicht zu diesem Kunden."})}} const fields=[data.customerId,data.orderId,data.quoteId,data.contractId,snapshot.number,snapshot.name,snapshot.address,snapshot.postalCode,snapshot.city,data.invoiceDate,data.periodFrom,data.periodTo,data.dueDate,data.status,data.notes]; let id=invoiceId,number;
+        if(request.method==="POST"){const items=Array.isArray(body.items)?body.items:[];if(!items.length){await connection.rollback();return sendJson(response,400,{message:"Mindestens eine Rechnungsposition ist erforderlich."})};const [created]=await connection.execute("INSERT INTO invoices (customer_id,order_id,sales_quote_id,contract_id,customer_number_snapshot,customer_name_snapshot,billing_address_snapshot,billing_postal_code_snapshot,billing_city_snapshot,invoice_date,service_period_from,service_period_to,due_date,status,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",fields);id=created.insertId;number=await createInvoiceNumber(connection,id);for(let index=0;index<items.length;index+=1){const item=invoiceItemPayload(items[index],index+1);if(!item){await connection.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie alle Rechnungspositionen."})}await connection.execute("INSERT INTO invoice_items (invoice_id,sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",[id,item.sortOrder,item.title,item.description,item.quantity,item.unit,item.unitPrice,item.discount,item.net,item.taxRate,item.tax,item.gross])}}
+        else { const [result]=await connection.execute("UPDATE invoices SET customer_id=?,order_id=?,sales_quote_id=?,contract_id=?,customer_number_snapshot=?,customer_name_snapshot=?,billing_address_snapshot=?,billing_postal_code_snapshot=?,billing_city_snapshot=?,invoice_date=?,service_period_from=?,service_period_to=?,due_date=?,status=?,notes=? WHERE id=?",[...fields,id]);if(!result.affectedRows){await connection.rollback();return sendJson(response,404,{message:"Rechnung nicht gefunden."})}if(Array.isArray(body.items)){if(data.status!=="ENTWURF"){await connection.rollback();return sendJson(response,409,{message:"Positionen können nur im Entwurf geändert werden."})}await connection.execute("DELETE FROM invoice_items WHERE invoice_id=?",[id]);if(!body.items.length){await connection.rollback();return sendJson(response,400,{message:"Mindestens eine Rechnungsposition ist erforderlich."})}for(let index=0;index<body.items.length;index+=1){const item=invoiceItemPayload(body.items[index],index+1);if(!item){await connection.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie alle Rechnungspositionen."})}await connection.execute("INSERT INTO invoice_items (invoice_id,sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",[id,item.sortOrder,item.title,item.description,item.quantity,item.unit,item.unitPrice,item.discount,item.net,item.taxRate,item.tax,item.gross])}} }
+        const totals=await recalculateInvoice(connection,id);await connection.commit();return sendJson(response,request.method==="POST"?201:200,{id,invoiceNumber:number,totals,message:request.method==="POST"?"Rechnung erstellt.":"Rechnung gespeichert."});
+    }catch(error){await connection.rollback();throw error}finally{connection.release()}
+}
+
 async function handleAdminApi(request, response, pathname, searchParams) {
     if (pathname === "/api/admin/login") {
         if (request.method !== "POST") {
@@ -1165,7 +1656,10 @@ async function handleAdminApi(request, response, pathname, searchParams) {
     const session = adminSessionOrRespond(request, response);
     if (!session) return;
 
-    if (pathname === "/api/admin/quotes" || /^\/api\/admin\/quotes\/\d+(?:\/files\/\d+)?$/.test(pathname)) {
+    if (pathname === "/api/admin/quotes" || /^\/api\/admin\/quotes\/\d+(?:\/items(?:\/\d+)?|\/create-order)?$/.test(pathname) || pathname === "/api/admin/contracts" || /^\/api\/admin\/contracts\/\d+$/.test(pathname)) {
+        return handleAdminCommercial(request, response, pathname, searchParams);
+    }
+    if (pathname === "/api/admin/quote-requests" || /^\/api\/admin\/quote-requests\/\d+(?:\/files\/\d+)?$/.test(pathname)) {
         return handleAdminQuotes(request, response, pathname, searchParams);
     }
     if (pathname === "/api/admin/appointments" || /^\/api\/admin\/appointments\/\d+$/.test(pathname)) {
@@ -1183,8 +1677,14 @@ async function handleAdminApi(request, response, pathname, searchParams) {
     if (pathname === "/api/admin/employee-tasks" || /^\/api\/admin\/employee-tasks\/\d+$/.test(pathname)) {
         return handleAdminEmployeeTasks(request, response, pathname, searchParams);
     }
+    if (pathname === "/api/admin/recurring-orders" || /^\/api\/admin\/recurring-orders\/\d+$/.test(pathname) || pathname === "/api/admin/recurring-orders/generate" || pathname === "/api/admin/automation-logs") {
+        return handleAdminRecurringOrders(request, response, pathname, searchParams);
+    }
     if (pathname === "/api/admin/orders" || /^\/api\/admin\/orders\/\d+(?:\/assignments(?:\/\d+)?)?$/.test(pathname)) {
         return handleAdminOrders(request, response, pathname, searchParams);
+    }
+    if (pathname === "/api/admin/invoices" || /^\/api\/admin\/invoices\/\d+(?:\/(?:items|payments)(?:\/\d+)?)?$/.test(pathname) || /^\/api\/admin\/orders\/\d+\/create-invoice$/.test(pathname)) {
+        return handleAdminInvoices(request, response, pathname, searchParams);
     }
 
     if (pathname !== "/api/admin/summary" && pathname !== "/api/admin/submissions") {
@@ -1475,6 +1975,45 @@ async function handleCustomerApi(request, response, pathname, searchParams) {
         const [rows] = await pool.execute(`SELECT id,order_number,service_type,title,description,object_type,address,postal_code,city,preferred_date,status,priority,created_at FROM orders WHERE customer_id=?${orderId ? " AND id=?" : ""} ORDER BY preferred_date DESC,id DESC`, orderId ? [session.customerId, orderId] : [session.customerId]);
         if (orderId && !rows[0]) return sendJson(response, 404, { message: "Auftrag nicht gefunden." });
         return sendJson(response, 200, orderId ? { order: rows[0] } : { rows });
+    }
+    const customerQuoteMatch = pathname.match(/^\/api\/customer\/quotes(?:\/(\d+)(?:\/accept)?)?$/);
+    if (customerQuoteMatch) {
+        const quoteId = customerQuoteMatch[1] ? Number(customerQuoteMatch[1]) : null;
+        const accepting = pathname.endsWith("/accept");
+        if (accepting) {
+            if (request.method !== "POST" || !isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
+            const [result] = await pool.execute("UPDATE quotes SET status='ANGENOMMEN',accepted_at=COALESCE(accepted_at,CURRENT_TIMESTAMP),accepted_by_customer_id=? WHERE id=? AND customer_id=? AND status='GESENDET'", [session.customerId, quoteId, session.customerId]);
+            return result.affectedRows ? sendJson(response, 200, { message: "Das Angebot wurde dokumentiert angenommen.", status: "ANGENOMMEN" }) : sendJson(response, 404, { message: "Angebot nicht gefunden oder nicht zur Annahme verfügbar." });
+        }
+        if (request.method !== "GET") return sendJson(response, 405, { message: "Methode nicht erlaubt." });
+        if (quoteId) {
+            const [rows] = await pool.execute("SELECT id,quote_number,service_description,object_address,postal_code,city,service_type,area_sqm,frequency,start_date,valid_until,customer_notes,net_amount,tax_amount,gross_amount,status,accepted_at,created_at FROM quotes WHERE id=? AND customer_id=?", [quoteId, session.customerId]);
+            if (!rows[0]) return sendJson(response, 404, { message: "Angebot nicht gefunden." });
+            const [items] = await pool.execute("SELECT id,sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount FROM quote_items WHERE quote_id=? ORDER BY sort_order,id", [quoteId]);
+            return sendJson(response, 200, { quote: rows[0], items });
+        }
+        const [rows] = await pool.execute("SELECT id,quote_number,service_type,valid_until,net_amount,tax_amount,gross_amount,status,created_at FROM quotes WHERE customer_id=? ORDER BY created_at DESC,id DESC", [session.customerId]);
+        return sendJson(response, 200, { rows });
+    }
+    const customerContractMatch = pathname.match(/^\/api\/customer\/contracts(?:\/(\d+))?$/);
+    if (customerContractMatch && request.method === "GET") {
+        const contractId = customerContractMatch[1] ? Number(customerContractMatch[1]) : null;
+        const columns = "co.id,co.contract_number,co.start_date,co.end_date,co.service_description,co.service_type,co.interval_type,co.interval_details,co.net_amount,co.tax_rate,co.tax_amount,co.gross_amount,co.payment_interval,co.status,co.created_at";
+        const [rows] = await pool.execute(`SELECT ${columns},(SELECT o.planned_start FROM orders o WHERE o.contract_id=co.id AND o.customer_id=co.customer_id AND o.status <> 'STORNIERT' AND o.planned_start >= NOW() ORDER BY o.planned_start LIMIT 1) AS next_service_at,(SELECT o.status FROM orders o WHERE o.contract_id=co.id AND o.customer_id=co.customer_id AND o.status <> 'STORNIERT' AND o.planned_start >= NOW() ORDER BY o.planned_start LIMIT 1) AS next_service_status FROM contracts co WHERE co.customer_id=?${contractId ? " AND co.id=?" : ""} ORDER BY co.created_at DESC,co.id DESC`, contractId ? [session.customerId,contractId] : [session.customerId]);
+        if (contractId && !rows[0]) return sendJson(response,404,{message:"Vertrag nicht gefunden."});
+        return sendJson(response,200,contractId?{contract:rows[0]}:{rows});
+    }
+    const customerInvoiceMatch = pathname.match(/^\/api\/customer\/invoices(?:\/(\d+))?$/);
+    if (customerInvoiceMatch && request.method === "GET") {
+        const invoiceId = customerInvoiceMatch[1] ? Number(customerInvoiceMatch[1]) : null;
+        if (invoiceId) {
+            const [rows] = await pool.execute("SELECT id,invoice_number,invoice_date,service_period_from,service_period_to,due_date,status,net_amount,tax_amount,gross_amount,paid_amount,outstanding_amount FROM invoices WHERE id=? AND customer_id=?", [invoiceId, session.customerId]);
+            if (!rows[0]) return sendJson(response, 404, { message: "Rechnung nicht gefunden." });
+            const [items] = await pool.execute("SELECT sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount FROM invoice_items WHERE invoice_id=? ORDER BY sort_order,id", [invoiceId]);
+            return sendJson(response, 200, { invoice: rows[0], items });
+        }
+        const [rows] = await pool.execute("SELECT id,invoice_number,invoice_date,due_date,status,net_amount,tax_amount,gross_amount,paid_amount,outstanding_amount FROM invoices WHERE customer_id=? ORDER BY invoice_date DESC,id DESC", [session.customerId]);
+        return sendJson(response, 200, { rows });
     }
     const resource = pathname.match(/^\/api\/customer\/(appointments|quotes)(?:\/(\d+))?$/); if (resource && request.method === "GET") { const table=resource[1]==="appointments"?"appointments":"quote_requests", link=table==="appointments"?"portal_customer_id":"customer_id", id=resource[2]?Number(resource[2]):null; const columns=table==="appointments"?"id,service,object_type,address,postal_code,city,preferred_date,start_time,end_time,status,created_at":"id,requested_service,object_type,address,postal_code,city,status,created_at"; const [rows]=await pool.execute(`SELECT ${columns} FROM ${table} WHERE ${link}=?${id?" AND id=?":""} ORDER BY created_at DESC`,id?[session.customerId,id]:[session.customerId]); if(id&&!rows[0])return sendJson(response,404,{message:"Eintrag nicht gefunden."}); return sendJson(response,200,id?{[resource[1].slice(0,-1)]:rows[0]}:{rows}); }
     return sendJson(response,404,{message:"API-Endpunkt nicht gefunden."});
