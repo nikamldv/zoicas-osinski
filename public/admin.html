@@ -11,7 +11,7 @@
     <script src="../js/admin.js" defer></script>
 </head>
 <body>
-    <main id="login-view" class="login-screen" hidden>
+    <main id="login-view" class="login-screen">
         <a class="back-link" href="../index.html">&larr; Zurück zur Website</a>
         <section class="login-card" aria-labelledby="login-title">
             <div class="login-mark" aria-hidden="true">Z&amp;O</div>
@@ -72,6 +72,10 @@
                 <button class="nav-item" type="button" data-type="order"><span class="nav-icon" aria-hidden="true">▣</span><span>Aufträge</span><span id="nav-order-count" class="nav-count">—</span></button>
                 <button class="nav-item" type="button" data-type="schedule"><span class="nav-icon" aria-hidden="true">▤</span><span>Einsatzplanung</span><span class="nav-count">↗</span></button>
             </nav>
+                <button class="nav-item" type="button" data-type="document"><span class="nav-icon" aria-hidden="true">▣</span><span>Dokumente</span><span class="nav-count">↗</span></button>
+                <button class="nav-item" type="button" data-type="message"><span class="nav-icon" aria-hidden="true">✉</span><span>Nachrichten</span><span class="nav-count">↗</span></button>
+                <button class="nav-item" type="button" data-type="notification"><span class="nav-icon" aria-hidden="true">●</span><span>Benachrichtigungen</span><span class="nav-count">↗</span></button>
+                <button class="nav-item" type="button" data-type="audit"><span class="nav-icon" aria-hidden="true">◫</span><span>Audit-Protokoll</span><span class="nav-count">↗</span></button>
             <div class="sidebar-bottom">
                 <a class="back-link" href="../index.html">Website ansehen <span aria-hidden="true">↗</span></a>
                 <div class="account-card">
@@ -97,6 +101,8 @@
                     <button id="create-recurring-button" class="button button-primary" type="button" hidden>Einsatzplan anlegen</button>
                     <button id="generate-recurring-button" class="button button-light" type="button" hidden>Aufträge generieren</button>
                     <button id="create-invoice-button" class="button button-primary" type="button" hidden>Rechnung anlegen</button>
+                    <button id="create-document-button" class="button button-primary" type="button" hidden>Dokument hochladen</button>
+                    <button id="create-message-button" class="button button-primary" type="button" hidden>Nachricht senden</button>
                     <button id="refresh-button" class="button button-light" type="button"><span aria-hidden="true">⟳</span> Aktualisieren</button>
                 </div>
             </header>
@@ -381,6 +387,29 @@
         <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
         <p class="eyebrow">AUTOMATISIERUNG</p><h2 id="generator-dialog-title">Aufträge generieren</h2>
         <form id="generator-form" class="admin-employee-form"><label>Zeitraum *<select name="days"><option value="7">Nächste 7 Tage</option><option value="14">Nächste 14 Tage</option><option value="30">Nächste 30 Tage</option></select></label><p id="generator-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Kontrolliert generieren</button></form>
+    </dialog>
+    <dialog id="document-dialog" class="detail-dialog employee-dialog" aria-labelledby="document-dialog-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <p class="eyebrow">DOKUMENTENVERWALTUNG</p><h2 id="document-dialog-title">Dokument hochladen</h2>
+        <p class="employee-dialog-intro">Dateien werden privat gespeichert. Zulässig sind JPG, PNG und PDF.</p>
+        <form id="document-form" class="admin-employee-form" enctype="multipart/form-data">
+            <label>Kunde *<select id="document-customer" name="customer_id" required><option value="">Kunde wählen</option></select></label>
+            <label>Dokumenttyp *<select name="document_type" required><option>ANGEBOT</option><option>VERTRAG</option><option>AUFTRAG</option><option>LEISTUNGSNACHWEIS</option><option>RECHNUNG</option><option>ZAHLUNGSBELEG</option><option>VORHER_FOTO</option><option>NACHHER_FOTO</option><option selected>SONSTIGES</option></select></label>
+            <label>Sichtbarkeit *<select name="visibility"><option value="ADMIN">Nur Verwaltung</option><option value="CUSTOMER">Kunde</option><option value="EMPLOYEE">Zugewiesene Mitarbeitende</option></select></label>
+            <label>Datei *<input name="file" type="file" accept="image/jpeg,image/png,application/pdf" required></label>
+            <label>Quote-ID <input name="quote_id" type="number" min="1"></label><label>Vertrag-ID <input name="contract_id" type="number" min="1"></label><label>Auftrag-ID <input name="order_id" type="number" min="1"></label><label>Rechnung-ID <input name="invoice_id" type="number" min="1"></label>
+            <p id="document-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Sicher hochladen</button>
+        </form>
+    </dialog>
+    <dialog id="message-dialog" class="detail-dialog employee-dialog" aria-labelledby="message-dialog-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <p class="eyebrow">KUNDENNACHRICHT</p><h2 id="message-dialog-title">Nachricht senden</h2>
+        <form id="admin-message-form" class="admin-employee-form">
+            <label class="admin-form-wide">Kunde *<select id="message-customer" name="customer_id" required><option value="">Kunde wählen</option></select></label>
+            <label class="admin-form-wide">Betreff *<input name="subject" maxlength="180" required></label>
+            <label class="admin-form-wide">Nachricht *<textarea name="message" maxlength="8000" required></textarea></label>
+            <p id="admin-message-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Nachricht senden</button>
+        </form>
     </dialog>
 </body>
 </html>

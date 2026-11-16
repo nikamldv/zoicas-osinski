@@ -34,7 +34,7 @@ const weekdayNames = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag",
 
 async function api(url, options = {}) {
     const headers = new Headers(options.headers || {});
-    if (options.body) headers.set("Content-Type", "application/json");
+    if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
 
     const response = await fetch(url, {
         ...options,
@@ -99,7 +99,7 @@ function escapeHtml(value) {
 
 function updateViewHeading() {
     const career = currentType === "career";
-    const quote = currentType === "quote", offer = currentType === "offer", contract = currentType === "contract", recurring = currentType === "recurring", invoice = currentType === "invoice", appointment = currentType === "appointment", customer = currentType === "customer", employee = currentType === "employee", order = currentType === "order", schedule = currentType === "schedule";
+    const quote = currentType === "quote", offer = currentType === "offer", contract = currentType === "contract", recurring = currentType === "recurring", invoice = currentType === "invoice", appointment = currentType === "appointment", customer = currentType === "customer", employee = currentType === "employee", order = currentType === "order", schedule = currentType === "schedule", document = currentType === "document", message = currentType === "message", notification = currentType === "notification", audit = currentType === "audit";
     byId("page-title").textContent = schedule ? "Einsatzplanung" : recurring ? "Wiederkehrende Aufträge" : invoice ? "Rechnungen" : contract ? "Verträge" : offer ? "Angebote" : order ? "Aufträge" : employee ? "Mitarbeiter" : customer ? "Kunden" : appointment ? "Termine" : quote ? "Angebotsanfragen" : career ? "Bewerbungen" : "Kontaktanfragen";
     byId("records-title").textContent = recurring ? "Automatisierte Einsatzpläne & Protokolle" : invoice ? "Rechnungsverwaltung" : contract ? "Vertragsverwaltung" : offer ? "Angebotsverwaltung" : order ? "Auftragsverwaltung" : employee ? "Mitarbeiterverwaltung" : customer ? "Registrierte Kunden" : appointment ? "Gebuchte Termine" : quote ? "Aktuelle Angebotsanfragen" : career ? "Aktuelle Bewerbungen" : "Aktuelle Kontaktanfragen";
     byId("service-heading").textContent = recurring ? "INTERVALL / NÄCHSTER LAUF" : invoice || contract || offer || order ? "LEISTUNG / BETRAG" : employee ? "POSITION / ROLLE" : appointment || quote ? "DIENSTLEISTUNG / ORT" : career ? "BEREICH" : "LEISTUNG";
@@ -110,6 +110,12 @@ function updateViewHeading() {
     byId("create-recurring-button").hidden = !recurring;
     byId("generate-recurring-button").hidden = !recurring;
     byId("create-invoice-button").hidden = !invoice;
+    byId("create-document-button").hidden = !document;
+    byId("create-message-button").hidden = !message;
+    if (document) { byId("page-title").textContent = "Dokumente"; byId("records-title").textContent = "Private Dokumente"; byId("service-heading").textContent = "TYP / SICHTBARKEIT"; }
+    if (message) { byId("page-title").textContent = "Nachrichten"; byId("records-title").textContent = "Kundennachrichten"; byId("service-heading").textContent = "ABSENDER / EMPFÄNGER"; }
+    if (notification) { byId("page-title").textContent = "Benachrichtigungen"; byId("records-title").textContent = "Interne Benachrichtigungen"; byId("service-heading").textContent = "TYP / VERKNÜPFUNG"; }
+    if (audit) { byId("page-title").textContent = "Audit-Protokoll"; byId("records-title").textContent = "Nachvollziehbare Systemereignisse"; byId("service-heading").textContent = "AKTION / OBJEKT"; }
     ["invoice-customer-filter", "invoice-order-filter", "invoice-due-filter"].forEach(id => { byId(id).hidden = !invoice; });
     byId("schedule-panel").hidden = !schedule;
     document.querySelector(".records-panel").hidden = schedule;
@@ -193,6 +199,16 @@ async function loadOrderSelections() {
 
 function renderRecords(rows) {
     currentRows = rows;
+    if (["document", "message", "notification", "audit"].includes(currentType)) {
+        const cell = value => escapeHtml(value || "—");
+        recordsBody.innerHTML = rows.map((row, index) => {
+            if (currentType === "document") return `<tr><td class="date-cell">${cell(formatDate(row.created_at))}</td><td class="person-cell"><strong>${cell(row.file_name)}</strong><span class="person-phone">${cell(row.first_name ? `${row.first_name} ${row.last_name}` : "Ohne Kundenzuordnung")}</span></td><td class="service-cell">${cell(row.document_type)}<div class="person-phone">${cell(row.visibility)}</div></td><td class="message-cell"><span class="message-preview">${cell(row.mime_type)} · ${cell(row.file_size)} B</span></td><td class="status-cell"><span class="status-pill" data-status="done">GESPEICHERT</span></td><td><a class="detail-button" href="/api/admin/documents/${row.id}">Download</a></td></tr>`;
+            if (currentType === "message") return `<tr><td class="date-cell">${cell(formatDate(row.created_at))}</td><td class="person-cell"><strong>${cell(`${row.first_name} ${row.last_name}`)}</strong><span class="person-phone">${cell(row.customer_number)}</span></td><td class="service-cell">${cell(row.sender_type)} → ${cell(row.recipient_type)}</td><td class="message-cell"><strong>${cell(row.subject)}</strong><div class="person-phone">${cell(row.message)}</div></td><td class="status-cell"><span class="status-pill" data-status="${row.read_at ? "done" : "new"}">${row.read_at ? "GELESEN" : "NEU"}</span></td><td>${row.read_at ? "" : `<button class="detail-button" type="button" data-message-read="${row.id}">Lesen</button>`}</td></tr>`;
+            if (currentType === "notification") return `<tr><td class="date-cell">${cell(formatDate(row.created_at))}</td><td class="person-cell"><strong>${cell(row.title)}</strong><span class="person-phone">${cell(row.notification_type)}</span></td><td class="service-cell">${cell(row.entity_type)} #${cell(row.entity_id)}</td><td class="message-cell"><span class="message-preview">${cell(row.body)}</span></td><td class="status-cell"><span class="status-pill" data-status="${row.read_at ? "done" : "new"}">${row.read_at ? "GELESEN" : "NEU"}</span></td><td>${row.read_at ? "" : `<button class="detail-button" type="button" data-notification-read="${row.id}">Lesen</button>`}</td></tr>`;
+            return `<tr><td class="date-cell">${cell(formatDate(row.created_at))}</td><td class="person-cell"><strong>${cell(row.actor_type)}</strong><span class="person-phone">${cell(row.actor_id)}</span></td><td class="service-cell">${cell(row.action)}<div class="person-phone">${cell(row.entity_type)} #${cell(row.entity_id)}</div></td><td class="message-cell"><span class="message-preview">${cell(row.metadata)}</span></td><td class="status-cell"><span class="status-pill" data-status="done">PROTOKOLLIERT</span></td><td></td></tr>`;
+        }).join("");
+        const empty = rows.length === 0; byId("empty-state").hidden = !empty; document.querySelector(".table-wrap table").hidden = empty; return;
+    }
     if (currentType === "recurring") {
         recordsBody.innerHTML = rows.map((row, index) => `<tr><td class="date-cell">${escapeHtml(row.contract_number)}</td><td class="person-cell"><strong>${escapeHtml(`${row.first_name} ${row.last_name}`)}</strong><span class="person-phone">${escapeHtml(row.customer_number || "—")}</span></td><td class="service-cell"><strong>${escapeHtml(row.service_type)}</strong><div class="person-phone">${escapeHtml(row.recurrence_type)} · ${escapeHtml(row.weekdays || "monatlich/einmalig")}</div></td><td class="message-cell"><span class="message-preview">${escapeHtml(row.next_run_date || "—")}</span><div class="person-phone">${escapeHtml(row.employee_first_name ? `${row.employee_first_name} ${row.employee_last_name}` : "Mitarbeiter wird vorgeschlagen")} · Log: ${escapeHtml(row.last_result || "—")}</div></td><td class="status-cell"><span class="status-pill" data-status="${Number(row.active) ? "done" : "new"}">${Number(row.active) ? "AKTIV" : "INAKTIV"}</span></td><td><button class="detail-button" type="button" data-record-index="${index}">Öffnen</button></td></tr>`).join("");
         const empty = rows.length === 0; byId("empty-state").hidden = !empty; document.querySelector(".table-wrap table").hidden = empty; return;
@@ -300,7 +316,7 @@ async function loadSubmissions() {
     }
 
     try {
-        const endpoint = currentType === "recurring" ? "/api/admin/recurring-orders" : currentType === "invoice" ? "/api/admin/invoices" : currentType === "order" ? "/api/admin/orders" : currentType === "employee" ? "/api/admin/employees" : currentType === "offer" ? "/api/admin/quotes" : currentType === "contract" ? "/api/admin/contracts" : currentType === "quote" ? "/api/admin/quote-requests" : currentType === "appointment" ? "/api/admin/appointments" : currentType === "customer" ? "/api/admin/customers" : "/api/admin/submissions";
+        const endpoint = currentType === "document" ? "/api/admin/documents" : currentType === "message" ? "/api/admin/messages" : currentType === "notification" ? "/api/admin/notifications" : currentType === "audit" ? "/api/admin/audit-logs" : currentType === "recurring" ? "/api/admin/recurring-orders" : currentType === "invoice" ? "/api/admin/invoices" : currentType === "order" ? "/api/admin/orders" : currentType === "employee" ? "/api/admin/employees" : currentType === "offer" ? "/api/admin/quotes" : currentType === "contract" ? "/api/admin/contracts" : currentType === "quote" ? "/api/admin/quote-requests" : currentType === "appointment" ? "/api/admin/appointments" : currentType === "customer" ? "/api/admin/customers" : "/api/admin/submissions";
         const result = await api(`${endpoint}?${params.toString()}`);
         if (currentType === "quote") byId("nav-quote-count").textContent = result.rows.filter(row => row.status === "new").length;
         renderRecords(result.rows);
@@ -458,6 +474,22 @@ async function fillCommercialCustomers() {
     const customers = await api("/api/admin/customers?page=1");
     const options = `<option value="">Kunde wählen</option>${(customers.rows || []).map(customer => `<option value="${customer.id}">${escapeHtml(`${customer.first_name} ${customer.last_name}`)} · ${escapeHtml(customer.customer_number || customer.email)}</option>`).join("")}`;
     byId("offer-customer").innerHTML = options; byId("contract-customer").innerHTML = options;
+}
+async function fillPhase12Customers() {
+    const result = await api("/api/admin/customers?page=1");
+    const options = `<option value="">Kunde wählen</option>${(result.rows || []).map(customer => `<option value="${customer.id}">${escapeHtml(`${customer.first_name} ${customer.last_name}`)} · ${escapeHtml(customer.customer_number || customer.email)}</option>`).join("")}`;
+    byId("document-customer").innerHTML = options;
+    byId("message-customer").innerHTML = options;
+}
+
+async function openDocumentDialog() {
+    byId("document-form").reset(); byId("document-form-note").hidden = true;
+    await fillPhase12Customers(); byId("document-dialog").showModal();
+}
+
+async function openMessageDialog() {
+    byId("admin-message-form").reset(); byId("admin-message-form-note").hidden = true;
+    await fillPhase12Customers(); byId("message-dialog").showModal();
 }
 async function openInvoiceDialog(invoice = null) {
     const form=byId("invoice-form"); form.reset(); byId("invoice-form-note").hidden=true; invoiceItems=[blankInvoiceItem()];
@@ -806,6 +838,16 @@ byId("create-contract-button").addEventListener("click", () => openContractDialo
 byId("create-recurring-button").addEventListener("click", () => openRecurringDialog().catch(error => setNotice(error.message)));
 byId("generate-recurring-button").addEventListener("click", () => { byId("generator-form").reset(); byId("generator-form-note").hidden = true; byId("generator-dialog").showModal(); });
 byId("create-invoice-button").addEventListener("click", () => openInvoiceDialog().catch(error => setNotice(error.message)));
+byId("create-document-button").addEventListener("click", () => openDocumentDialog().catch(error => setNotice(error.message)));
+byId("create-message-button").addEventListener("click", () => openMessageDialog().catch(error => setNotice(error.message)));
+byId("document-form").addEventListener("submit", async event => {
+    event.preventDefault(); const form = event.currentTarget, note = byId("document-form-note"), data = new FormData(form);
+    try { const result = await api("/api/admin/documents", { method: "POST", body: data }); form.reset(); byId("document-dialog").close(); setNotice(result.message, "success"); await loadSubmissions(); } catch (error) { note.textContent = error.message; note.hidden = false; }
+});
+byId("admin-message-form").addEventListener("submit", async event => {
+    event.preventDefault(); const form = event.currentTarget, note = byId("admin-message-form-note");
+    try { const result = await api("/api/admin/messages", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(form))) }); form.reset(); byId("message-dialog").close(); setNotice(result.message, "success"); await loadSubmissions(); } catch (error) { note.textContent = error.message; note.hidden = false; }
+});
 byId("recurring-form").addEventListener("submit", async event => { event.preventDefault(); const form = event.currentTarget, id = form.elements.namedItem("id").value, note = byId("recurring-form-note"); try { const payload = Object.fromEntries(new FormData(form)); delete payload.id; const result = await api(id ? `/api/admin/recurring-orders/${id}` : "/api/admin/recurring-orders", { method: id ? "PATCH" : "POST", body: JSON.stringify(payload) }); byId("recurring-dialog").close(); setNotice(result.message, "success"); await reloadDashboard(); } catch (error) { note.textContent = error.message; note.hidden = false; } });
 byId("generator-form").addEventListener("submit", async event => { event.preventDefault(); const note = byId("generator-form-note"); try { const result = await api("/api/admin/recurring-orders/generate", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget))) }); const summary = result.summary; note.textContent = `Geprüft: ${summary.checkedContracts} · Neu: ${summary.created} · Bereits vorhanden: ${summary.existing} · Ohne Mitarbeiter: ${summary.noAvailability} · Fehler: ${summary.failed}`; note.hidden = false; note.classList.remove("is-error"); await reloadDashboard(); } catch (error) { note.textContent = error.message; note.hidden = false; } });
 byId("add-invoice-item").addEventListener("click", () => { invoiceItems.push(blankInvoiceItem()); renderInvoiceItems(); });
@@ -870,6 +912,10 @@ byId("order-assignment-list").addEventListener("click", async event => {
 });
 
 recordsBody.addEventListener("click", event => {
+    const message = event.target.closest("[data-message-read]");
+    const notification = event.target.closest("[data-notification-read]");
+    if (message) { api(`/api/admin/messages/${message.dataset.messageRead}/read`, { method: "PATCH", body: "{}" }).then(() => loadSubmissions()).catch(error => setNotice(error.message)); return; }
+    if (notification) { api(`/api/admin/notifications/${notification.dataset.notificationRead}/read`, { method: "PATCH", body: "{}" }).then(() => loadSubmissions()).catch(error => setNotice(error.message)); return; }
     const button = event.target.closest("[data-record-index]");
     if (button?.classList.contains("detail-button")) openDetails(Number(button.dataset.recordIndex));
 });

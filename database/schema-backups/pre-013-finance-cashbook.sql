@@ -1,0 +1,24 @@
+-- Pre-Phase 13.1 recovery checkpoint for zoicas_osinski.
+-- Created before 013_finance_cashbook.sql. No destructive SQL is included.
+-- Relevant verified pre-013 tables:
+-- customers, employees, orders, contracts, invoices, invoice_items,
+-- invoice_payments, documents and audit_logs.
+--
+-- The live database was checked before Phase 13.1: invoice_payments remains
+-- the authoritative ledger for invoice settlement. This backup marker exists
+-- so that a production operator can take a physical/schema dump immediately
+-- before executing the additive migration, if required by local policy.
+--
+-- Recommended operational backup command (do not run automatically here):
+-- mysqldump --single-transaction --routines --triggers --no-data zoicas_osinski
+--
+-- Existing Phase-10 relationships that must remain unchanged:
+-- invoice_payments.invoice_id -> invoices.id
+-- invoice_items.invoice_id -> invoices.id
+-- invoices.customer_id -> customers.id
+-- invoices.order_id -> orders.id
+-- invoices.sales_quote_id -> quotes.id
+-- invoices.contract_id -> contracts.id
+--
+-- Existing Phase-12 audit_logs is reused by Phase 13.1. No new audit table
+-- and no change to audit_logs is part of this migration.

@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS audit_logs (
  PRIMARY KEY(id), KEY idx_p12_audit_entity(entity_type,entity_id,created_at), KEY idx_p12_audit_actor(actor_type,actor_id,created_at), KEY idx_p12_audit_action(action,created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 GRANT SELECT ON zoicas_osinski.documents TO 'zoicas_app'@'127.0.0.1';
+GRANT SELECT,INSERT,UPDATE ON zoicas_osinski.messages TO 'zoicas_app'@'127.0.0.1';
+GRANT SELECT,INSERT,UPDATE ON zoicas_osinski.notifications TO 'zoicas_app'@'127.0.0.1';
+GRANT INSERT ON zoicas_osinski.audit_logs TO 'zoicas_app'@'127.0.0.1';
 GRANT SELECT,INSERT,UPDATE,DELETE ON zoicas_osinski.documents TO 'zoicas_dashboard'@'127.0.0.1';
 GRANT SELECT,INSERT,UPDATE,DELETE ON zoicas_osinski.messages TO 'zoicas_dashboard'@'127.0.0.1';
 GRANT SELECT,INSERT,UPDATE,DELETE ON zoicas_osinski.notifications TO 'zoicas_dashboard'@'127.0.0.1';
