@@ -1,0 +1,24 @@
+-- Pre-Phase 15 recovery checkpoint for zoicas_osinski.
+-- Created during Phase 15.1 discovery only; no database command was executed.
+--
+-- Verified live schema conventions:
+--   ENGINE=InnoDB, DEFAULT CHARSET=utf8mb4, normally COLLATE=utf8mb4_unicode_ci
+--   (customers currently uses the legacy utf8mb4_0900_ai_ci collation.)
+--   BIGINT UNSIGNED AUTO_INCREMENT primary keys
+--   created_at / updated_at TIMESTAMP columns
+--   RESTRICT foreign keys for business records
+--
+-- Baseline table counts recorded before any Phase 15 migration (2026-11-17):
+--   customers=43, employees=22, orders=25, order_assignments=19,
+--   employee_work_logs=4, service_reports=3, quotes=10, contracts=11,
+--   invoices=11, invoice_payments=7, financial_transactions=3,
+--   documents=30, messages=10, notifications=53, audit_logs=133
+--
+-- Phase 15 is additive. It must not alter existing order, service report,
+-- invoice, payment, finance, document, message or audit-log structures.
+--
+-- Before production execution create a verified logical backup, for example:
+-- mysqldump --single-transaction --routines --triggers --no-data zoicas_osinski
+--
+-- No restore SQL is included. Restore only from a verified backup under the
+-- operator's recovery procedure.

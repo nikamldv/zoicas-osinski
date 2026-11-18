@@ -1,0 +1,27 @@
+-- Pre-Phase 14.1 recovery checkpoint for zoicas_osinski.
+-- Created after inspecting the live schema and before 014_service_reports_quality.sql.
+-- This migration is additive: it creates only service_reports and its two
+-- integrity triggers. It does not alter any existing Phase 1–13 table.
+--
+-- Verified live database convention:
+--   ENGINE=InnoDB, DEFAULT CHARSET=utf8mb4, COLLATE=utf8mb4_unicode_ci
+--
+-- Verified pre-migration records (2026-11-17):
+--   orders=25, order_assignments=19, customers=43, employees=22,
+--   documents=30, invoices=11, invoice_payments=7, financial_transactions=3
+--
+-- Existing relationship chain preserved by Phase 14.1:
+--   orders.customer_id -> customers.id
+--   order_assignments.order_id -> orders.id
+--   order_assignments.employee_id -> employees.id
+--   documents.order_id -> orders.id
+--
+-- The service_reports table is deliberately independent from documents;
+-- document linking is a later application/API concern and documents is not
+-- changed by Phase 14.1.
+--
+-- Recommended operational schema backup command before production execution:
+-- mysqldump --single-transaction --routines --triggers --no-data zoicas_osinski
+--
+-- No restore SQL is included here. Restore must be performed from a verified
+-- physical/logical MySQL backup according to the operator's recovery policy.

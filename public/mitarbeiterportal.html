@@ -18,9 +18,11 @@
                 <button data-employee-view="tasks" type="button">Meine Aufgaben</button>
                 <button data-employee-view="appointments" type="button">Meine Termine</button>
                 <button data-employee-view="orders" type="button">Meine Aufträge</button>
+                <button data-employee-view="service-reports" type="button">Meine Leistungsnachweise</button>
                 <button data-employee-view="schedule" type="button">Mein Zeitplan</button>
                 <button data-employee-view="work" type="button">Arbeitszeit</button>
                 <button data-employee-view="documents" type="button">Dokumentation</button>
+                <button data-employee-view="cash-payments" type="button">Meine Barzahlungen</button>
                 <button data-employee-view="profile" type="button">Mein Profil</button>
                 <button id="employee-logout" type="button">Abmelden</button>
             </aside>
@@ -49,6 +51,22 @@
                     <section class="employee-panel"><h2>Meine Aufträge</h2><div id="employee-order-list" class="employee-list"></div></section>
                 </div>
 
+                <div id="employee-service-reports" class="employee-view" hidden>
+                    <section class="employee-panel">
+                        <div class="employee-panel-head"><div><h2>Meine Leistungsnachweise</h2><p>Erstellen, ergänzen und reichen Sie Nachweise ausschließlich für Ihre eigenen Einsätze ein.</p></div><button id="service-report-create-toggle" class="button button-primary" type="button">+ Leistungsnachweis erstellen</button></div>
+                        <form id="employee-service-report-form" class="employee-form" hidden novalidate>
+                            <input name="id" type="hidden"><input name="order_id" type="hidden">
+                            <label class="wide">Auftrag / Einsatz<select id="employee-service-report-assignment" name="assignment_id" required><option value="">Einsatz wählen</option></select><small>Es werden nur Ihre aktiven, zugewiesenen Einsätze angezeigt.</small></label>
+                            <label>Leistungsdatum<input name="service_date" type="date" required></label><label>Beginn<input name="started_at" type="datetime-local" required></label><label>Ende<input name="finished_at" type="datetime-local" required></label>
+                            <label class="wide">Zusammenfassung<textarea name="summary" maxlength="5000" required placeholder="Was wurde durchgeführt?"></textarea></label><label class="wide">Hinweis für den Kunden<textarea name="customer_notes" maxlength="4000" placeholder="Optionaler Hinweis für den Kunden"></textarea></label>
+                            <p id="employee-service-report-form-note" class="form-note wide" role="status" aria-live="polite"></p><button class="button button-primary" type="submit">Entwurf speichern</button><button id="employee-service-report-cancel" class="button button-light" type="button">Abbrechen</button>
+                        </form>
+                    </section>
+                    <section class="employee-panel service-report-filter-panel"><div class="service-report-filter-grid"><label>Status<select id="employee-service-report-status"><option value="">Alle Status</option><option value="DRAFT">Entwurf</option><option value="SUBMITTED">Eingereicht</option><option value="REVIEWED">Geprüft</option><option value="RETURNED">Zurückgegeben</option><option value="SHARED">Freigegeben</option><option value="CUSTOMER_CONFIRMED">Kundenbestätigt</option><option value="CANCELLED">Storniert</option></select></label><label>Datum<input id="employee-service-report-date" type="date"></label><label class="wide">Suche<input id="employee-service-report-search" type="search" maxlength="100" placeholder="Nummer, Kunde oder Auftrag suchen"></label></div></section>
+                    <section class="employee-panel"><div id="employee-service-report-list" class="employee-list"></div><div class="employee-pagination"><button id="employee-service-report-previous" class="button button-light" type="button">← Zurück</button><span id="employee-service-report-page-info">Einträge 0</span><button id="employee-service-report-next" class="button button-light" type="button">Weiter →</button></div></section>
+                    <section id="employee-service-report-detail" class="employee-panel" hidden><div class="employee-panel-head"><div><p class="section-kicker">LEISTUNGSNACHWEIS</p><h2 id="employee-service-report-detail-title">Details</h2></div><button id="employee-service-report-detail-close" class="button button-light" type="button">Schließen</button></div><dl id="employee-service-report-detail-values" class="portal-order-detail"></dl><div class="service-report-copy"><strong>Zusammenfassung</strong><p id="employee-service-report-detail-summary">—</p></div><div class="service-report-copy"><strong>Hinweis für den Kunden</strong><p id="employee-service-report-detail-customer-notes">—</p></div><div id="employee-service-report-detail-actions" class="service-report-actions"></div></section>
+                </div>
+
                 <div id="employee-schedule" class="employee-view" hidden>
                     <section class="employee-panel"><div class="employee-schedule-head"><h2>Mein Zeitplan</h2><div><button id="employee-schedule-previous" class="button button-light" type="button">←</button><input id="employee-schedule-date" type="date"><button id="employee-schedule-next" class="button button-light" type="button">→</button><button id="employee-schedule-week" class="button button-light" type="button">Woche</button></div></div><div id="employee-schedule-list" class="employee-schedule-list"></div></section>
                 </div>
@@ -59,6 +77,34 @@
 
                 <div id="employee-documents" class="employee-view" hidden>
                     <section class="employee-panel"><h2>Dokumentation hochladen</h2><form id="document-form" class="employee-form" enctype="multipart/form-data"><label>Aufgabe<select id="document-task" name="task_id" required><option value="">Aufgabe wählen</option></select></label><label>Auftrag<select id="document-order" name="order_id"><option value="">Ohne Auftragsbezug</option></select></label><label>Datei<input name="document" type="file" accept="image/jpeg,image/png,application/pdf" required></label><label class="wide">Beschreibung<textarea name="description" maxlength="1000"></textarea></label><button class="button button-primary" type="submit">Dokument hochladen</button></form><p class="form-note">Erlaubt: JPG, PNG oder PDF, maximal 5 MB. Dateien bleiben privat und sind nur berechtigten Mitarbeitenden zugänglich.</p></section><section class="employee-panel"><h2>Meine Dokumente</h2><div id="document-list" class="employee-list"></div></section>
+                </div>
+
+                <div id="employee-cash-payments" class="employee-view" hidden>
+                    <div class="portal-data cash-payment-summary" aria-label="Übersicht meiner Barzahlungen">
+                        <article><strong id="cash-payment-total">—</strong><p>Meine Barzahlungen</p></article>
+                        <article><strong id="cash-payment-today">—</strong><p>Heute</p></article>
+                        <article><strong id="cash-payment-month">—</strong><p>Dieser Monat</p></article>
+                        <article><strong id="cash-payment-recorded">—</strong><p>Erfasst</p></article>
+                        <article><strong id="cash-payment-approved">—</strong><p>Geprüft</p></article>
+                    </div>
+                    <section class="employee-panel">
+                        <div class="employee-panel-head"><div><h2>Barzahlung erfassen</h2><p>Nur für Ihre zugewiesenen Aufträge. Die Prüfung erfolgt zusätzlich sicher im Backend.</p></div><button id="cash-payment-toggle" class="button button-primary" type="button">+ Barzahlung erfassen</button></div>
+                        <form id="cash-payment-form" class="employee-form" hidden novalidate>
+                            <label>Kunde<select id="cash-customer" name="customer_id" required><option value="">Kunde wählen</option></select></label>
+                            <label>Auftrag<select id="cash-order" name="order_id" required disabled><option value="">Zuerst Kunde wählen</option></select></label>
+                            <label>Betrag (€)<input name="amount" type="number" min="0.01" max="999999.99" step="0.01" inputmode="decimal" required></label>
+                            <label>Zahlungsdatum<input name="payment_date" type="date" required></label>
+                            <label>Zahlungsart<select name="payment_method" required><option value="BAR">Bar</option></select></label>
+                            <label>Rechnung (optional)<select id="cash-invoice" name="invoice_id" disabled><option value="">Ohne Rechnung</option></select></label>
+                            <label class="wide">Verwendungszweck<input name="purpose" maxlength="500" required placeholder="z. B. Reinigungseinsatz"></label>
+                            <label>Quittungsnummer (optional)<input name="receipt_number" maxlength="180"></label>
+                            <label>Beleg (optional)<input id="cash-receipt" name="receipt" type="file" accept="image/jpeg,image/png,application/pdf"><small>Erlaubt: JPG, PNG oder PDF, maximal 5 MB. Der Beleg wird privat gespeichert.</small></label>
+                            <label class="wide">Notiz (optional)<textarea name="notes" maxlength="4000"></textarea></label>
+                            <p id="cash-payment-form-note" class="form-note wide" role="status" aria-live="polite"></p>
+                            <button class="button button-primary" type="submit">Barzahlung speichern</button>
+                        </form>
+                    </section>
+                    <section class="employee-panel"><h2>Meine erfassten Barzahlungen</h2><div id="cash-payment-list" class="employee-list"></div></section>
                 </div>
 
                 <div id="employee-profile" class="employee-view" hidden>

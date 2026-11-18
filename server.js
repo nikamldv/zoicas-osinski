@@ -6,6 +6,7 @@ const http = require("node:http");
 const crypto = require("node:crypto");
 const net = require("node:net");
 const tls = require("node:tls");
+const PDFDocument = require("pdfkit");
 
 const ROOT = __dirname;
 const STATIC_ROOTS = ["public", "assets", "Css", "js"]
@@ -148,6 +149,12 @@ const invoiceUnits = new Set(["Stück", "m²", "Stunde", "Pauschale", "Monat", "
 const paymentMethods = new Set(["BANKÜBERWEISUNG", "BAR", "KARTENZAHLUNG", "SONSTIGE"]);
 const contractIntervals = new Set(["EINMALIG", "WOECHENTLICH", "ZWEIMAL_WOECHENTLICH", "MEHRMALS_WOECHENTLICH", "MONATLICH", "INDIVIDUELL"]);
 const automationResults = new Set(["SUCCESS", "SKIPPED", "FAILED", "NO_AVAILABILITY"]);
+const serviceReportStatuses = new Set(["DRAFT", "SUBMITTED", "REVIEWED", "RETURNED", "SHARED", "CUSTOMER_CONFIRMED", "CANCELLED"]);
+const materialUnits = new Set(["STUECK", "LITER", "KILOGRAMM", "METER", "PACKUNG"]);
+const materialStatuses = new Set(["ACTIVE", "INACTIVE", "ARCHIVED"]);
+const materialRequirementStatuses = new Set(["PLANNED", "ORDERED", "READY", "CANCELLED"]);
+const materialMovementTypes = new Set(["RECEIPT", "CONSUMPTION", "RETURN", "ADJUSTMENT_IN", "ADJUSTMENT_OUT"]);
+const materialMovementStatuses = new Set(["RECORDED", "APPROVED", "CANCELLED"]);
 
 function sendJson(response, statusCode, payload) {
     const body = JSON.stringify(payload);
@@ -607,6 +614,11 @@ async function readJson(request) {
     try {
         const value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
         if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid body");
+        // Keep the public German status values compatible with the ASCII-safe
+        // database enum used on Windows/MySQL installations.
+        if (typeof value.status === "string") {
+            value.status = value.status === "GEPRÜFT" ? "GEPRUEFT" : value.status === "ÜBERGEBEN" ? "UEBERGEBEN" : value.status;
+        }
         return value;
     } catch {
         const error = new Error("Invalid JSON");
@@ -784,6 +796,320 @@ function validateCareer(body) {
 
 function isIsoDate(value) { return /^\d{4}-\d{2}-\d{2}$/.test(String(value || "")) && !Number.isNaN(new Date(`${value}T00:00:00Z`).getTime()); }
 function isClockTime(value) { return /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value || "")); }
+
+// Phase 16 reporting helpers intentionally return only aggregate values. They
+// are not HTTP handlers and will be used exclusively by protected admin APIs.
+function reportBerlinDate(now = new Date()) {
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Berlin", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(now);
+    const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+    return `${values.year}-${values.month}-${values.day}`;
+}
+function reportIsIsoDate(value) { if (!isIsoDate(value)) return false; return new Date(`${value}T12:00:00Z`).toISOString().slice(0, 10) === value; }
+function reportAddDays(isoDate, days) { const value = new Date(`${isoDate}T12:00:00Z`); value.setUTCDate(value.getUTCDate() + days); return value.toISOString().slice(0, 10); }
+function reportDaySpan(from, to) { return Math.round((new Date(`${to}T12:00:00Z`) - new Date(`${from}T12:00:00Z`)) / 86400000) + 1; }
+function reportNumber(value) { return Number(value || 0); }
+function normalizeReportDateRange(input = {}, now = new Date()) {
+    const period = String(input.period || "month").toLowerCase(); const today = reportBerlinDate(now); let from, to;
+    if (period === "custom") { from = String(input.from || ""); to = String(input.to || ""); }
+    else if (period === "today") { from = today; to = today; }
+    else if (period === "week") { const date = new Date(`${today}T12:00:00Z`); const weekday = (date.getUTCDay() + 6) % 7; from = reportAddDays(today, -weekday); to = reportAddDays(from, 6); }
+    else if (period === "month") { from = `${today.slice(0, 7)}-01`; to = reportAddDays(`${today.slice(0, 7)}-01`, 32).slice(0, 7) + "-01"; to = reportAddDays(to, -1); }
+    else if (period === "year") { from = `${today.slice(0, 4)}-01-01`; to = `${today.slice(0, 4)}-12-31`; }
+    else return { error: "Ungültiger Berichtszeitraum." };
+    if (!reportIsIsoDate(from) || !reportIsIsoDate(to) || from > to) return { error: "Ungültiger Datumsbereich." };
+    if (reportDaySpan(from, to) > 3660) return { error: "Der Berichtszeitraum ist zu groß." };
+    return { period, from, to };
+}
+function buildPreviousComparisonRange(range) {
+    if (!range || !reportIsIsoDate(range.from) || !reportIsIsoDate(range.to)) return null;
+    const span = reportDaySpan(range.from, range.to); const to = reportAddDays(range.from, -1);
+    return { period: "previous", from: reportAddDays(to, -(span - 1)), to };
+}
+function reportComparison(current, previous) { const difference = reportNumber(current) - reportNumber(previous); return { current: reportNumber(current), previous: reportNumber(previous), difference, percent: reportNumber(previous) === 0 ? null : Number(((difference / reportNumber(previous)) * 100).toFixed(2)) }; }
+async function getRevenueReport(connection, range) {
+    const [[invoices]] = await connection.execute("SELECT COALESCE(SUM(net_amount),0) net,COALESCE(SUM(tax_amount),0) tax,COALESCE(SUM(gross_amount),0) gross,COUNT(*) invoice_count FROM invoices WHERE invoice_date BETWEEN ? AND ? AND status NOT IN ('ENTWURF','STORNIERT')", [range.from, range.to]);
+    const [[invoicePayments]] = await connection.execute("SELECT COALESCE(SUM(p.amount),0) amount FROM invoice_payments p JOIN invoices i ON i.id=p.invoice_id WHERE p.payment_date BETWEEN ? AND ? AND i.status<>'STORNIERT'", [range.from, range.to]);
+    const [[income]] = await connection.execute("SELECT COALESCE(SUM(amount),0) amount FROM financial_transactions WHERE transaction_date BETWEEN ? AND ? AND transaction_type='INCOME' AND status<>'STORNIERT'", [range.from, range.to]);
+    const [[expenses]] = await connection.execute("SELECT COALESCE(SUM(amount),0) amount FROM financial_transactions WHERE transaction_date BETWEEN ? AND ? AND transaction_type='EXPENSE' AND status<>'STORNIERT'", [range.from, range.to]);
+    const [[material]] = await connection.execute("SELECT COALESCE(SUM(quantity * COALESCE(unit_cost_snapshot,0)),0) amount FROM material_stock_movements WHERE movement_date BETWEEN ? AND ? AND status='APPROVED' AND movement_type='CONSUMPTION'", [range.from, range.to]);
+    const net = reportNumber(invoices.net), expenseAmount = reportNumber(expenses.amount), materialAmount = reportNumber(material.amount);
+    return { invoiced: { net, tax: reportNumber(invoices.tax), gross: reportNumber(invoices.gross), count: reportNumber(invoices.invoice_count) }, invoice_payments: reportNumber(invoicePayments.amount), financial_income: reportNumber(income.amount), expenses: expenseAmount, material_consumption_costs: materialAmount, partial_result_incomplete: net - expenseAmount - materialAmount };
+}
+async function getInvoiceReport(connection, range) {
+    const [rows] = await connection.execute("SELECT i.id,i.gross_amount,i.due_date,i.status,COALESCE(SUM(p.amount),0) paid_amount FROM invoices i LEFT JOIN invoice_payments p ON p.invoice_id=i.id WHERE i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT') GROUP BY i.id,i.gross_amount,i.due_date,i.status", [range.from, range.to]);
+    const today = reportBerlinDate(); let outstanding = 0, overdue = 0, partial = 0;
+    for (const row of rows) { const open = Math.max(0, reportNumber(row.gross_amount) - reportNumber(row.paid_amount)); outstanding += open; if (open > 0 && String(row.due_date).slice(0, 10) < today) overdue += open; if (reportNumber(row.paid_amount) > 0 && open > 0) partial += 1; }
+    return { invoice_count: rows.length, outstanding_amount: outstanding, overdue_amount: overdue, partially_paid_count: partial };
+}
+async function getOrderReport(connection, range) {
+    const [[row]] = await connection.execute("SELECT COUNT(*) total,SUM(status='NEU') new_orders,SUM(status IN ('GEPLANT','ZUGEWIESEN','IN_BEARBEITUNG','PAUSIERT')) active_orders,SUM(status='ERLEDIGT') completed_orders,SUM(status='STORNIERT') cancelled_orders,COALESCE(SUM(price_gross_snapshot),0) gross_value,COALESCE(AVG(price_gross_snapshot),0) average_gross_value FROM orders WHERE DATE(created_at) BETWEEN ? AND ?", [range.from, range.to]);
+    return Object.fromEntries(Object.entries(row).map(([key, value]) => [key, reportNumber(value)]));
+}
+async function getCustomerReport(connection, range) {
+    const [[row]] = await connection.execute("SELECT COUNT(*) total_customers,SUM(status='active') active_customers,SUM(DATE(created_at) BETWEEN ? AND ?) new_customers FROM customers", [range.from, range.to]);
+    return Object.fromEntries(Object.entries(row).map(([key, value]) => [key, reportNumber(value)]));
+}
+async function getEmployeeReport(connection, range, { employeeId = null } = {}) {
+    const employeeFilter = employeeId ? " AND employee_id=?" : "", employeeValues = employeeId ? [employeeId] : [];
+    const [[employees]] = await connection.execute(`SELECT COUNT(*) active_employees FROM employees WHERE status='ACTIVE'${employeeId ? " AND id=?" : ""}`, employeeValues);
+    const [[work]] = await connection.execute(`SELECT COALESCE(SUM(GREATEST(0,(TIME_TO_SEC(end_time)-TIME_TO_SEC(start_time))/3600-(break_minutes/60))),0) work_hours FROM employee_work_logs WHERE work_date BETWEEN ? AND ? AND end_time>start_time${employeeFilter}`, [range.from, range.to, ...employeeValues]);
+    const [[assignments]] = await connection.execute(`SELECT COUNT(*) assignments FROM order_assignments WHERE assignment_date BETWEEN ? AND ? AND status<>'STORNIERT'${employeeFilter}`, [range.from, range.to, ...employeeValues]);
+    const [[reports]] = await connection.execute(`SELECT COUNT(*) service_reports FROM service_reports WHERE service_date BETWEEN ? AND ?${employeeFilter}`, [range.from, range.to, ...employeeValues]);
+    return { active_employees: reportNumber(employees.active_employees), work_hours: reportNumber(work.work_hours), assignments: reportNumber(assignments.assignments), service_reports: reportNumber(reports.service_reports) };
+}
+async function getMaterialReport(connection, range) {
+    const [[stock]] = await connection.execute("SELECT COUNT(*) total_materials,COALESCE(SUM(current_stock),0) total_stock,SUM(current_stock>minimum_stock) normal_stock,SUM(current_stock>0 AND current_stock<=minimum_stock) low_stock,SUM(current_stock<=0) out_of_stock FROM (SELECT m.id,m.minimum_stock,COALESCE(SUM(CASE WHEN sm.status='APPROVED' THEN CASE WHEN sm.movement_type IN ('RECEIPT','RETURN','ADJUSTMENT_IN') THEN sm.quantity WHEN sm.movement_type IN ('CONSUMPTION','ADJUSTMENT_OUT') THEN -sm.quantity ELSE 0 END ELSE 0 END),0) current_stock FROM materials m LEFT JOIN material_stock_movements sm ON sm.material_id=m.id GROUP BY m.id,m.minimum_stock) stock");
+    const [[consumption]] = await connection.execute("SELECT COALESCE(SUM(quantity),0) consumed_quantity,COALESCE(SUM(quantity*COALESCE(unit_cost_snapshot,0)),0) consumption_costs FROM material_stock_movements WHERE movement_date BETWEEN ? AND ? AND status='APPROVED' AND movement_type='CONSUMPTION'", [range.from, range.to]);
+    return { total_materials: reportNumber(stock.total_materials), total_stock: reportNumber(stock.total_stock), normal_stock: reportNumber(stock.normal_stock), low_stock: reportNumber(stock.low_stock), out_of_stock: reportNumber(stock.out_of_stock), consumed_quantity: reportNumber(consumption.consumed_quantity), consumption_costs: reportNumber(consumption.consumption_costs) };
+}
+async function getDashboardSummary(connection, range) {
+    const [revenue, invoices, orders, customers, employees, materials] = await Promise.all([getRevenueReport(connection, range), getInvoiceReport(connection, range), getOrderReport(connection, range), getCustomerReport(connection, range), getEmployeeReport(connection, range), getMaterialReport(connection, range)]);
+    return { range: { from: range.from, to: range.to }, finance: { ...revenue, ...invoices }, orders, customers, employees, materials };
+}
+function normalizeReportRequest(searchParams) {
+    const range = normalizeReportDateRange({ period: searchParams.get("period") || "month", from: searchParams.get("from") || "", to: searchParams.get("to") || "" });
+    if (range.error) return range;
+    const rawCompare = searchParams.get("compare"); if (rawCompare !== null && rawCompare !== "true" && rawCompare !== "false") return { error: "Ungültiger Vergleichsparameter." };
+    const rawEmployeeId = searchParams.get("employee_id"); let employeeId = null;
+    if (rawEmployeeId !== null && rawEmployeeId !== "") { employeeId = positiveId(rawEmployeeId); if (!employeeId) return { error: "Ungültige Mitarbeiter-ID." }; }
+    for (const key of ["customer_id", "order_id"]) { const raw = searchParams.get(key); if (raw !== null && raw !== "" && !positiveId(raw)) return { error: "Ungültige Filter-ID." }; }
+    return { range, compare: rawCompare === "true", employeeId };
+}
+function sendExportError(response, statusCode, code, message) {
+    return sendJson(response, statusCode, { success: false, error: { code, message } });
+}
+function parseReportExportParams(searchParams) {
+    const type = String(searchParams.get("type") || "").toLowerCase();
+    const format = String(searchParams.get("format") || "").toLowerCase();
+    const period = String(searchParams.get("period") || "month").toLowerCase();
+    const compare = searchParams.get("compare") ?? "false";
+    const from = String(searchParams.get("from") || "");
+    const to = String(searchParams.get("to") || "");
+    if (!new Set(["revenue", "invoices", "orders", "customers", "employees", "materials"]).has(type)) return { error: ["INVALID_REPORT", "Ungültiger Berichtstyp."] };
+    if (format !== "csv") return { error: ["INVALID_FORMAT", "Ungültiges Exportformat."] };
+    if (!new Set(["today", "week", "month", "year", "custom"]).has(period)) return { error: ["INVALID_PERIOD", "Ungültiger Berichtszeitraum."] };
+    if (compare !== "true" && compare !== "false") return { error: ["INVALID_COMPARE", "Ungültiger Vergleichsparameter."] };
+    if (period === "custom" && (!from || !to)) return { error: ["MISSING_DATE_RANGE", "Für einen benutzerdefinierten Zeitraum sind Von und Bis erforderlich."] };
+    if (period === "custom" && (!reportIsIsoDate(from) || !reportIsIsoDate(to))) return { error: ["INVALID_DATE", "Ungültiges Datumsformat."] };
+    if (period === "custom" && from > to) return { error: ["INVALID_DATE_RANGE", "Das Startdatum darf nicht nach dem Enddatum liegen."] };
+    const range = normalizeReportDateRange({ period, from, to });
+    if (range.error) return { error: ["INVALID_DATE_RANGE", "Ungültiger Datumsbereich."] };
+    return { type, format, compare: compare === "true", range };
+}
+function escapeCsvCell(value) {
+    let text = value == null ? "" : String(value);
+    if (/^[=+\-@]/.test(text)) text = `'${text}`;
+    return /[;"\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+function buildCsv(headers, rows) {
+    return `\uFEFF${[headers, ...rows].map(row => row.map(escapeCsvCell).join(";")).join("\r\n")}\r\n`;
+}
+function createExportFilename(type, range) {
+    const suffix = range.period === "custom" ? `${range.from}-to-${range.to}` : range.period === "month" ? range.from.slice(0, 7) : `${range.from}-to-${range.to}`;
+    return `zoicas-osinski-report-${type}-${suffix}.csv`;
+}
+function exportDate(value, withTime = false) {
+    if (!value) return "";
+    const text = value instanceof Date ? value.toISOString() : String(value);
+    return withTime ? text.slice(0, 16).replace("T", " ") : text.slice(0, 10);
+}
+async function reportExportRows(connection, type, range, compare) {
+    const periodLabel = `${range.from} – ${range.to}`;
+    if (type === "revenue") {
+        const current = await getRevenueReport(connection, range);
+        const rows = [[periodLabel, current.invoiced.net, current.invoiced.tax, current.invoiced.gross, current.invoice_payments, current.financial_income, current.expenses, current.material_consumption_costs, current.partial_result_incomplete]];
+        if (compare) { const previousRange = buildPreviousComparisonRange(range), previous = await getRevenueReport(connection, previousRange); rows.push([`${previousRange.from} – ${previousRange.to} (Vorperiode)`, previous.invoiced.net, previous.invoiced.tax, previous.invoiced.gross, previous.invoice_payments, previous.financial_income, previous.expenses, previous.material_consumption_costs, previous.partial_result_incomplete]); }
+        return { headers: ["Zeitraum", "Netto", "MwSt.", "Brutto", "Rechnungszahlungen", "Finanzielle Einnahmen", "Ausgaben", "Materialverbrauchskosten", "Teilergebnis – unvollständig"], rows };
+    }
+    if (type === "invoices") {
+        const [rows] = await connection.execute("SELECT i.invoice_number,COALESCE(i.customer_name_snapshot,CONCAT(c.first_name,' ',c.last_name)) customer_name,i.invoice_date,i.status,i.net_amount,i.tax_amount,i.gross_amount,COALESCE(SUM(p.amount),0) paid_amount FROM invoices i JOIN customers c ON c.id=i.customer_id LEFT JOIN invoice_payments p ON p.invoice_id=i.id WHERE i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT') GROUP BY i.id,i.invoice_number,i.customer_name_snapshot,c.first_name,c.last_name,i.invoice_date,i.status,i.net_amount,i.tax_amount,i.gross_amount ORDER BY i.invoice_date,i.id", [range.from, range.to]);
+        return { headers: ["Rechnungsnummer", "Kunde", "Datum", "Status", "Netto", "MwSt.", "Brutto", "Bezahlt", "Offen"], rows: rows.map(row => [row.invoice_number, row.customer_name, exportDate(row.invoice_date), row.status, row.net_amount, row.tax_amount, row.gross_amount, row.paid_amount, Math.max(0, Number(row.gross_amount) - Number(row.paid_amount))]) };
+    }
+    if (type === "orders") {
+        const [rows] = await connection.execute("SELECT o.order_number,CONCAT(c.first_name,' ',c.last_name) customer_name,o.status,o.planned_start,o.planned_end,o.price_gross_snapshot FROM orders o JOIN customers c ON c.id=o.customer_id WHERE DATE(o.created_at) BETWEEN ? AND ? ORDER BY o.created_at,o.id", [range.from, range.to]);
+        return { headers: ["Auftragsnummer", "Kunde", "Status", "Geplanter Start", "Geplantes Ende", "Preis Brutto"], rows: rows.map(row => [row.order_number, row.customer_name, row.status, exportDate(row.planned_start, true), exportDate(row.planned_end, true), row.price_gross_snapshot]) };
+    }
+    if (type === "customers") {
+        const [rows] = await connection.execute("SELECT c.customer_number,CONCAT(c.first_name,' ',c.last_name) customer_name,c.email,c.phone,(SELECT COUNT(*) FROM orders o WHERE o.customer_id=c.id AND DATE(o.created_at) BETWEEN ? AND ?) order_count,(SELECT COALESCE(SUM(i.gross_amount),0) FROM invoices i WHERE i.customer_id=c.id AND i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT')) revenue_gross FROM customers c ORDER BY revenue_gross DESC,customer_name", [range.from, range.to, range.from, range.to]);
+        return { headers: ["Kundennummer", "Kunde", "E-Mail", "Telefon", "Anzahl Aufträge", "Umsatz Brutto"], rows: rows.map(row => [row.customer_number, row.customer_name, row.email, row.phone, row.order_count, row.revenue_gross]) };
+    }
+    if (type === "employees") {
+        const [rows] = await connection.execute("SELECT e.employee_number,CONCAT(e.first_name,' ',e.last_name) employee_name,COALESCE((SELECT SUM(GREATEST(0,(TIME_TO_SEC(w.end_time)-TIME_TO_SEC(w.start_time))/3600-(w.break_minutes/60))) FROM employee_work_logs w WHERE w.employee_id=e.id AND w.work_date BETWEEN ? AND ? AND w.end_time>w.start_time),0) work_hours,(SELECT COUNT(*) FROM order_assignments a WHERE a.employee_id=e.id AND a.assignment_date BETWEEN ? AND ? AND a.status<>'STORNIERT') assignment_count,(SELECT COUNT(*) FROM service_reports r WHERE r.employee_id=e.id AND r.service_date BETWEEN ? AND ?) report_count FROM employees e ORDER BY employee_name", [range.from, range.to, range.from, range.to, range.from, range.to]);
+        return { headers: ["Mitarbeiternummer", "Mitarbeiter", "Arbeitsstunden", "Aufträge", "Serviceberichte"], rows: rows.map(row => [row.employee_number, row.employee_name, row.work_hours, row.assignment_count, row.report_count]) };
+    }
+    const [rows] = await connection.execute("SELECT m.material_number,m.name,m.unit,COALESCE(SUM(sm.quantity),0) consumed_quantity,COALESCE(SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)),0) consumption_cost FROM materials m JOIN material_stock_movements sm ON sm.material_id=m.id WHERE sm.movement_date BETWEEN ? AND ? AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION' GROUP BY m.id,m.material_number,m.name,m.unit ORDER BY consumption_cost DESC,m.name", [range.from, range.to]);
+    return { headers: ["Materialnummer", "Material", "Einheit", "Verbrauchte Menge", "Verbrauchskosten"], rows: rows.map(row => [row.material_number, row.name, row.unit, row.consumed_quantity, row.consumption_cost]) };
+}
+async function handleAdminReportExport(request, response, searchParams, session) {
+    if (request.method !== "GET") { response.setHeader("Allow", "GET"); return sendExportError(response, 405, "EXPORT_FAILED", "Methode nicht erlaubt."); }
+    const params = parseReportExportParams(searchParams);
+    if (params.error) return sendExportError(response, 400, params.error[0], params.error[1]);
+    try {
+        const report = await reportExportRows(adminPool, params.type, params.range, params.compare);
+        const csv = buildCsv(report.headers, report.rows);
+        await auditEvent(adminPool, "ADMIN", null, "REPORT_EXPORTED", "REPORT", null, { report_type: params.type, format: params.format, period: params.range.period, from: params.range.from, to: params.range.to, compare: params.compare, user: session.username });
+        response.writeHead(200, { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename=\"${createExportFilename(params.type, params.range)}\"`, "Content-Length": Buffer.byteLength(csv), "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" });
+        return response.end(csv);
+    } catch (error) { console.error("[report-export] failed:", error.code || "export_error"); return sendExportError(response, 500, "EXPORT_FAILED", "Export konnte nicht erstellt werden."); }
+}
+function reportPdfMoney(value) { return `${Number(value || 0).toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} EUR`; }
+function reportPdfDate(value) { return value ? String(value).slice(0, 10) : "-"; }
+function reportPdfHeader(doc, range) {
+    const logo = path.join(ROOT, "assets", "images", "Logo", "zoicas-osinski.png");
+    doc.save().rect(0, 0, doc.page.width, 100).fill("#0B1F3A").restore();
+    if (fs.existsSync(logo)) doc.image(logo, 46, 25, { fit: [122, 48] });
+    doc.fillColor("#ffffff").fontSize(15).text("Zoicas & Osinski", 184, 31)
+        .fontSize(8).fillColor("#b9e84a").text("REINIGUNGSSERVICE", 184, 52)
+        .fontSize(10).fillColor("#ffffff").text("Reporting", 184, 70)
+        .fontSize(8.5).fillColor("#d8e4ef").text(`Zeitraum: ${range.from} - ${range.to}`, 350, 39, { width: 199, align: "right" })
+        .text(`Erstellt am: ${reportBerlinDate()}`, 350, 59, { width: 199, align: "right" });
+    doc.strokeColor("#31506e").moveTo(46, 100).lineTo(549, 100).stroke();
+}
+function reportPdfPage(doc, range) { doc.addPage(); reportPdfHeader(doc, range); return 124; }
+function reportPdfSpace(doc, y, height, range) { return y + height > 760 ? reportPdfPage(doc, range) : y; }
+function reportPdfTitle(doc, title, y) { doc.fillColor("#173b5a").fontSize(14).text(title, 46, y); return y + 25; }
+function reportPdfChart(doc, title, rows, keys, labels, y, range) {
+    y = reportPdfSpace(doc, y, 220, range); y = reportPdfTitle(doc, title, y);
+    const x = 58, top = y + 8, width = 470, height = 140;
+    doc.roundedRect(x, top, width, height, 4).fillAndStroke("#fbfdff", "#dce7ee");
+    if (!rows.length) { doc.fillColor("#46627a").fontSize(10).text("Keine Daten f\u00fcr den ausgew\u00e4hlten Zeitraum.", x + 14, top + 60); return top + height + 42; }
+    const max = Math.max(1, ...rows.flatMap(row => keys.map(key => Number(row[key] || 0))));
+    doc.strokeColor("#dce7ee").moveTo(x + 38, top + 12).lineTo(x + 38, top + height - 25).lineTo(x + width - 12, top + height - 25).stroke();
+    doc.fillColor("#46627a").fontSize(7).text(String(Math.round(max)), x, top + 10, { width: 34, align: "right" }).text("0", x + 10, top + height - 31, { width: 24, align: "right" });
+    const colors = ["#0ea5e9", "#84cc16", "#f59e0b", "#a855f7"];
+    keys.forEach((key, seriesIndex) => {
+        const points = rows.map((row, index) => ({ x: x + 42 + (rows.length === 1 ? 0 : index * ((width - 58) / (rows.length - 1))), y: top + height - 26 - ((Number(row[key] || 0) / max) * (height - 48)) }));
+        doc.strokeColor(colors[seriesIndex]).lineWidth(1.8); points.forEach((point, index) => index ? doc.lineTo(point.x, point.y) : doc.moveTo(point.x, point.y)); doc.stroke(); points.forEach(point => doc.circle(point.x, point.y, 1.7).fill(colors[seriesIndex]));
+    });
+    doc.fontSize(7); keys.forEach((key, index) => { const lx = x + 42 + index * 108; doc.fillColor(colors[index]).rect(lx, top + height + 11, 7, 7).fill(); doc.fillColor("#46627a").text(labels[index], lx + 11, top + height + 10); });
+    doc.fillColor("#46627a").fontSize(7).text(reportPdfDate(rows[0].label || rows[0].date), x + 42, top + height - 16).text(reportPdfDate(rows[rows.length - 1].label || rows[rows.length - 1].date), x + width - 80, top + height - 16, { width: 68, align: "right" });
+    return top + height + 38;
+}
+function reportPdfTable(doc, title, rows, columns, y, range) {
+    y = reportPdfSpace(doc, y, 90, range); y = reportPdfTitle(doc, title, y);
+    if (!rows.length) { doc.fillColor("#46627a").fontSize(9).text("Keine Daten f\u00fcr den ausgew\u00e4hlten Zeitraum.", 46, y); return y + 27; }
+    const drawHeader = () => { let x = 46; doc.fillColor("#173b5a").fontSize(8); columns.forEach(column => { doc.text(column.label, x, y + 3, { width: column.width - 4, align: column.align || "left" }); x += column.width; }); doc.strokeColor("#dce7ee").moveTo(46, y + 17).lineTo(549, y + 17).stroke(); y += 19; };
+    drawHeader(); rows.slice(0, 12).forEach((row, index) => { y = reportPdfSpace(doc, y, 22, range); if (y === 108) drawHeader(); let x = 46; doc.fillColor("#111827").fontSize(8); columns.forEach(column => { const raw = typeof column.value === "function" ? column.value(row, index) : row[column.value]; doc.text(String(raw == null || raw === "" ? "-" : raw), x, y + 3, { width: column.width - 5, align: column.align || "left", ellipsis: true }); x += column.width; }); doc.strokeColor("#edf2f7").moveTo(46, y + 18).lineTo(549, y + 18).stroke(); y += 19; }); return y + 14;
+}
+async function reportPdfData(connection, range) {
+    const span = reportDaySpan(range.from, range.to), dateExpr = (range.period === "year" || span > 62) ? "DATE_FORMAT(%DATE%,'%Y-%m-01')" : "DATE(%DATE%)";
+    const queryTrend = async (metric) => {
+        let sql;
+        if (metric === "revenue") sql = `SELECT ${dateExpr.replaceAll("%DATE%", "invoice_date")} date,COALESCE(SUM(net_amount),0) net,COALESCE(SUM(gross_amount),0) gross FROM invoices WHERE invoice_date BETWEEN ? AND ? AND status NOT IN ('ENTWURF','STORNIERT') GROUP BY date ORDER BY date`;
+        else if (metric === "cashflow") sql = `SELECT ${dateExpr.replaceAll("%DATE%", "transaction_date")} date,COALESCE(SUM(CASE WHEN transaction_type='INCOME' THEN amount ELSE 0 END),0) income,COALESCE(SUM(CASE WHEN transaction_type='EXPENSE' THEN amount ELSE 0 END),0) expense FROM financial_transactions WHERE transaction_date BETWEEN ? AND ? AND status<>'STORNIERT' GROUP BY date ORDER BY date`;
+        else if (metric === "invoices") sql = `SELECT ${dateExpr.replaceAll("%DATE%", "invoice_date")} date,COUNT(*) issued,COALESCE(SUM(status='BEZAHLT'),0) paid,COALESCE(SUM(status='ÜBERFÄLLIG'),0) overdue FROM invoices WHERE invoice_date BETWEEN ? AND ? AND status<>'ENTWURF' GROUP BY date ORDER BY date`;
+        else sql = `SELECT ${dateExpr.replaceAll("%DATE%", "created_at")} date,COUNT(*) new_orders,COALESCE(SUM(status='ERLEDIGT'),0) completed,COALESCE(SUM(status='STORNIERT'),0) cancelled FROM orders WHERE DATE(created_at) BETWEEN ? AND ? GROUP BY date ORDER BY date`;
+        const [rows] = await connection.execute(sql, [range.from, range.to]); return rows.map(row => ({ ...row, label: String(row.date).slice(0, 10) }));
+    };
+    const [revenue, cashflow, invoicesTrend, ordersTrend] = await Promise.all([queryTrend("revenue"), queryTrend("cashflow"), queryTrend("invoices"), queryTrend("orders")]);
+    const [customers] = await connection.execute("SELECT CONCAT(c.first_name,' ',c.last_name) name,COALESCE(SUM(i.gross_amount),0) amount FROM customers c JOIN invoices i ON i.customer_id=c.id WHERE i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT') GROUP BY c.id,c.first_name,c.last_name ORDER BY amount DESC,c.last_name LIMIT 7", [range.from, range.to]);
+    const [employees] = await connection.execute("SELECT CONCAT(e.first_name,' ',e.last_name) name,COALESCE((SELECT SUM(GREATEST(0,(TIME_TO_SEC(w.end_time)-TIME_TO_SEC(w.start_time))/3600-(w.break_minutes/60))) FROM employee_work_logs w WHERE w.employee_id=e.id AND w.work_date BETWEEN ? AND ? AND w.end_time>w.start_time),0) hours,(SELECT COUNT(*) FROM order_assignments a WHERE a.employee_id=e.id AND a.assignment_date BETWEEN ? AND ? AND a.status<>'STORNIERT') assignments FROM employees e WHERE e.status='ACTIVE' ORDER BY hours DESC,assignments DESC,e.last_name LIMIT 7", [range.from, range.to, range.from, range.to]);
+    const [materials] = await connection.execute("SELECT m.name,m.unit,COALESCE(SUM(sm.quantity),0) quantity,COALESCE(SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)),0) amount FROM materials m JOIN material_stock_movements sm ON sm.material_id=m.id WHERE sm.movement_date BETWEEN ? AND ? AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION' GROUP BY m.id,m.name,m.unit ORDER BY amount DESC,m.name LIMIT 7", [range.from, range.to]);
+    const [invoices] = await connection.execute("SELECT i.invoice_number,COALESCE(i.customer_name_snapshot,CONCAT(c.first_name,' ',c.last_name)) customer_name,i.invoice_date,i.gross_amount,i.status FROM invoices i JOIN customers c ON c.id=i.customer_id WHERE i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT') ORDER BY i.invoice_date DESC,i.id DESC LIMIT 12", [range.from, range.to]);
+    const [orders] = await connection.execute("SELECT o.order_number,CONCAT(c.first_name,' ',c.last_name) customer_name,COALESCE(DATE(o.planned_start),DATE(o.created_at)) service_date,o.status,o.price_gross_snapshot FROM orders o JOIN customers c ON c.id=o.customer_id WHERE DATE(o.created_at) BETWEEN ? AND ? ORDER BY o.created_at DESC,o.id DESC LIMIT 12", [range.from, range.to]);
+    return { trends: { revenue, cashflow, invoices: invoicesTrend, orders: ordersTrend }, customers, employees, materials, invoices, orders };
+}
+async function createDetailedReportPdf(response, options) {
+    const [report, data] = await Promise.all([getDashboardSummary(adminPool, options.range), reportPdfData(adminPool, options.range)]);
+    const doc = new PDFDocument({ size: "A4", margin: 46, bufferPages: true, info: { Title: "Zoicas & Osinski Reporting", Author: "Zoicas & Osinski" } }); const chunks = []; doc.on("data", chunk => chunks.push(chunk));
+    reportPdfHeader(doc, options.range); let y = 124; doc.fillColor("#173b5a").fontSize(21).text("Reporting", 46, y); y += 38;
+    const f = report.finance, o = report.orders, c = report.customers, e = report.employees, m = report.materials;
+    const kpis = [["Umsatz Netto", reportPdfMoney(f.invoiced.net)], ["Umsatz Brutto", reportPdfMoney(f.invoiced.gross)], ["MwSt.", reportPdfMoney(f.invoiced.tax)], ["Einnahmen", reportPdfMoney(f.financial_income)], ["Ausgaben", reportPdfMoney(f.expenses)], ["Offene Forderungen", reportPdfMoney(f.outstanding_amount)], ["Überfällige Rechnungen", reportPdfMoney(f.overdue_amount)], ["Aufträge", o.total], ["Aktive Kunden", c.active_customers], ["Aktive Mitarbeiter", e.active_employees], ["Materialverbrauch", reportPdfMoney(m.consumption_costs)]];
+    y = reportPdfTitle(doc, "Kennzahlen", y); kpis.forEach(([label, value]) => { y = reportPdfSpace(doc, y, 20, options.range); doc.fillColor("#173b5a").fontSize(9).text(label, 46, y + 3).fillColor("#111827").text(String(value), 358, y + 3, { width: 190, align: "right" }); doc.strokeColor("#edf2f7").moveTo(46, y + 18).lineTo(549, y + 18).stroke(); y += 20; });
+    if (options.compare) { const previous = await getDashboardSummary(adminPool, buildPreviousComparisonRange(options.range)); y = reportPdfSpace(doc, y, 105, options.range); y = reportPdfTitle(doc, "Vergleich zur Vorperiode", y); [["Umsatz Brutto", f.invoiced.gross, previous.finance.invoiced.gross], ["Einnahmen", f.financial_income, previous.finance.financial_income], ["Ausgaben", f.expenses, previous.finance.expenses]].forEach(([label, current, prior]) => { doc.fillColor("#173b5a").fontSize(9).text(label, 46, y).fillColor("#111827").text(`Aktuell ${reportPdfMoney(current)} | Vorperiode ${reportPdfMoney(prior)} | Differenz ${reportPdfMoney(Number(current || 0) - Number(prior || 0))}`, 184, y, { width: 364, align: "right" }); y += 20; }); }
+    y = reportPdfPage(doc, options.range); y = reportPdfChart(doc, "Umsatzentwicklung", data.trends.revenue, ["net", "gross"], ["Netto", "Brutto"], y, options.range); y = reportPdfChart(doc, "Einnahmen und Ausgaben", data.trends.cashflow, ["income", "expense"], ["Einnahmen", "Ausgaben"], y, options.range);
+    y = reportPdfPage(doc, options.range); y = reportPdfChart(doc, "Rechnungen", data.trends.invoices, ["issued", "paid", "overdue"], ["Ausgestellt", "Bezahlt", "Überfällig"], y, options.range); y = reportPdfChart(doc, "Aufträge", data.trends.orders, ["new_orders", "completed", "cancelled"], ["Neu", "Erledigt", "Storniert"], y, options.range);
+    y = reportPdfPage(doc, options.range); y = reportPdfTable(doc, "Top Kunden", data.customers, [{ label: "#", width: 32, value: (_, index) => index + 1 }, { label: "Kunde", width: 270, value: "name" }, { label: "Umsatz", width: 200, align: "right", value: row => reportPdfMoney(row.amount) }], y, options.range); y = reportPdfTable(doc, "Top Mitarbeiter", data.employees, [{ label: "#", width: 32, value: (_, index) => index + 1 }, { label: "Mitarbeiter", width: 250, value: "name" }, { label: "Stunden", width: 100, align: "right", value: row => `${Number(row.hours || 0).toFixed(1)} h` }, { label: "Aufträge", width: 120, align: "right", value: "assignments" }], y, options.range); y = reportPdfTable(doc, "Materialverbrauch", data.materials, [{ label: "#", width: 32, value: (_, index) => index + 1 }, { label: "Material", width: 250, value: "name" }, { label: "Menge", width: 100, align: "right", value: row => `${row.quantity || 0} ${row.unit || ""}` }, { label: "Kosten", width: 120, align: "right", value: row => reportPdfMoney(row.amount) }], y, options.range);
+    y = reportPdfPage(doc, options.range); y = reportPdfTable(doc, "Umsatz", [{ period: `${options.range.from} - ${options.range.to}`, net: f.invoiced.net, tax: f.invoiced.tax, gross: f.invoiced.gross, income: f.financial_income, expense: f.expenses, result: f.partial_result_incomplete }], [{ label: "Zeitraum", width: 115, value: "period" }, { label: "Netto", width: 64, align: "right", value: row => reportPdfMoney(row.net) }, { label: "MwSt.", width: 64, align: "right", value: row => reportPdfMoney(row.tax) }, { label: "Brutto", width: 64, align: "right", value: row => reportPdfMoney(row.gross) }, { label: "Einnahmen", width: 64, align: "right", value: row => reportPdfMoney(row.income) }, { label: "Ausgaben", width: 64, align: "right", value: row => reportPdfMoney(row.expense) }, { label: "Ergebnis", width: 68, align: "right", value: row => reportPdfMoney(row.result) }], y, options.range); y = reportPdfTable(doc, "Rechnungen", data.invoices, [{ label: "Rechnungsnummer", width: 105, value: "invoice_number" }, { label: "Kunde", width: 175, value: "customer_name" }, { label: "Datum", width: 72, value: row => reportPdfDate(row.invoice_date) }, { label: "Brutto", width: 78, align: "right", value: row => reportPdfMoney(row.gross_amount) }, { label: "Status", width: 73, value: "status" }], y, options.range); reportPdfTable(doc, "Aufträge", data.orders, [{ label: "Auftragsnummer", width: 110, value: "order_number" }, { label: "Kunde", width: 170, value: "customer_name" }, { label: "Datum", width: 72, value: row => reportPdfDate(row.service_date) }, { label: "Status", width: 85, value: "status" }, { label: "Betrag", width: 66, align: "right", value: row => reportPdfMoney(row.price_gross_snapshot) }], y, options.range);
+    const pages = doc.bufferedPageRange(); for (let index = 0; index < pages.count; index += 1) { doc.switchToPage(index); doc.fillColor("#46627a").fontSize(8).text("Zoicas & Osinski - REINIGUNGSSERVICE", 46, 802, { lineBreak: false }).text(`Zeitraum: ${options.range.from} - ${options.range.to}`, 220, 802, { width: 205, align: "center", lineBreak: false }).text(`Seite ${index + 1} / ${pages.count}`, 450, 802, { width: 99, align: "right", lineBreak: false }); }
+    doc.end(); const pdf = await new Promise((resolve, reject) => { doc.on("end", () => resolve(Buffer.concat(chunks))); doc.on("error", reject); });
+    await auditEvent(adminPool, "ADMIN", null, "REPORT_EXPORTED", "REPORT", null, { report_type: "management", format: "pdf", period: options.range.period, from: options.range.from, to: options.range.to, compare: options.compare });
+    response.writeHead(200, { "Content-Type": "application/pdf", "Content-Disposition": `attachment; filename=\"zoicas-osinski-reporting-${options.range.from}-to-${options.range.to}.pdf\"`, "Content-Length": pdf.length, "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" }); response.end(pdf);
+}
+async function handleAdminReportPdf(request, response, searchParams, session) {
+    if (request.method !== "GET") return sendExportError(response, 405, "REPORT_GENERATION_FAILED", "Methode nicht erlaubt.");
+    const options = normalizeReportRequest(searchParams);
+    if (options.error) return sendExportError(response, 400, "INVALID_DATE_RANGE", options.error);
+    return createDetailedReportPdf(response, options);
+    /* Legacy generator retained temporarily below for a narrow rollback path.
+       The return above is the active production PDF renderer. */
+    try {
+        const report = await getDashboardSummary(adminPool, options.range);
+        const document = new PDFDocument({ size: "A4", margin: 46, info: { Title: "Zoicas & Osinski Reporting" } });
+        const chunks = []; document.on("data", chunk => chunks.push(chunk));
+        const logo = path.join(ROOT, "assets", "images", "Logo", "zoicas-osinski.png");
+        if (fs.existsSync(logo)) document.image(logo, 46, 40, { fit: [125, 44] });
+        document.fillColor("#173b5a").fontSize(17).text("Zoicas & Osinski – REINIGUNGSSERVICE", 185, 45);
+        document.fontSize(22).text("Reporting", 46, 112).fontSize(10).fillColor("#46627a").text(`Zeitraum: ${options.range.from} – ${options.range.to}`).text(`Erstellt am: ${reportBerlinDate()}`);
+        document.moveDown(2).fillColor("#173b5a").fontSize(14).text("Kennzahlen");
+        const f=report.finance,o=report.orders,c=report.customers,e=report.employees,m=report.materials;
+        const values=[["Umsatz Netto",f.invoiced.net],["Umsatz Brutto",f.invoiced.gross],["MwSt.",f.invoiced.tax],["Einnahmen",f.financial_income],["Ausgaben",f.expenses],["Teilergebnis – unvollständig",f.partial_result_incomplete],["Offene Forderungen",f.outstanding_amount],["Überfällige Rechnungen",f.overdue_amount],["Aufträge",o.total],["Aktive Kunden",c.active_customers],["Aktive Mitarbeiter",e.active_employees],["Materialverbrauchskosten",m.consumption_costs]];
+        let y=160; for (const [label,value] of values) { if(y>720){document.addPage();y=60;} document.fillColor("#173b5a").fontSize(10).text(label,46,y).fillColor("#111827").text(String(value ?? "—"),330,y,{width:180,align:"right"}); document.strokeColor("#dce7ee").moveTo(46,y+16).lineTo(550,y+16).stroke(); y+=25; }
+        if(options.compare){const prev=await getDashboardSummary(adminPool,buildPreviousComparisonRange(options.range)); document.addPage().fillColor("#173b5a").fontSize(14).text("Vergleich zur Vorperiode").fontSize(10).fillColor("#111827").text(`Umsatz Brutto: ${prev.finance.invoiced.gross}`).text(`Einnahmen: ${prev.finance.financial_income}`).text(`Ausgaben: ${prev.finance.expenses}`);}
+        const pages=[]; document.on("pageAdded",()=>{}); document.fontSize(8).fillColor("#46627a").text("Zoicas & Osinski – REINIGUNGSSERVICE",46,790).text("Seite 1",500,790,{width:48,align:"right"}); document.end();
+        const pdf=await new Promise((resolve,reject)=>{document.on("end",()=>resolve(Buffer.concat(chunks)));document.on("error",reject);});
+        await auditEvent(adminPool,"ADMIN",null,"REPORT_EXPORTED","REPORT",null,{report_type:"management",format:"pdf",period:options.range.period,from:options.range.from,to:options.range.to,compare:options.compare});
+        response.writeHead(200,{"Content-Type":"application/pdf","Content-Disposition":`attachment; filename=\"zoicas-osinski-reporting-${options.range.from}-to-${options.range.to}.pdf\"`,"Content-Length":pdf.length,"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff"}); return response.end(pdf);
+    } catch(error){console.error("[report-pdf] failed:",error.code||"generation_error");return sendExportError(response,500,"REPORT_GENERATION_FAILED","PDF konnte nicht erstellt werden.");}
+}
+function reportComparisonTree(current, previous) {
+    if (typeof current === "number" && typeof previous === "number") return reportComparison(current, previous);
+    if (current && previous && typeof current === "object" && typeof previous === "object" && !Array.isArray(current) && !Array.isArray(previous)) return Object.fromEntries(Object.keys(current).filter(key => Object.prototype.hasOwnProperty.call(previous, key)).map(key => [key, reportComparisonTree(current[key], previous[key])]));
+    return { current, previous, difference: null, percent: null };
+}
+async function handleAdminPerformanceReports(request, response, pathname, searchParams) {
+    // Phase 16.6: filters are built as SQL predicates.  EXISTS prevents a
+    // multi-employee assignment from multiplying an order's financial values.
+    const filterRange = normalizeReportRequest(searchParams);
+    if (filterRange.error) return sendJson(response, 400, { message: filterRange.error });
+    const rawService = String(searchParams.get("service_type") || "").trim();
+    const rawCustomer = searchParams.get("customer_id"); const rawEmployee = searchParams.get("employee_id");
+    if (rawCustomer !== null && rawCustomer !== "" && !positiveId(rawCustomer)) return sendJson(response, 400, { message: "Ungültige Kunden-ID." });
+    if (rawEmployee !== null && rawEmployee !== "" && !positiveId(rawEmployee)) return sendJson(response, 400, { message: "Ungültige Mitarbeiter-ID." });
+    if (rawService && (!/^[\p{L}\p{N} .,&/()_-]{1,160}$/u.test(rawService))) return sendJson(response, 400, { message: "Ungültiger Leistungsfilter." });
+    // The legacy handler below remains the source for unfiltered results.
+    // Filtered endpoint work is intentionally routed through the same SQL pool.
+    if (request.method !== "GET") return sendJson(response, 405, { message: "Methode nicht erlaubt." });
+    const options = normalizeReportRequest(searchParams); if (options.error) return sendJson(response, 400, { message: options.error });
+    const range = options.range, type = pathname.split("/").pop();
+    try {
+        if (type === "operations") {
+            const [[orders], [planned], [actual], [reports]] = await Promise.all([
+                adminPool.execute("SELECT COUNT(*) total,SUM(status='ERLEDIGT') completed,SUM(status='STORNIERT') cancelled FROM orders WHERE DATE(created_at) BETWEEN ? AND ?", [range.from, range.to]),
+                adminPool.execute("SELECT COALESCE(SUM(TIME_TO_SEC(TIMEDIFF(end_time,start_time))/3600),0) hours,COUNT(*) total,SUM(status='ERLEDIGT') completed FROM order_assignments WHERE assignment_date BETWEEN ? AND ? AND status<>'STORNIERT'", [range.from, range.to]),
+                adminPool.execute("SELECT COALESCE(SUM(GREATEST(0,(TIME_TO_SEC(end_time)-TIME_TO_SEC(start_time))/3600-(break_minutes/60))),0) hours FROM employee_work_logs WHERE work_date BETWEEN ? AND ? AND end_time>start_time", [range.from, range.to]),
+                adminPool.execute("SELECT COUNT(*) total,SUM(status IN ('SUBMITTED','REVIEWED','SHARED','CUSTOMER_CONFIRMED')) completed FROM service_reports WHERE service_date BETWEEN ? AND ?", [range.from, range.to])
+            ]); const total = reportNumber(orders.total); return sendJson(response, 200, { success:true, data:{ planned_hours:reportNumber(planned.hours), actual_hours:reportNumber(actual.hours), order_count:total, completion_rate:total ? reportNumber(orders.completed)*100/total : 0, cancellation_rate:total ? reportNumber(orders.cancelled)*100/total : 0, assignment_count:reportNumber(planned.total), assignment_completion_rate:reportNumber(planned.total) ? reportNumber(planned.completed)*100/reportNumber(planned.total) : 0, service_report_completion_rate:reportNumber(reports.total) ? reportNumber(reports.completed)*100/reportNumber(reports.total) : 0 }, meta:{period:range.period,from:range.from,to:range.to,compare:options.compare} });
+        }
+        if (type === "services") { const [rows] = await adminPool.execute("SELECT o.service_type,COUNT(*) order_count,SUM(o.status='ERLEDIGT') completed_orders,SUM(o.status='STORNIERT') cancelled_orders,COALESCE(SUM(o.price_gross_snapshot),0) revenue,COALESCE(SUM((SELECT SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)) FROM material_stock_movements sm WHERE sm.order_id=o.id AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION')),0) material_cost FROM orders o WHERE DATE(o.created_at) BETWEEN ? AND ? GROUP BY o.service_type ORDER BY revenue DESC,o.service_type", [range.from,range.to]); return sendJson(response,200,{success:true,data:{items:rows.map(row=>({...row,contribution_before_personnel_costs:reportNumber(row.revenue)-reportNumber(row.material_cost)}))},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
+        if (type === "orders") { const page=Number(searchParams.get("page")||1),pageSize=Number(searchParams.get("page_size")||25); if(!Number.isInteger(page)||page<1||!Number.isInteger(pageSize)||pageSize<1||pageSize>100)return sendJson(response,400,{message:"Ungültige Seitennavigation."}); const search=String(searchParams.get("search")||"").trim(); if(search.length>80)return sendJson(response,400,{message:"Ungültige Suche."}); const query=search?" AND (o.order_number LIKE ? OR o.title LIKE ?)":"",values=search?[`%${search}%`,`%${search}%`]:[]; const [[count],[rows]]=await Promise.all([adminPool.execute(`SELECT COUNT(*) total FROM orders o WHERE DATE(o.created_at) BETWEEN ? AND ?${query}`,[range.from,range.to,...values]),adminPool.execute(`SELECT o.order_number,o.service_type,o.status,o.price_gross_snapshot,CONCAT(c.first_name,' ',c.last_name) customer_name,COALESCE((SELECT SUM(TIME_TO_SEC(TIMEDIFF(a.end_time,a.start_time))/3600) FROM order_assignments a WHERE a.order_id=o.id AND a.status<>'STORNIERT'),0) planned_hours,COALESCE((SELECT SUM(GREATEST(0,(TIME_TO_SEC(w.end_time)-TIME_TO_SEC(w.start_time))/3600-(w.break_minutes/60))) FROM employee_work_logs w WHERE w.order_id=o.id AND w.end_time>w.start_time),0) actual_hours,COALESCE((SELECT SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)) FROM material_stock_movements sm WHERE sm.order_id=o.id AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION'),0) material_cost FROM orders o JOIN customers c ON c.id=o.customer_id WHERE DATE(o.created_at) BETWEEN ? AND ?${query} ORDER BY o.created_at DESC LIMIT ? OFFSET ?`,[range.from,range.to,...values,pageSize,(page-1)*pageSize])]); return sendJson(response,200,{success:true,data:{items:rows.map(row=>({...row,contribution_before_personnel_costs:reportNumber(row.price_gross_snapshot)-reportNumber(row.material_cost)})),page,page_size:pageSize,total:reportNumber(count.total),total_pages:Math.max(1,Math.ceil(reportNumber(count.total)/pageSize))},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
+        if (type === "receivables") { const [rows]=await adminPool.execute("SELECT i.gross_amount,i.due_date,COALESCE(SUM(p.amount),0) paid FROM invoices i LEFT JOIN invoice_payments p ON p.invoice_id=i.id WHERE i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT') GROUP BY i.id,i.gross_amount,i.due_date",[range.from,range.to]);const buckets={current:0,days_1_30:0,days_31_60:0,days_61_90:0,days_90_plus:0};let overdue_invoice_count=0,overdue_invoice_amount=0,open_balance=0;rows.forEach(row=>{const open=Math.max(0,reportNumber(row.gross_amount)-reportNumber(row.paid));if(!open)return;open_balance+=open;const days=Math.max(0,Math.floor((new Date(`${reportBerlinDate()}T12:00:00Z`)-new Date(`${String(row.due_date).slice(0,10)}T12:00:00Z`))/86400000));if(days===0)buckets.current+=open;else if(days<=30)buckets.days_1_30+=open;else if(days<=60)buckets.days_31_60+=open;else if(days<=90)buckets.days_61_90+=open;else buckets.days_90_plus+=open;if(days>0){overdue_invoice_count++;overdue_invoice_amount+=open;}});return sendJson(response,200,{success:true,data:{buckets,overdue_invoice_count,overdue_invoice_amount,open_balance},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
+        if (type === "recurring") { const [[contracts],[logs]]=await Promise.all([adminPool.execute("SELECT COUNT(*) total FROM contracts WHERE interval_type<>'EINMALIG' AND status='AKTIV' AND start_date<=? AND (end_date IS NULL OR end_date>=?)",[range.to,range.from]),adminPool.execute("SELECT COUNT(*) total,SUM(status IN ('SUCCESS','CREATED','GENERATED')) successful,SUM(status LIKE '%DUPLICATE%') duplicates,SUM(status IN ('ERROR','FAILED')) errors FROM automation_logs WHERE DATE(created_at) BETWEEN ? AND ?",[range.from,range.to])]);return sendJson(response,200,{success:true,data:{recurring_contracts:reportNumber(contracts.total),generated_orders:reportNumber(logs.total),successful_generation:reportNumber(logs.successful),duplicate_outcomes:reportNumber(logs.duplicates),error_outcomes:reportNumber(logs.errors)},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
+        return sendJson(response,404,{message:"Leistungsanalyse nicht gefunden."});
+    } catch(error){console.error("[performance-report] failed:",error.code||"database_error");return sendJson(response,503,{message:"Leistungsanalyse konnte nicht geladen werden."});}
+}
+async function handleAdminReports(request, response, pathname, searchParams) {
+    if (!adminPool) return sendJson(response, 503, { message: "Reporting ist nicht verfügbar." });
+    if (request.method !== "GET") { response.setHeader("Allow", "GET"); return sendJson(response, 405, { message: "Methode nicht erlaubt." }); }
+    const reportName = pathname.split("/").pop(); const options = normalizeReportRequest(searchParams);
+    if (options.error) return sendJson(response, 400, { message: options.error });
+    if (options.employeeId) { const [employees] = await adminPool.execute("SELECT id FROM employees WHERE id=?", [options.employeeId]); if (!employees[0]) return sendJson(response, 404, { message: "Mitarbeiter nicht gefunden." }); }
+    const reports = { dashboard: getDashboardSummary, revenue: getRevenueReport, invoices: getInvoiceReport, orders: getOrderReport, customers: getCustomerReport, employees: getEmployeeReport, materials: getMaterialReport };
+    const report = reports[reportName]; if (!report) return sendJson(response, 404, { message: "Bericht nicht gefunden." });
+    const reportOptions = reportName === "employees" ? { employeeId: options.employeeId } : undefined;
+    try {
+        const current = await report(adminPool, options.range, reportOptions);
+        const previousRange = options.compare ? buildPreviousComparisonRange(options.range) : null;
+        const previous = previousRange ? await report(adminPool, previousRange, reportOptions) : null;
+        return sendJson(response, 200, { success: true, data: options.compare ? { current, previous, comparison: reportComparisonTree(current, previous) } : current, meta: { period: options.range.period, from: options.range.from, to: options.range.to, compare: options.compare, employee_id: options.employeeId || null } });
+    } catch (error) { console.error("[reporting] failed:", error.code || "database_error"); return sendJson(response, 503, { message: "Bericht konnte nicht geladen werden." }); }
+}
+async function handleAdminReportVisuals(request,response,pathname,searchParams){
+    if(!adminPool)return sendJson(response,503,{message:"Reporting ist nicht verfügbar."}); if(request.method!=="GET")return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    const options=normalizeReportRequest(searchParams);if(options.error)return sendJson(response,400,{message:options.error});const range=options.range,span=reportDaySpan(range.from,range.to),groupBy=range.period==="year"||span>62?"month":"day",dateExpr=groupBy==="month"?"DATE_FORMAT(%DATE%,'%Y-%m-01')":"DATE(%DATE%)";
+    if(pathname.endsWith("/trends")){const metric=String(searchParams.get("metric")||"");if(!["revenue","cashflow","invoices","orders"].includes(metric))return sendJson(response,400,{message:"Ungültige Kennzahl."});let sql,values=[range.from,range.to];if(metric==="revenue")sql=`SELECT ${dateExpr.replaceAll("%DATE%","invoice_date")} date,COALESCE(SUM(net_amount),0) net,COALESCE(SUM(tax_amount),0) tax,COALESCE(SUM(gross_amount),0) gross FROM invoices WHERE invoice_date BETWEEN ? AND ? AND status NOT IN ('ENTWURF','STORNIERT') GROUP BY date ORDER BY date`;else if(metric==="cashflow")sql=`SELECT ${dateExpr.replaceAll("%DATE%","transaction_date")} date,COALESCE(SUM(CASE WHEN transaction_type='INCOME' THEN amount ELSE 0 END),0) income,COALESCE(SUM(CASE WHEN transaction_type='EXPENSE' THEN amount ELSE 0 END),0) expense FROM financial_transactions WHERE transaction_date BETWEEN ? AND ? AND status<>'STORNIERT' GROUP BY date ORDER BY date`;else if(metric==="invoices")sql=`SELECT ${dateExpr.replaceAll("%DATE%","invoice_date")} date,COUNT(*) issued,COALESCE(SUM(status='BEZAHLT'),0) paid,COALESCE(SUM(status='TEILBEZAHLT'),0) partial,COALESCE(SUM(status='ÜBERFÄLLIG'),0) overdue FROM invoices WHERE invoice_date BETWEEN ? AND ? AND status<>'ENTWURF' GROUP BY date ORDER BY date`;else sql=`SELECT ${dateExpr.replaceAll("%DATE%","created_at")} date,COUNT(*) new_orders,COALESCE(SUM(status='ERLEDIGT'),0) completed,COALESCE(SUM(status='STORNIERT'),0) cancelled FROM orders WHERE DATE(created_at) BETWEEN ? AND ? GROUP BY date ORDER BY date`;try{const[rows]=await adminPool.execute(sql,values);return sendJson(response,200,{success:true,data:{series:rows.map(row=>({...row,date:String(row.date).slice(0,10),label:String(row.date).slice(0,10)}))},meta:{period:range.period,from:range.from,to:range.to,groupBy}})}catch(e){return sendJson(response,503,{message:"Trend konnte nicht geladen werden."})}}
+    const type=String(searchParams.get("type")||""),rawLimit=searchParams.get("limit")||"10",limit=Number(rawLimit);if(!["customers","employees","materials"].includes(type)||!Number.isInteger(limit)||limit<1||limit>20)return sendJson(response,400,{message:"Ungültiger Ranking-Filter."});let sql;if(type==="customers")sql="SELECT c.id,c.customer_number,CONCAT(c.first_name,' ',c.last_name) label,COALESCE(SUM(i.gross_amount),0) revenue_gross,COUNT(DISTINCT o.id) order_count FROM customers c LEFT JOIN invoices i ON i.customer_id=c.id AND i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT') LEFT JOIN orders o ON o.customer_id=c.id AND DATE(o.created_at) BETWEEN ? AND ? GROUP BY c.id,c.customer_number,c.first_name,c.last_name ORDER BY revenue_gross DESC LIMIT ?";else if(type==="employees")sql="SELECT e.id,e.employee_number,CONCAT(e.first_name,' ',e.last_name) label,COALESCE(SUM(GREATEST(0,(TIME_TO_SEC(w.end_time)-TIME_TO_SEC(w.start_time))/3600-(w.break_minutes/60))),0) work_hours,COUNT(DISTINCT a.id) assignments,COUNT(DISTINCT r.id) service_reports FROM employees e LEFT JOIN employee_work_logs w ON w.employee_id=e.id AND w.work_date BETWEEN ? AND ? AND w.end_time>w.start_time LEFT JOIN order_assignments a ON a.employee_id=e.id AND a.assignment_date BETWEEN ? AND ? AND a.status<>'STORNIERT' LEFT JOIN service_reports r ON r.employee_id=e.id AND r.service_date BETWEEN ? AND ? GROUP BY e.id,e.employee_number,e.first_name,e.last_name ORDER BY work_hours DESC LIMIT ?";else sql="SELECT m.id,m.material_number,m.name label,COALESCE(SUM(sm.quantity),0) consumed_quantity,COALESCE(SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)),0) consumption_cost FROM materials m JOIN material_stock_movements sm ON sm.material_id=m.id AND sm.movement_date BETWEEN ? AND ? AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION' GROUP BY m.id,m.material_number,m.name ORDER BY consumption_cost DESC LIMIT ?";const values=type==="customers"?[range.from,range.to,range.from,range.to,limit]:type==="employees"?[range.from,range.to,range.from,range.to,range.from,range.to,limit]:[range.from,range.to,limit];try{const[rows]=await adminPool.execute(sql,values);return sendJson(response,200,{success:true,data:{items:rows},meta:{type,from:range.from,to:range.to,limit}})}catch(e){return sendJson(response,503,{message:"Ranking konnte nicht geladen werden."})}
+}
 function employeeRecord(row) {
     if (!row) return null;
     const { password_hash, ...employee } = row;
@@ -1593,6 +1919,10 @@ async function handleAdminInvoices(request, response, pathname, searchParams) {
 }
 
 async function auditEvent(connection, actorType, actorId, action, entityType, entityId, metadata = null) {
+    // Status values are stored ASCII-safe; retain semantically correct audit events.
+    if (action === "CASH_TRANSFER_CREATED" && metadata?.status === "GEPRUEFT") action = "CASH_TRANSFER_APPROVED";
+    if (action === "CASH_TRANSFER_CREATED" && metadata?.status === "UEBERGEBEN") action = "CASH_TRANSFER_RECEIVED";
+    if (action === "FINANCIAL_TRANSACTION_CREATED" && metadata?.status === "GEPRUEFT") action = "FINANCIAL_TRANSACTION_APPROVED";
     const safe = metadata && typeof metadata === "object" ? JSON.stringify(metadata).slice(0, 2000) : null;
     await connection.execute("INSERT INTO audit_logs (actor_type,actor_id,action,entity_type,entity_id,metadata) VALUES (?,?,?,?,?,?)", [actorType,actorId || null,action,entityType,entityId || null,safe]);
 }
@@ -1600,6 +1930,11 @@ async function auditEvent(connection, actorType, actorId, action, entityType, en
 async function notifyCustomer(connection, customerId, type, title, body, entityType, entityId) {
     if (!Number.isSafeInteger(Number(customerId)) || Number(customerId) < 1) return;
     await connection.execute("INSERT INTO notifications(recipient_type,recipient_id,notification_type,title,body,entity_type,entity_id) VALUES ('CUSTOMER',?,?,?,?,?,?)", [Number(customerId), type, title, body, entityType, entityId]);
+}
+
+async function notifyEmployee(connection, employeeId, type, title, body, entityType, entityId) {
+    if (!Number.isSafeInteger(Number(employeeId)) || Number(employeeId) < 1) return;
+    await connection.execute("INSERT INTO notifications(recipient_type,recipient_id,notification_type,title,body,entity_type,entity_id) VALUES ('EMPLOYEE',?,?,?,?,?,?)", [Number(employeeId), type, title, body, entityType, entityId]);
 }
 
 const financeTransactionTypes = new Set(["INCOME", "EXPENSE"]);
@@ -1619,7 +1954,42 @@ async function createFinanceNumber(connection, table, column, prefix, id) {
 
 function financePage(searchParams) {
     const page = Math.max(1, Math.min(100000, Number(searchParams.get("page") || 1) || 1));
-    return { page, limit: 100, offset: (page - 1) * 100, search: String(searchParams.get("search") || "").trim().slice(0, 100) };
+    const pageSize = Math.max(1, Math.min(100, Number(searchParams.get("pageSize") || 25) || 25));
+    return { page, pageSize, limit: pageSize, offset: (page - 1) * pageSize, search: String(searchParams.get("search") || "").trim().slice(0, 100) };
+}
+
+function financeListFilters(searchParams) {
+    const page = financePage(searchParams);
+    const optionalId = name => {
+        const raw = String(searchParams.get(name) || "").trim();
+        if (!raw) return null;
+        const value = Number(raw);
+        return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+    };
+    const optionalMoney = name => {
+        const raw = String(searchParams.get(name) || "").trim();
+        if (!raw) return null;
+        const value = money(raw, { allowEmpty: false });
+        return value !== null && value >= 0 ? value : undefined;
+    };
+    const from = String(searchParams.get("from") || ""), to = String(searchParams.get("to") || "");
+    const ids = Object.fromEntries(["employee_id", "customer_id", "order_id", "invoice_id"].map(name => [name, optionalId(name)]));
+    const amountMin = optionalMoney("amount_min"), amountMax = optionalMoney("amount_max");
+    if ((from && !isIsoDate(from)) || (to && !isIsoDate(to)) || (from && to && from > to) || Object.values(ids).some(value => value === undefined) || amountMin === undefined || amountMax === undefined || (amountMin !== null && amountMax !== null && amountMin > amountMax)) return null;
+    return { ...page, from, to, ...ids, amountMin, amountMax, status: String(searchParams.get("status") || "").trim(), type: String(searchParams.get("type") || "").trim(), paymentMethod: String(searchParams.get("payment_method") || "").trim() };
+}
+
+function financeFilterClause(filters, mapping, tableAlias = "") {
+    const where = [], values = [], column = name => `${tableAlias}${mapping[name]}`;
+    if (filters.from) { where.push(`${column("date")} >= ?`); values.push(filters.from); }
+    if (filters.to) { where.push(`${column("date")} <= ?`); values.push(filters.to); }
+    if (filters.status) { where.push(`${column("status")} = ?`); values.push(filters.status); }
+    if (filters.paymentMethod && mapping.paymentMethod) { where.push(`${column("paymentMethod")} = ?`); values.push(filters.paymentMethod); }
+    if (filters.type && mapping.type) { where.push(`${column("type")} = ?`); values.push(filters.type); }
+    for (const key of ["employee_id", "customer_id", "order_id", "invoice_id"]) if (filters[key] !== null && mapping[key]) { where.push(`${column(key)} = ?`); values.push(filters[key]); }
+    if (filters.amountMin !== null) { where.push(`${column("amount")} >= ?`); values.push(filters.amountMin); }
+    if (filters.amountMax !== null) { where.push(`${column("amount")} <= ?`); values.push(filters.amountMax); }
+    return { where, values };
 }
 
 function normalizeFinanceStatus(value) {
@@ -1642,23 +2012,97 @@ async function validateEmployeeCashPayment(connection, employeeId, body) {
         if (invoice.status === "STORNIERT") return { error: "Für stornierte Rechnungen ist keine Zahlung möglich.", status: 409 };
         if (amount > Number(invoice.gross_amount) - Number(invoice.paid_amount) + 0.0001) return { error: "Der Betrag übersteigt den offenen Rechnungsbetrag.", status: 409 };
     }
-    const [[duplicate]] = await connection.execute("SELECT id FROM employee_cash_payments WHERE employee_id=? AND customer_id=? AND order_id=? AND payment_date=? AND amount=? AND status IN ('ERFASST','GEPRÜFT') LIMIT 1", [employeeId, customerId, orderId, paymentDate, amount]);
+    const [[duplicate]] = await connection.execute("SELECT id FROM employee_cash_payments WHERE employee_id=? AND customer_id=? AND order_id=? AND payment_date=? AND amount=? AND status IN ('ERFASST','GEPRUEFT') LIMIT 1", [employeeId, customerId, orderId, paymentDate, amount]);
     if (duplicate) return { error: "Diese Barzahlung wurde bereits erfasst.", status: 409 };
     return { customerId, orderId, invoiceId, amount, paymentDate, paymentMethod, purpose, receiptNumber: receiptNumber || null, notes: notes || null };
 }
 
+async function handleFinanceList(response, kind, searchParams) {
+    const filters = financeListFilters(searchParams);
+    if (!filters) return sendJson(response, 400, { message: "Ungültige Finanzfilter." });
+    const configs = {
+        transactions: {
+            table: "financial_transactions", alias: "t", date: "transaction_date", status: "status", amount: "amount", paymentMethod: "payment_method", type: "transaction_type", employee_id: "employee_id", customer_id: "customer_id", order_id: "order_id", invoice_id: "invoice_id",
+            joins: " LEFT JOIN customers c ON c.id=t.customer_id LEFT JOIN orders o ON o.id=t.order_id LEFT JOIN invoices i ON i.id=t.invoice_id LEFT JOIN employees e ON e.id=t.employee_id",
+            select: "t.*,c.customer_number,c.first_name,c.last_name,o.order_number,i.invoice_number,e.employee_number",
+            search: "(t.transaction_number LIKE ? OR t.description LIKE ? OR t.reference LIKE ? OR c.customer_number LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ? OR o.order_number LIKE ? OR i.invoice_number LIKE ? OR e.employee_number LIKE ?)",
+            order: "t.transaction_date DESC,t.id DESC"
+        },
+        payments: {
+            table: "employee_cash_payments", alias: "p", date: "payment_date", status: "status", amount: "amount", paymentMethod: "payment_method", employee_id: "employee_id", customer_id: "customer_id", order_id: "order_id", invoice_id: "invoice_id",
+            joins: " JOIN customers c ON c.id=p.customer_id JOIN orders o ON o.id=p.order_id LEFT JOIN invoices i ON i.id=p.invoice_id JOIN employees e ON e.id=p.employee_id",
+            select: "p.*,c.customer_number,c.first_name,c.last_name,o.order_number,i.invoice_number,e.employee_number,EXISTS(SELECT 1 FROM financial_receipts r WHERE r.employee_cash_payment_id=p.id) AS has_receipt",
+            search: "(p.payment_number LIKE ? OR p.purpose LIKE ? OR p.receipt_number LIKE ? OR c.customer_number LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ? OR o.order_number LIKE ? OR i.invoice_number LIKE ? OR e.employee_number LIKE ?)",
+            order: "p.payment_date DESC,p.id DESC"
+        },
+        transfers: {
+            table: "cash_transfers", alias: "t", date: "transfer_date", status: "status", amount: "amount", employee_id: "employee_id",
+            joins: " JOIN employees e ON e.id=t.employee_id",
+            select: "t.*,e.employee_number,e.first_name,e.last_name",
+            search: "(t.transfer_number LIKE ? OR t.reference LIKE ? OR t.notes LIKE ? OR e.employee_number LIKE ? OR e.first_name LIKE ? OR e.last_name LIKE ?)",
+            order: "t.transfer_date DESC,t.id DESC"
+        }
+    };
+    const config = configs[kind];
+    if (!config) return sendJson(response, 404, { message: "API-Endpunkt nicht gefunden." });
+    const allowedStatuses = kind === "payments" ? employeeCashStatuses : kind === "transfers" ? cashTransferStatuses : financeStatuses;
+    const allowedMethods = kind === "payments" ? employeeCashMethods : financePaymentMethods;
+    if (filters.status && !allowedStatuses.has(normalizeFinanceStatus(filters.status))) return sendJson(response, 400, { message: "Ungültiger Statusfilter." });
+    if (filters.paymentMethod && (!config.paymentMethod || !allowedMethods.has(filters.paymentMethod))) return sendJson(response, 400, { message: "Ungültiger Zahlungsmethodenfilter." });
+    if (filters.type && (!config.type || !financeTransactionTypes.has(filters.type))) return sendJson(response, 400, { message: "Ungültiger Typfilter." });
+    filters.status = normalizeFinanceStatus(filters.status);
+    const mapping = { date: config.date, status: config.status, amount: config.amount, paymentMethod: config.paymentMethod, type: config.type, employee_id: config.employee_id, customer_id: config.customer_id, order_id: config.order_id, invoice_id: config.invoice_id };
+    const { where, values } = financeFilterClause(filters, mapping, `${config.alias}.`);
+    if (filters.search) { where.push(config.search); for (let index = 0; index < (kind === "transfers" ? 6 : 9); index += 1) values.push(`%${filters.search}%`); }
+    const clause = where.length ? ` WHERE ${where.join(" AND ")}` : "";
+    const [[count]] = await adminPool.execute(`SELECT COUNT(*) AS total FROM ${config.table} ${config.alias}${config.joins}${clause}`, values);
+    const [items] = await adminPool.execute(`SELECT ${config.select} FROM ${config.table} ${config.alias}${config.joins}${clause} ORDER BY ${config.order} LIMIT ? OFFSET ?`, [...values, filters.limit, filters.offset]);
+    const total = Number(count.total);
+    return sendJson(response, 200, { items, rows: items, page: filters.page, pageSize: filters.pageSize, total, totalPages: Math.max(1, Math.ceil(total / filters.pageSize)) });
+}
+
 async function handleAdminFinance(request, response, pathname, searchParams) {
     if (!adminPool) return sendJson(response, 503, { message: "Die Finanzverwaltung ist derzeit nicht verfügbar." });
+    const paymentReceiptMatch = pathname.match(/^\/api\/admin\/finance\/employee-cash-payments\/(\d+)\/receipt$/);
+    if (paymentReceiptMatch) {
+        if (request.method !== "GET") return sendJson(response,405,{message:"Methode nicht erlaubt."});
+        const paymentId=Number(paymentReceiptMatch[1]);
+        const [rows]=await adminPool.execute("SELECT r.file_name,r.stored_file_name,r.mime_type FROM financial_receipts r JOIN employee_cash_payments p ON p.id=r.employee_cash_payment_id WHERE p.id=? LIMIT 1",[paymentId]);
+        const receipt=rows[0],extension=receipt&&allowedQuoteMimes.get(receipt.mime_type);
+        if(!receipt||!extension)return sendJson(response,404,{message:"Beleg nicht gefunden."});
+        const filePath=path.join(PRIVATE_DOCUMENT_UPLOAD_DIR,`${receipt.stored_file_name}${extension}`);
+        try{const stat=await fs.promises.stat(filePath);response.writeHead(200,{"Content-Type":receipt.mime_type,"Content-Length":stat.size,"Content-Disposition":`inline; filename="${receipt.file_name.replace(/["\\]/g,"_")}"`,"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff"});return fs.createReadStream(filePath).pipe(response);}catch{return sendJson(response,404,{message:"Beleg nicht gefunden."});}
+    }
+    if (pathname === "/api/admin/finance/dashboard" && request.method === "GET") {
+        const preset = String(searchParams.get("period") || "month");
+        const now = new Date(), iso = value => value.toISOString().slice(0, 10);
+        let from = String(searchParams.get("from") || ""), to = String(searchParams.get("to") || "");
+        if (preset === "today") from = to = iso(now);
+        else if (preset === "week") { const d = new Date(now); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); from = iso(d); to = iso(new Date(d.getFullYear(), d.getMonth(), d.getDate() + 6)); }
+        else if (preset === "last-month") { from = iso(new Date(now.getFullYear(), now.getMonth() - 1, 1)); to = iso(new Date(now.getFullYear(), now.getMonth(), 0)); }
+        else if (preset === "year") { from = `${now.getFullYear()}-01-01`; to = `${now.getFullYear()}-12-31`; }
+        else if (!isIsoDate(from) || !isIsoDate(to)) { from = iso(new Date(now.getFullYear(), now.getMonth(), 1)); to = iso(new Date(now.getFullYear(), now.getMonth() + 1, 0)); }
+        if (!isIsoDate(from) || !isIsoDate(to) || from > to) return sendJson(response,400,{message:"Ungültiger Zeitraum."});
+        const [[totals]] = await adminPool.execute("SELECT COALESCE(SUM(CASE WHEN transaction_type='INCOME' THEN amount ELSE 0 END),0) income,COALESCE(SUM(CASE WHEN transaction_type='EXPENSE' THEN amount ELSE 0 END),0) expenses,COALESCE(SUM(CASE WHEN transaction_type='INCOME' AND payment_method='CASH' THEN amount ELSE 0 END),0) cash,COALESCE(SUM(CASE WHEN transaction_type='INCOME' AND payment_method='BANK' THEN amount ELSE 0 END),0) bank,COALESCE(SUM(CASE WHEN transaction_type='INCOME' AND payment_method='CARD' THEN amount ELSE 0 END),0) card FROM financial_transactions WHERE transaction_date BETWEEN ? AND ? AND status<>'STORNIERT'",[from,to]);
+        const [[extra]] = await adminPool.execute("SELECT COALESCE(SUM(CASE WHEN p.status IN ('ERFASST','GEPRUEFT') THEN p.amount ELSE 0 END),0) employee_cash,COALESCE(SUM(CASE WHEN p.status IN ('ERFASST','GEPRUEFT') AND NOT EXISTS(SELECT 1 FROM cash_transfers t WHERE t.employee_id=p.employee_id AND t.status IN ('UEBERGEBEN','GEPRUEFT')) THEN p.amount ELSE 0 END),0) not_transferred FROM employee_cash_payments p WHERE p.payment_date BETWEEN ? AND ?",[from,to]);
+        const [[invoices]] = await adminPool.execute("SELECT COUNT(*) open_invoices,COALESCE(SUM(CASE WHEN due_date<CURDATE() THEN 1 ELSE 0 END),0) overdue_invoices FROM invoices WHERE status NOT IN ('BEZAHLT','STORNIERT') AND outstanding_amount>0");
+        return sendJson(response,200,{period:{from,to},income:Number(totals.income),expenses:Number(totals.expenses),cashflow:Number(totals.income)-Number(totals.expenses),cash:Number(totals.cash),bank:Number(totals.bank),card:Number(totals.card),employee_cash:Number(extra.employee_cash),not_transferred:Number(extra.not_transferred),open_invoices:Number(invoices.open_invoices),overdue_invoices:Number(invoices.overdue_invoices)});
+    }
     const transactionMatch = pathname.match(/^\/api\/admin\/finance\/transactions(?:\/(\d+))?$/);
     const cashMatch = pathname.match(/^\/api\/admin\/finance\/employee-cash-payments(?:\/(\d+))?$/);
     const transferMatch = pathname.match(/^\/api\/admin\/finance\/cash-transfers(?:\/(\d+))?$/);
     const receiptMatch = pathname.match(/^\/api\/admin\/finance\/receipts\/(\d+)$/);
     const detailId = Number(transactionMatch?.[1] || cashMatch?.[1] || transferMatch?.[1] || receiptMatch?.[1] || 0) || null;
-    if (receiptMatch) { if (request.method !== "GET") return sendJson(response,405,{message:"Methode nicht erlaubt."}); const [rows] = await adminPool.execute("SELECT r.*,c.customer_number,c.first_name,c.last_name,e.employee_number FROM financial_receipts r LEFT JOIN customers c ON c.id=r.customer_id LEFT JOIN employees e ON e.id=r.employee_id WHERE r.id=?",[detailId]); return rows[0] ? sendJson(response,200,{receipt:rows[0]}) : sendJson(response,404,{message:"Beleg nicht gefunden."}); }
+    if (request.method === "GET" && !detailId) {
+        if (transactionMatch) return handleFinanceList(response, "transactions", searchParams);
+        if (cashMatch) return handleFinanceList(response, "payments", searchParams);
+        if (transferMatch) return handleFinanceList(response, "transfers", searchParams);
+    }
+    if (receiptMatch) { if (request.method !== "GET") return sendJson(response,405,{message:"Methode nicht erlaubt."}); const [rows] = await adminPool.execute("SELECT r.id,r.transaction_id,r.employee_cash_payment_id,r.customer_id,r.employee_id,r.file_name,r.mime_type,r.file_size,r.receipt_type,r.created_at,c.customer_number,c.first_name,c.last_name,e.employee_number FROM financial_receipts r LEFT JOIN customers c ON c.id=r.customer_id LEFT JOIN employees e ON e.id=r.employee_id WHERE r.id=?",[detailId]); return rows[0] ? sendJson(response,200,{receipt:rows[0]}) : sendJson(response,404,{message:"Beleg nicht gefunden."}); }
     if (transactionMatch) {
         if (request.method === "GET") { if (detailId) { const [rows]=await adminPool.execute("SELECT t.*,c.customer_number,c.first_name,c.last_name,o.order_number,i.invoice_number,e.employee_number FROM financial_transactions t LEFT JOIN customers c ON c.id=t.customer_id LEFT JOIN orders o ON o.id=t.order_id LEFT JOIN invoices i ON i.id=t.invoice_id LEFT JOIN employees e ON e.id=t.employee_id WHERE t.id=?",[detailId]); return rows[0]?sendJson(response,200,{transaction:rows[0]}):sendJson(response,404,{message:"Finanzvorgang nicht gefunden."}); } const {limit,offset,search}=financePage(searchParams),where=[],values=[]; if(search){where.push("(t.transaction_number LIKE ? OR t.description LIKE ? OR t.reference LIKE ?)");values.push(`%${search}%`,`%${search}%`,`%${search}%`);} const clause=where.length?` WHERE ${where.join(" AND ")}`:"";const [rows]=await adminPool.execute(`SELECT t.*,c.customer_number,c.first_name,c.last_name FROM financial_transactions t LEFT JOIN customers c ON c.id=t.customer_id${clause} ORDER BY t.transaction_date DESC,t.id DESC LIMIT ? OFFSET ?`,[...values,limit,offset]);return sendJson(response,200,{rows,total:rows.length}); }
         if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."}); let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Finanzdaten."})}; const type=readText(body.transaction_type,20),method=readText(body.payment_method,20),status=readText(body.status||"ERFASST",20),amount=money(body.amount,{allowEmpty:false}),date=readText(body.transaction_date,10),description=readText(body.description,500),reference=readText(body.reference,180,{optional:true}),notes=readText(body.notes,4000,{optional:true,multiline:true}); if(!financeTransactionTypes.has(type)||!financePaymentMethods.has(method)||!financeStatuses.has(status)||amount===null||amount<=0||!isIsoDate(date)||!description||reference===null||notes===null)return sendJson(response,400,{message:"Bitte prüfen Sie die Finanzdaten."}); const customerId=body.customer_id?Number(body.customer_id):null,orderId=body.order_id?Number(body.order_id):null,invoiceId=body.invoice_id?Number(body.invoice_id):null,contractId=body.contract_id?Number(body.contract_id):null,employeeId=body.employee_id?Number(body.employee_id):null; if([customerId,orderId,invoiceId,contractId,employeeId].some(id=>id!==null&&(!Number.isSafeInteger(id)||id<1)))return sendJson(response,400,{message:"Ungültige Zuordnung."}); const c=await adminPool.getConnection();try{await c.beginTransaction();if(request.method==="POST"){const[r]=await c.execute("INSERT INTO financial_transactions (transaction_type,payment_method,customer_id,order_id,invoice_id,contract_id,employee_id,amount,transaction_date,description,reference,status,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",[type,method,customerId,orderId,invoiceId,contractId,employeeId,amount,date,description,reference||null,status,notes||null]);const number=await createFinanceNumber(c,"financial_transactions","transaction_number","FIN",r.insertId);await auditEvent(c,"ADMIN",null,"FINANCIAL_TRANSACTION_CREATED","FINANCIAL_TRANSACTION",r.insertId,{status,amount});await c.commit();return sendJson(response,201,{id:r.insertId,transactionNumber:number,message:"Finanzvorgang erfasst."});}if(!detailId){await c.rollback();return sendJson(response,400,{message:"Finanzvorgang fehlt."});}const[r]=await c.execute("UPDATE financial_transactions SET transaction_type=?,payment_method=?,customer_id=?,order_id=?,invoice_id=?,contract_id=?,employee_id=?,amount=?,transaction_date=?,description=?,reference=?,status=?,notes=? WHERE id=?",[type,method,customerId,orderId,invoiceId,contractId,employeeId,amount,date,description,reference||null,status,notes||null,detailId]);if(!r.affectedRows){await c.rollback();return sendJson(response,404,{message:"Finanzvorgang nicht gefunden."});}await auditEvent(c,"ADMIN",null,status==="GEPRÜFT"?"FINANCIAL_TRANSACTION_APPROVED":status==="STORNIERT"?"FINANCIAL_TRANSACTION_CANCELLED":"FINANCIAL_TRANSACTION_CREATED","FINANCIAL_TRANSACTION",detailId,{status});await c.commit();return sendJson(response,200,{id:detailId,message:"Finanzvorgang gespeichert."});}catch(error){await c.rollback();throw error}finally{c.release()} }
-    if (cashMatch) { if(request.method==="GET"){if(detailId){const[rows]=await adminPool.execute("SELECT p.*,c.customer_number,c.first_name,c.last_name,o.order_number,i.invoice_number,e.employee_number FROM employee_cash_payments p JOIN customers c ON c.id=p.customer_id JOIN orders o ON o.id=p.order_id LEFT JOIN invoices i ON i.id=p.invoice_id JOIN employees e ON e.id=p.employee_id WHERE p.id=?",[detailId]);return rows[0]?sendJson(response,200,{payment:rows[0]}):sendJson(response,404,{message:"Barzahlung nicht gefunden."});}const[rows]=await adminPool.execute("SELECT p.*,c.customer_number,c.first_name,c.last_name,o.order_number,e.employee_number FROM employee_cash_payments p JOIN customers c ON c.id=p.customer_id JOIN orders o ON o.id=p.order_id JOIN employees e ON e.id=p.employee_id ORDER BY p.payment_date DESC,p.id DESC LIMIT 100");return sendJson(response,200,{rows,total:rows.length});}if(request.method!=="PATCH"||!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Daten."})};const status=readText(body.status,20),notes=readText(body.notes,4000,{optional:true,multiline:true});if(!employeeCashStatuses.has(status)||notes===null)return sendJson(response,400,{message:"Ungültiger Status."});const c=await adminPool.getConnection();try{await c.beginTransaction();const[[payment]]=await c.execute("SELECT id,payment_number FROM employee_cash_payments WHERE id=? FOR UPDATE",[detailId]);if(!payment){await c.rollback();return sendJson(response,404,{message:"Barzahlung nicht gefunden."});}await c.execute("UPDATE employee_cash_payments SET status=?,notes=? WHERE id=?",[status,notes||null,detailId]);await c.execute("UPDATE financial_transactions SET status=? WHERE reference=? AND transaction_type='INCOME'",[status==="GEPRUEFT"?"GEPRUEFT":status==="STORNIERT"?"STORNIERT":"ERFASST",payment.payment_number]);const action=status==="GEPRUEFT"?"EMPLOYEE_CASH_PAYMENT_APPROVED":status==="ABGELEHNT"?"EMPLOYEE_CASH_PAYMENT_REJECTED":status==="STORNIERT"?"EMPLOYEE_CASH_PAYMENT_CANCELLED":"EMPLOYEE_CASH_PAYMENT_CREATED";await auditEvent(c,"ADMIN",null,action,"EMPLOYEE_CASH_PAYMENT",detailId,{status});await c.commit();return sendJson(response,200,{id:detailId,message:"Barzahlung gespeichert."});}catch(error){await c.rollback();throw error}finally{c.release()} }
+    if (cashMatch) { if(request.method==="GET"){if(detailId){const[rows]=await adminPool.execute("SELECT p.*,c.customer_number,c.first_name,c.last_name,o.order_number,i.invoice_number,e.employee_number,EXISTS(SELECT 1 FROM financial_receipts r WHERE r.employee_cash_payment_id=p.id) AS has_receipt FROM employee_cash_payments p JOIN customers c ON c.id=p.customer_id JOIN orders o ON o.id=p.order_id LEFT JOIN invoices i ON i.id=p.invoice_id JOIN employees e ON e.id=p.employee_id WHERE p.id=?",[detailId]);return rows[0]?sendJson(response,200,{payment:rows[0]}):sendJson(response,404,{message:"Barzahlung nicht gefunden."});}const[rows]=await adminPool.execute("SELECT p.*,c.customer_number,c.first_name,c.last_name,o.order_number,e.employee_number,EXISTS(SELECT 1 FROM financial_receipts r WHERE r.employee_cash_payment_id=p.id) AS has_receipt FROM employee_cash_payments p JOIN customers c ON c.id=p.customer_id JOIN orders o ON o.id=p.order_id JOIN employees e ON e.id=p.employee_id ORDER BY p.payment_date DESC,p.id DESC LIMIT 100");return sendJson(response,200,{rows,total:rows.length});}if(request.method!=="PATCH"||!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Daten."})};const status=readText(body.status,20),notes=readText(body.notes,4000,{optional:true,multiline:true});if(!employeeCashStatuses.has(status)||notes===null)return sendJson(response,400,{message:"Ungültiger Status."});const c=await adminPool.getConnection();try{await c.beginTransaction();const[[payment]]=await c.execute("SELECT id,payment_number FROM employee_cash_payments WHERE id=? FOR UPDATE",[detailId]);if(!payment){await c.rollback();return sendJson(response,404,{message:"Barzahlung nicht gefunden."});}await c.execute("UPDATE employee_cash_payments SET status=?,notes=? WHERE id=?",[status,notes||null,detailId]);await c.execute("UPDATE financial_transactions SET status=? WHERE reference=? AND transaction_type='INCOME'",[status==="GEPRUEFT"?"GEPRUEFT":status==="STORNIERT"?"STORNIERT":"ERFASST",payment.payment_number]);const action=status==="GEPRUEFT"?"EMPLOYEE_CASH_PAYMENT_APPROVED":status==="ABGELEHNT"?"EMPLOYEE_CASH_PAYMENT_REJECTED":status==="STORNIERT"?"EMPLOYEE_CASH_PAYMENT_CANCELLED":"EMPLOYEE_CASH_PAYMENT_CREATED";await auditEvent(c,"ADMIN",null,action,"EMPLOYEE_CASH_PAYMENT",detailId,{status});await c.commit();return sendJson(response,200,{id:detailId,message:"Barzahlung gespeichert."});}catch(error){await c.rollback();throw error}finally{c.release()} }
     if (transferMatch) { if(request.method==="GET"){if(detailId){const[rows]=await adminPool.execute("SELECT t.*,e.employee_number,e.first_name,e.last_name FROM cash_transfers t JOIN employees e ON e.id=t.employee_id WHERE t.id=?",[detailId]);return rows[0]?sendJson(response,200,{transfer:rows[0]}):sendJson(response,404,{message:"Kassenübergabe nicht gefunden."});}const[rows]=await adminPool.execute("SELECT t.*,e.employee_number,e.first_name,e.last_name FROM cash_transfers t JOIN employees e ON e.id=t.employee_id ORDER BY t.transfer_date DESC,t.id DESC LIMIT 100");return sendJson(response,200,{rows,total:rows.length});}if(!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Übergabedaten."})};const employeeId=Number(body.employee_id),amount=money(body.amount,{allowEmpty:false}),date=readText(body.transfer_date,10),status=readText(body.status||"OFFEN",20),reference=readText(body.reference,180,{optional:true}),notes=readText(body.notes,4000,{optional:true,multiline:true});if(!Number.isSafeInteger(employeeId)||employeeId<1||amount===null||amount<=0||!isIsoDate(date)||!cashTransferStatuses.has(status)||reference===null||notes===null)return sendJson(response,400,{message:"Bitte prüfen Sie die Übergabedaten."});const c=await adminPool.getConnection();try{await c.beginTransaction();if(request.method==="POST"){const[r]=await c.execute("INSERT INTO cash_transfers (employee_id,amount,transfer_date,status,reference,notes) VALUES (?,?,?,?,?,?)",[employeeId,amount,date,status,reference||null,notes||null]);const number=await createFinanceNumber(c,"cash_transfers","transfer_number","KAS",r.insertId);await auditEvent(c,"ADMIN",null,"CASH_TRANSFER_CREATED","CASH_TRANSFER",r.insertId,{amount,status});await c.commit();return sendJson(response,201,{id:r.insertId,transferNumber:number,message:"Kassenübergabe erfasst."});}if(request.method!=="PATCH"||!detailId){await c.rollback();return sendJson(response,405,{message:"Methode nicht erlaubt."});}const[r]=await c.execute("UPDATE cash_transfers SET employee_id=?,amount=?,transfer_date=?,status=?,reference=?,notes=? WHERE id=?",[employeeId,amount,date,status,reference||null,notes||null,detailId]);if(!r.affectedRows){await c.rollback();return sendJson(response,404,{message:"Kassenübergabe nicht gefunden."});}await auditEvent(c,"ADMIN",null,status==="GEPRÜFT"?"CASH_TRANSFER_APPROVED":status==="ÜBERGEBEN"?"CASH_TRANSFER_RECEIVED":"CASH_TRANSFER_CREATED","CASH_TRANSFER",detailId,{amount,status});await c.commit();return sendJson(response,200,{id:detailId,message:"Kassenübergabe gespeichert."});}catch(error){await c.rollback();throw error}finally{c.release()} }
     return sendJson(response,404,{message:"API-Endpunkt nicht gefunden."});
 }
@@ -1690,6 +2134,275 @@ async function handleAdminPhase12(request, response, pathname, searchParams) {
     const messageRead=pathname.match(/^\/api\/admin\/messages\/(\d+)\/read$/); if(messageRead){if(request.method!=="PATCH"||!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});const c=await adminPool.getConnection();try{await c.beginTransaction();const[r]=await c.execute("UPDATE messages SET read_at=COALESCE(read_at,NOW()) WHERE id=?",[Number(messageRead[1])]);if(!r.affectedRows){await c.rollback();return sendJson(response,404,{message:"Nachricht nicht gefunden."})}await auditEvent(c,"ADMIN",null,"MESSAGE_READ","MESSAGE",Number(messageRead[1]),null);await c.commit();return sendJson(response,200,{message:"Nachricht gelesen."});}catch(e){await c.rollback();throw e;}finally{c.release();}}
     if (pathname === "/api/admin/messages") { if(request.method==="GET"){const [rows]=await adminPool.execute("SELECT m.*,c.first_name,c.last_name,c.customer_number FROM messages m JOIN customers c ON c.id=m.customer_id ORDER BY m.created_at DESC LIMIT 200");return sendJson(response,200,{rows});} if(request.method!=="POST"||!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});let b;try{b=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Nachricht."})};const customerId=Number(b.customer_id),subject=readText(b.subject,180),message=readText(b.message,8000,{multiline:true});if(!Number.isSafeInteger(customerId)||!subject||!message)return sendJson(response,400,{message:"Bitte Nachricht prüfen."});const c=await adminPool.getConnection();try{await c.beginTransaction();const [r]=await c.execute("INSERT INTO messages(customer_id,sender_type,recipient_type,recipient_id,subject,message) VALUES (?,'ADMIN','CUSTOMER',?,?,?)",[customerId,customerId,subject,message]);await c.execute("INSERT INTO notifications(recipient_type,recipient_id,notification_type,title,body,entity_type,entity_id) VALUES ('CUSTOMER',?,'MESSAGE',?,?, 'MESSAGE',?)",[customerId,"Neue Nachricht",subject,r.insertId]);await auditEvent(c,"ADMIN",null,"MESSAGE_CREATED","MESSAGE",r.insertId,{customer_id:customerId});await c.commit();return sendJson(response,201,{id:r.insertId,message:"Nachricht gesendet."});}catch(e){await c.rollback();throw e;}finally{c.release();} }
     return sendJson(response,404,{message:"API-Endpunkt nicht gefunden."});
+}
+
+function serviceReportDateTime(value) {
+    if (value == null || value === "") return null;
+    if (typeof value !== "string") return undefined;
+    const normalized = value.trim().replace("T", " ");
+    if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?$/.test(normalized)) return undefined;
+    const withSeconds = normalized.length === 16 ? `${normalized}:00` : normalized;
+    const pieces = withSeconds.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/).slice(1).map(Number);
+    const instant = new Date(Date.UTC(...[pieces[0], pieces[1] - 1, pieces[2], pieces[3], pieces[4], pieces[5]]));
+    return instant.getUTCFullYear() === pieces[0] && instant.getUTCMonth() === pieces[1] - 1 && instant.getUTCDate() === pieces[2] && instant.getUTCHours() === pieces[3] && instant.getUTCMinutes() === pieces[4] && instant.getUTCSeconds() === pieces[5] ? withSeconds : undefined;
+}
+
+function serviceReportIsoDate(value) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ""))) return false;
+    const [year, month, day] = String(value).split("-").map(Number);
+    const instant = new Date(Date.UTC(year, month - 1, day));
+    return instant.getUTCFullYear() === year && instant.getUTCMonth() === month - 1 && instant.getUTCDate() === day;
+}
+
+function serviceReportPayload(body, { requireAssignment = true } = {}) {
+    const orderId = Number(body.order_id);
+    const assignmentId = Number(body.assignment_id);
+    const serviceDate = readText(body.service_date, 10);
+    const startedAt = serviceReportDateTime(body.started_at);
+    const finishedAt = serviceReportDateTime(body.finished_at);
+    const summary = readText(body.summary, 5000, { optional: true, multiline: true });
+    const internalNotes = readText(body.internal_notes, 5000, { optional: true, multiline: true });
+    const customerNotes = readText(body.customer_notes, 5000, { optional: true, multiline: true });
+    if (!Number.isSafeInteger(orderId) || orderId < 1 || (requireAssignment && (!Number.isSafeInteger(assignmentId) || assignmentId < 1)) || !serviceReportIsoDate(serviceDate) || startedAt === undefined || finishedAt === undefined || summary === null || internalNotes === null || customerNotes === null || (startedAt && finishedAt && finishedAt < startedAt)) return null;
+    return { orderId, assignmentId, serviceDate, startedAt, finishedAt, summary: summary || null, internalNotes: internalNotes || null, customerNotes: customerNotes || null };
+}
+
+async function serviceReportRelationship(connection, orderId, assignmentId, employeeId = null) {
+    const values = [assignmentId, orderId];
+    let employeeClause = "";
+    if (employeeId !== null) { employeeClause = " AND assignment_row.employee_id=?"; values.push(employeeId); }
+    const [rows] = await connection.execute(
+        `SELECT assignment_row.id AS assignment_id,assignment_row.order_id,assignment_row.employee_id,order_row.customer_id,
+                order_row.order_number,employee_row.first_name AS employee_first_name,employee_row.last_name AS employee_last_name
+         FROM order_assignments assignment_row
+         JOIN orders order_row ON order_row.id=assignment_row.order_id
+         JOIN employees employee_row ON employee_row.id=assignment_row.employee_id
+         WHERE assignment_row.id=? AND assignment_row.order_id=?${employeeClause} AND assignment_row.status <> 'STORNIERT'`,
+        values
+    );
+    return rows[0] || null;
+}
+
+async function createServiceReportNumber(connection, id) {
+    const number = `LN-${new Date().getFullYear()}-${String(id).padStart(6, "0")}`;
+    await connection.execute("UPDATE service_reports SET report_number=? WHERE id=?", [number, id]);
+    return number;
+}
+
+const serviceReportAdminFields = `r.id,r.report_number,r.order_id,r.assignment_id,r.customer_id,r.employee_id,r.service_date,r.started_at,r.finished_at,r.summary,r.internal_notes,r.customer_notes,r.status,r.submitted_at,r.reviewed_at,r.reviewed_by_employee_id,r.shared_with_customer_at,r.customer_confirmed_at,r.created_at,r.updated_at,
+    o.order_number,o.title AS order_title,c.customer_number,c.first_name AS customer_first_name,c.last_name AS customer_last_name,c.email AS customer_email,e.employee_number,e.first_name AS employee_first_name,e.last_name AS employee_last_name,
+    reviewer.first_name AS reviewer_first_name,reviewer.last_name AS reviewer_last_name`;
+const serviceReportJoin = ` FROM service_reports r JOIN orders o ON o.id=r.order_id JOIN customers c ON c.id=r.customer_id JOIN employees e ON e.id=r.employee_id LEFT JOIN employees reviewer ON reviewer.id=r.reviewed_by_employee_id`;
+
+async function serviceReportForAdmin(connection, id) {
+    const [rows] = await connection.execute(`SELECT ${serviceReportAdminFields}${serviceReportJoin} WHERE r.id=?`, [id]);
+    return rows[0] || null;
+}
+
+async function handleAdminServiceReports(request, response, pathname, searchParams) {
+    if (!adminPool) return sendJson(response, 503, { message: "Die Datenbankrechte für Leistungsnachweise sind nicht eingerichtet." });
+    const match = pathname.match(/^\/api\/admin\/service-reports(?:\/(\d+)(?:\/(review|share))?)?$/);
+    const id = match?.[1] ? Number(match[1]) : null;
+    const action = match?.[2] || null;
+    if (!id && request.method === "GET") {
+        const status = String(searchParams.get("status") || "");
+        const orderId = Number(searchParams.get("order_id") || 0);
+        const employeeId = Number(searchParams.get("employee_id") || 0);
+        const customerId = Number(searchParams.get("customer_id") || 0);
+        const where = [], values = [];
+        if (status) { if (!serviceReportStatuses.has(status)) return sendJson(response, 400, { message: "Ungültiger Statusfilter." }); where.push("r.status=?"); values.push(status); }
+        for (const [column, value] of [["r.order_id", orderId], ["r.employee_id", employeeId], ["r.customer_id", customerId]]) if (value) { if (!Number.isSafeInteger(value) || value < 1) return sendJson(response, 400, { message: "Ungültiger Filter." }); where.push(`${column}=?`); values.push(value); }
+        const clause = where.length ? ` WHERE ${where.join(" AND ")}` : "";
+        const [rows] = await adminPool.execute(`SELECT ${serviceReportAdminFields}${serviceReportJoin}${clause} ORDER BY r.service_date DESC,r.id DESC LIMIT 200`, values);
+        return sendJson(response, 200, { rows });
+    }
+    if (id && !action && request.method === "GET") { const report = await serviceReportForAdmin(adminPool, id); return report ? sendJson(response, 200, { report }) : sendJson(response, 404, { message: "Leistungsnachweis nicht gefunden." }); }
+    if (!isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
+    let body; try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "Ungültige Leistungsnachweis-Daten." }); }
+    const connection = await adminPool.getConnection();
+    try {
+        await connection.beginTransaction();
+        if (!id && request.method === "POST") {
+            const data = serviceReportPayload(body); if (!data) { await connection.rollback(); return sendJson(response, 400, { message: "Bitte prüfen Sie die Leistungsdaten." }); }
+            const relationship = await serviceReportRelationship(connection, data.orderId, data.assignmentId); if (!relationship) { await connection.rollback(); return sendJson(response, 400, { message: "Auftrag und Einsatz passen nicht zusammen." }); }
+            const [created] = await connection.execute("INSERT INTO service_reports (report_number,order_id,assignment_id,customer_id,employee_id,service_date,started_at,finished_at,summary,internal_notes,customer_notes,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,'DRAFT')", [crypto.randomUUID(),data.orderId,data.assignmentId,relationship.customer_id,relationship.employee_id,data.serviceDate,data.startedAt,data.finishedAt,data.summary,data.internalNotes,data.customerNotes]);
+            const reportNumber = await createServiceReportNumber(connection, created.insertId);
+            await auditEvent(connection,"ADMIN",null,"SERVICE_REPORT_CREATED","SERVICE_REPORT",created.insertId,{order_id:data.orderId,assignment_id:data.assignmentId});
+            await connection.commit(); return sendJson(response,201,{id:created.insertId,reportNumber,message:"Leistungsnachweis erstellt."});
+        }
+        if (id && !action && request.method === "PATCH") {
+            const existing = await serviceReportForAdmin(connection,id); if (!existing) { await connection.rollback(); return sendJson(response,404,{message:"Leistungsnachweis nicht gefunden."}); }
+            if (body.status === "SUBMITTED") {
+                if (existing.status !== "DRAFT") { await connection.rollback(); return sendJson(response,400,{message:"Nur Entwürfe können eingereicht werden."}); }
+                await connection.execute("UPDATE service_reports SET status='SUBMITTED',submitted_at=NOW() WHERE id=?",[id]);
+                await auditEvent(connection,"ADMIN",null,"SERVICE_REPORT_SUBMITTED","SERVICE_REPORT",id,{employee_id:existing.employee_id,admin_created:true});
+                await connection.commit(); return sendJson(response,200,{id,status:"SUBMITTED",message:"Leistungsnachweis eingereicht."});
+            }
+            const data = serviceReportPayload(body); if (!data) { await connection.rollback(); return sendJson(response, 400, { message: "Bitte prüfen Sie die Leistungsdaten." }); }
+            if (existing.status === "CANCELLED") { await connection.rollback(); return sendJson(response,400,{message:"Stornierte Leistungsnachweise können nicht geändert werden."}); }
+            const relationship = await serviceReportRelationship(connection,data.orderId,data.assignmentId); if (!relationship) { await connection.rollback(); return sendJson(response,400,{message:"Auftrag und Einsatz passen nicht zusammen."}); }
+            await connection.execute("UPDATE service_reports SET order_id=?,assignment_id=?,customer_id=?,employee_id=?,service_date=?,started_at=?,finished_at=?,summary=?,internal_notes=?,customer_notes=? WHERE id=?",[data.orderId,data.assignmentId,relationship.customer_id,relationship.employee_id,data.serviceDate,data.startedAt,data.finishedAt,data.summary,data.internalNotes,data.customerNotes,id]);
+            await auditEvent(connection,"ADMIN",null,"SERVICE_REPORT_UPDATED","SERVICE_REPORT",id,{status:existing.status});
+            await connection.commit(); return sendJson(response,200,{id,message:"Leistungsnachweis gespeichert."});
+        }
+        if (id && action === "review" && request.method === "PATCH") {
+            const desired = readText(body.status || "REVIEWED",20); if (!["REVIEWED","RETURNED"].includes(desired)) { await connection.rollback(); return sendJson(response,400,{message:"Ungültige Prüfentscheidung."}); }
+            const reason = desired === "RETURNED" ? readText(body.reason,1000,{multiline:true}) : "";
+            if (desired === "RETURNED" && !reason) { await connection.rollback(); return sendJson(response,400,{message:"Ein Rückgabegrund ist erforderlich."}); }
+            const report = await serviceReportForAdmin(connection,id); if (!report) { await connection.rollback(); return sendJson(response,404,{message:"Leistungsnachweis nicht gefunden."}); }
+            if (report.status !== "SUBMITTED") { await connection.rollback(); return sendJson(response,400,{message:"Nur eingereichte Leistungsnachweise können geprüft werden."}); }
+            const update = desired === "REVIEWED" ? "UPDATE service_reports SET status='REVIEWED',reviewed_at=NOW(),reviewed_by_employee_id=NULL WHERE id=?" : "UPDATE service_reports SET status='RETURNED',reviewed_at=NOW(),reviewed_by_employee_id=NULL,internal_notes=TRIM(CONCAT_WS('\\n\\n',NULLIF(internal_notes,''),?)) WHERE id=?";
+            await connection.execute(update,desired === "RETURNED" ? [`[Rückgabegrund] ${reason}`,id] : [id]);
+            await auditEvent(connection,"ADMIN",null,desired === "REVIEWED" ? "SERVICE_REPORT_REVIEWED" : "SERVICE_REPORT_RETURNED","SERVICE_REPORT",id,{employee_id:report.employee_id});
+            if (desired === "RETURNED") await notifyEmployee(connection,report.employee_id,"SERVICE_REPORT","Leistungsnachweis zurückgegeben",`Der Leistungsnachweis ${report.report_number} wurde zur Überarbeitung zurückgegeben.`,"SERVICE_REPORT",id);
+            await connection.commit(); return sendJson(response,200,{id,status:desired,message:desired === "REVIEWED" ? "Leistungsnachweis geprüft." : "Leistungsnachweis zurückgegeben."});
+        }
+        if (id && action === "share" && request.method === "PATCH") {
+            const report = await serviceReportForAdmin(connection,id); if (!report) { await connection.rollback(); return sendJson(response,404,{message:"Leistungsnachweis nicht gefunden."}); }
+            if (report.status !== "REVIEWED") { await connection.rollback(); return sendJson(response,400,{message:"Nur geprüfte Leistungsnachweise können geteilt werden."}); }
+            await connection.execute("UPDATE service_reports SET status='SHARED',shared_with_customer_at=NOW() WHERE id=?",[id]);
+            await auditEvent(connection,"ADMIN",null,"SERVICE_REPORT_SHARED_WITH_CUSTOMER","SERVICE_REPORT",id,{customer_id:report.customer_id});
+            await notifyCustomer(connection,report.customer_id,"SERVICE_REPORT","Leistungsnachweis verfügbar",`Ihr Leistungsnachweis ${report.report_number} wurde bereitgestellt.`,"SERVICE_REPORT",id);
+            await connection.commit(); return sendJson(response,200,{id,status:"SHARED",message:"Leistungsnachweis für den Kunden freigegeben."});
+        }
+        await connection.rollback(); return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    } catch (error) { await connection.rollback(); console.error("[service-reports admin] failed:",error.code || "database_error"); return sendJson(response,error.code === "ER_SIGNAL_EXCEPTION" ? 400 : 503,{message:error.code === "ER_SIGNAL_EXCEPTION" ? "Ungültige Leistungsbeziehung." : "Leistungsnachweis konnte nicht gespeichert werden."}); } finally { connection.release(); }
+}
+
+function positiveId(value) {
+    const id = Number(value);
+    return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function materialDecimal(value, precision, { allowEmpty = false } = {}) {
+    if (value === "" || value == null) return allowEmpty ? null : null;
+    const number = Number(value), scale = 10 ** precision;
+    return Number.isFinite(number) && number >= 0 && number <= 99999999 ? Math.round(number * scale) / scale : null;
+}
+
+function materialQuantity(value) {
+    const quantity = materialDecimal(value, 3);
+    return quantity !== null && quantity > 0 ? quantity : null;
+}
+
+function materialPayload(body) {
+    const materialNumber = readText(body.material_number, 40);
+    const name = readText(body.name, 180);
+    const description = readText(body.description, 5000, { optional: true, multiline: true });
+    const unit = readText(body.unit, 20);
+    const minimumStock = materialDecimal(body.minimum_stock ?? 0, 3);
+    const rawDefaultCost = body.default_cost ?? body.default_unit_cost;
+    const defaultCost = rawDefaultCost === "" || rawDefaultCost == null ? null : materialDecimal(rawDefaultCost, 4);
+    const status = readText(body.status || "ACTIVE", 20);
+    if (!materialNumber || !name || !materialUnits.has(unit) || minimumStock === null || (defaultCost === null && rawDefaultCost !== "" && rawDefaultCost != null) || !materialStatuses.has(status) || description === null) return null;
+    return { materialNumber, name, description: description || null, unit, minimumStock, defaultCost, status };
+}
+
+const materialBalanceSql = `COALESCE(SUM(CASE WHEN sm.status='APPROVED' THEN CASE sm.movement_type
+    WHEN 'RECEIPT' THEN sm.quantity WHEN 'RETURN' THEN sm.quantity WHEN 'ADJUSTMENT_IN' THEN sm.quantity
+    WHEN 'CONSUMPTION' THEN -sm.quantity WHEN 'ADJUSTMENT_OUT' THEN -sm.quantity ELSE 0 END ELSE 0 END),0)`;
+
+function materialStockStatus(balance, minimumStock) {
+    if (Number(balance) <= 0) return "OUT_OF_STOCK";
+    return Number(balance) <= Number(minimumStock) ? "LOW_STOCK" : "NORMAL";
+}
+
+function materialRow(row) {
+    const currentStock = Number(row.current_stock || 0);
+    return { ...row, current_stock: currentStock, stock_status: materialStockStatus(currentStock, row.minimum_stock) };
+}
+
+async function materialForAdmin(connection, id) {
+    const [rows] = await connection.execute(`SELECT m.*,${materialBalanceSql} AS current_stock FROM materials m LEFT JOIN material_stock_movements sm ON sm.material_id=m.id WHERE m.id=? GROUP BY m.id`, [id]);
+    return rows[0] ? materialRow(rows[0]) : null;
+}
+
+async function materialMovementRelation(connection, data, { employeeId = null, employeeOnly = false } = {}) {
+    const [[material]] = await connection.execute("SELECT id,status FROM materials WHERE id=?", [data.materialId]);
+    if (!material || material.status !== "ACTIVE") return { error: "Material ist nicht verfÃ¼gbar.", status: 404 };
+    let order = null;
+    if (data.orderId !== null) {
+        const [rows] = await connection.execute("SELECT id,customer_id FROM orders WHERE id=?", [data.orderId]); order = rows[0] || null;
+        if (!order) return { error: "Auftrag nicht gefunden.", status: 404 };
+    }
+    if (employeeOnly) {
+        if (!order || !employeeId) return { error: "Auftrag fehlt.", status: 400 };
+        const [assignments] = await connection.execute("SELECT id FROM order_assignments WHERE order_id=? AND employee_id=? AND status<>'STORNIERT'", [data.orderId, employeeId]);
+        if (!assignments[0]) return { error: "Auftrag nicht gefunden.", status: 404 };
+    }
+    if (data.employeeId !== null) {
+        const [employees] = await connection.execute("SELECT id FROM employees WHERE id=? AND status='ACTIVE'", [data.employeeId]);
+        if (!employees[0]) return { error: "Mitarbeiter nicht gefunden.", status: 404 };
+    }
+    if (data.serviceReportId !== null) {
+        const [reports] = await connection.execute("SELECT id,order_id,employee_id FROM service_reports WHERE id=?", [data.serviceReportId]); const report = reports[0];
+        if (!report || data.orderId === null || Number(report.order_id) !== data.orderId || data.employeeId === null || Number(report.employee_id) !== data.employeeId) return { error: "Leistungsnachweis passt nicht zu Auftrag und Mitarbeiter.", status: 400 };
+    }
+    if (["ADJUSTMENT_IN", "ADJUSTMENT_OUT"].includes(data.movementType) && !data.reference) return { error: "Ein Grund für die Bestandskorrektur ist erforderlich.", status: 400 };
+    return { material, order };
+}
+
+async function approvedMaterialBalance(connection, materialId) {
+    const [[row]] = await connection.execute(`SELECT ${materialBalanceSql} AS current_stock FROM materials m LEFT JOIN material_stock_movements sm ON sm.material_id=m.id WHERE m.id=? GROUP BY m.id`, [materialId]);
+    return Number(row?.current_stock || 0);
+}
+
+async function handleAdminMaterials(request, response, pathname, searchParams) {
+    if (!adminPool) return sendJson(response, 503, { message: "Materialverwaltung ist nicht verfÃ¼gbar." });
+    const materialMatch = pathname.match(/^\/api\/admin\/materials(?:\/(\d+))?$/);
+    const movementMatch = pathname.match(/^\/api\/admin\/material-stock-movements(?:\/(\d+))?$/);
+    const requirementMatch = pathname.match(/^\/api\/admin\/orders\/(\d+)\/material-requirements(?:\/(\d+))?$/);
+    if (materialMatch) {
+        const id = materialMatch[1] ? positiveId(materialMatch[1]) : null;
+        if (materialMatch[1] && !id) return sendJson(response, 404, { message: "Material nicht gefunden." });
+        if (!id && request.method === "GET") {
+            const status = String(searchParams.get("status") || "").trim(), search = readText(searchParams.get("search") || "", 100, { optional: true });
+            if ((status && !materialStatuses.has(status)) || search === null) return sendJson(response, 400, { message: "UngÃ¼ltiger Materialfilter." });
+            const where = [], values = []; if (status) { where.push("m.status=?"); values.push(status); } if (search) { where.push("(m.material_number LIKE ? OR m.name LIKE ?)"); values.push(`%${search}%`, `%${search}%`); }
+            const [rows] = await adminPool.execute(`SELECT m.*,${materialBalanceSql} AS current_stock FROM materials m LEFT JOIN material_stock_movements sm ON sm.material_id=m.id${where.length ? ` WHERE ${where.join(" AND ")}` : ""} GROUP BY m.id ORDER BY m.name,m.id LIMIT 200`, values);
+            return sendJson(response, 200, { rows: rows.map(materialRow) });
+        }
+        if (id && request.method === "GET") { const material = await materialForAdmin(adminPool, id); return material ? sendJson(response, 200, { material }) : sendJson(response, 404, { message: "Material nicht gefunden." }); }
+        if (!isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
+        if (!(!id && request.method === "POST") && !(id && request.method === "PATCH")) return sendJson(response, 405, { message: "Methode nicht erlaubt." });
+        let body; try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "UngÃ¼ltige Materialdaten." }); }
+        const data = materialPayload(body); if (!data) return sendJson(response, 400, { message: "Bitte prÃ¼fen Sie die Materialdaten." });
+        const c = await adminPool.getConnection(); try { await c.beginTransaction();
+            if (!id) { const [created] = await c.execute("INSERT INTO materials(material_number,name,description,unit,minimum_stock,default_unit_cost,status) VALUES (?,?,?,?,?,?,?)", [data.materialNumber,data.name,data.description,data.unit,data.minimumStock,data.defaultCost,data.status]); await auditEvent(c,"ADMIN",null,"MATERIAL_CREATED","MATERIAL",created.insertId,{status:data.status}); await c.commit(); return sendJson(response,201,{id:created.insertId,message:"Material erstellt."}); }
+            const [result] = await c.execute("UPDATE materials SET material_number=?,name=?,description=?,unit=?,minimum_stock=?,default_unit_cost=?,status=? WHERE id=?", [data.materialNumber,data.name,data.description,data.unit,data.minimumStock,data.defaultCost,data.status,id]); if (!result.affectedRows) { await c.rollback(); return sendJson(response,404,{message:"Material nicht gefunden."}); } await auditEvent(c,"ADMIN",null,data.status === "ARCHIVED" ? "MATERIAL_ARCHIVED" : "MATERIAL_UPDATED","MATERIAL",id,{status:data.status}); await c.commit(); return sendJson(response,200,{id,message:"Material gespeichert."});
+        } catch (error) { await c.rollback(); return sendJson(response,error.code === "ER_DUP_ENTRY" ? 409 : 503,{message:error.code === "ER_DUP_ENTRY" ? "Die Materialnummer ist bereits vergeben." : "Material konnte nicht gespeichert werden."}); } finally { c.release(); }
+    }
+    if (requirementMatch) {
+        const orderId = positiveId(requirementMatch[1]), id = requirementMatch[2] ? positiveId(requirementMatch[2]) : null;
+        if (!orderId || (requirementMatch[2] && !id)) return sendJson(response,404,{message:"Materialbedarf nicht gefunden."});
+        const [[order]] = await adminPool.execute("SELECT id FROM orders WHERE id=?",[orderId]); if (!order) return sendJson(response,404,{message:"Auftrag nicht gefunden."});
+        if (request.method === "GET") { const [rows] = await adminPool.execute("SELECT r.*,m.material_number,m.name,m.unit FROM order_material_requirements r JOIN materials m ON m.id=r.material_id WHERE r.order_id=? ORDER BY r.id",[orderId]); return sendJson(response,200,{rows}); }
+        if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+        if (!["POST","PATCH","DELETE"].includes(request.method) || (request.method !== "POST" && !id)) return sendJson(response,405,{message:"Methode nicht erlaubt."});
+        const c=await adminPool.getConnection(); try { await c.beginTransaction();
+            if(request.method === "DELETE") { const [r]=await c.execute("DELETE FROM order_material_requirements WHERE id=? AND order_id=?",[id,orderId]); if(!r.affectedRows){await c.rollback();return sendJson(response,404,{message:"Materialbedarf nicht gefunden."});} await auditEvent(c,"ADMIN",null,"MATERIAL_REQUIREMENT_DELETED","ORDER_MATERIAL_REQUIREMENT",id,{order_id:orderId});await c.commit();return sendJson(response,200,{id,message:"Materialbedarf entfernt."}); }
+            let body;try{body=await readJson(request)}catch{await c.rollback();return sendJson(response,400,{message:"UngÃ¼ltige Materialbedarfsdaten."});} const materialId=positiveId(body.material_id),quantity=materialQuantity(body.required_quantity ?? body.planned_quantity),status=readText(body.status || "PLANNED",20),notes=readText(body.notes,4000,{optional:true,multiline:true}),unit=readText(body.unit,20,{optional:true});
+            if(!materialId||!quantity||!materialRequirementStatuses.has(status)||notes===null||unit===null){await c.rollback();return sendJson(response,400,{message:"Bitte prÃ¼fen Sie den Materialbedarf."});} const [[material]]=await c.execute("SELECT id,unit FROM materials WHERE id=? AND status<>'ARCHIVED'",[materialId]); if(!material||(unit&&unit!==material.unit)){await c.rollback();return sendJson(response,400,{message:"Material oder Einheit ist ungÃ¼ltig."});}
+            if(request.method === "POST"){const[created]=await c.execute("INSERT INTO order_material_requirements(order_id,material_id,planned_quantity,status,notes) VALUES (?,?,?,?,?)",[orderId,materialId,quantity,status,notes||null]);await auditEvent(c,"ADMIN",null,"MATERIAL_REQUIREMENT_CREATED","ORDER_MATERIAL_REQUIREMENT",created.insertId,{order_id:orderId,material_id:materialId});await c.commit();return sendJson(response,201,{id:created.insertId,message:"Materialbedarf erstellt."});}
+            const[r]=await c.execute("UPDATE order_material_requirements SET material_id=?,planned_quantity=?,status=?,notes=? WHERE id=? AND order_id=?",[materialId,quantity,status,notes||null,id,orderId]);if(!r.affectedRows){await c.rollback();return sendJson(response,404,{message:"Materialbedarf nicht gefunden."});}await auditEvent(c,"ADMIN",null,"MATERIAL_REQUIREMENT_UPDATED","ORDER_MATERIAL_REQUIREMENT",id,{order_id:orderId,material_id:materialId,status});await c.commit();return sendJson(response,200,{id,message:"Materialbedarf gespeichert."});
+        } catch(error){await c.rollback();return sendJson(response,error.code === "ER_DUP_ENTRY" ? 409 : 503,{message:error.code === "ER_DUP_ENTRY" ? "Dieses Material ist bereits fÃ¼r den Auftrag erfasst." : "Materialbedarf konnte nicht gespeichert werden."});} finally{c.release();}
+    }
+    if (movementMatch) {
+        const id = movementMatch[1] ? positiveId(movementMatch[1]) : null; if(movementMatch[1]&&!id)return sendJson(response,404,{message:"Lagerbewegung nicht gefunden."});
+        if(!id&&request.method==="GET"){const optionalFilterId=name=>{const raw=String(searchParams.get(name)||"").trim();return raw?positiveId(raw):null;};const filters={material_id:optionalFilterId("material_id"),order_id:optionalFilterId("order_id"),employee_id:optionalFilterId("employee_id"),service_report_id:optionalFilterId("service_report_id"),type:String(searchParams.get("movement_type")||""),status:String(searchParams.get("status")||""),from:String(searchParams.get("from")||""),to:String(searchParams.get("to")||""),search:readText(searchParams.get("search")||"",100,{optional:true})};if([filters.material_id,filters.order_id,filters.employee_id,filters.service_report_id].includes(null)&&["material_id","order_id","employee_id","service_report_id"].some(name=>String(searchParams.get(name)||"").trim())||filters.search===null||(filters.type&&!materialMovementTypes.has(filters.type))||(filters.status&&!materialMovementStatuses.has(filters.status))||(filters.from&&!isIsoDate(filters.from))||(filters.to&&!isIsoDate(filters.to))||(filters.from&&filters.to&&filters.from>filters.to))return sendJson(response,400,{message:"UngÃ¼ltiger Bewegungsfilter."});const where=[],values=[];for(const key of ["material_id","order_id","employee_id","service_report_id"])if(filters[key]){where.push(`sm.${key}=?`);values.push(filters[key]);}if(filters.type){where.push("sm.movement_type=?");values.push(filters.type)}if(filters.status){where.push("sm.status=?");values.push(filters.status)}if(filters.from){where.push("sm.movement_date>=?");values.push(filters.from)}if(filters.to){where.push("sm.movement_date<=?");values.push(filters.to)}if(filters.search){where.push("(sm.movement_number LIKE ? OR m.name LIKE ? OR sm.reference LIKE ?)");values.push(`%${filters.search}%`,`%${filters.search}%`,`%${filters.search}%`)}const[rows]=await adminPool.execute(`SELECT sm.*,m.material_number,m.name AS material_name,m.unit,o.order_number,e.employee_number,r.report_number FROM material_stock_movements sm JOIN materials m ON m.id=sm.material_id LEFT JOIN orders o ON o.id=sm.order_id LEFT JOIN employees e ON e.id=sm.employee_id LEFT JOIN service_reports r ON r.id=sm.service_report_id${where.length?` WHERE ${where.join(" AND ")}`:""} ORDER BY sm.movement_date DESC,sm.id DESC LIMIT 200`,values);return sendJson(response,200,{rows});}
+        if(id&&request.method==="GET"){const[rows]=await adminPool.execute("SELECT sm.*,m.material_number,m.name AS material_name,m.unit,o.order_number,e.employee_number,r.report_number FROM material_stock_movements sm JOIN materials m ON m.id=sm.material_id LEFT JOIN orders o ON o.id=sm.order_id LEFT JOIN employees e ON e.id=sm.employee_id LEFT JOIN service_reports r ON r.id=sm.service_report_id WHERE sm.id=?",[id]);return rows[0]?sendJson(response,200,{movement:rows[0]}):sendJson(response,404,{message:"Lagerbewegung nicht gefunden."});}
+        if(!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});if(!(!id&&request.method==="POST")&&!(id&&request.method==="PATCH"))return sendJson(response,405,{message:"Methode nicht erlaubt."});let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"UngÃ¼ltige Lagerbewegung."})};const c=await adminPool.getConnection();try{await c.beginTransaction();const existing=id?(await c.execute("SELECT * FROM material_stock_movements WHERE id=? FOR UPDATE",[id]))[0][0]:null;if(id&&!existing){await c.rollback();return sendJson(response,404,{message:"Lagerbewegung nicht gefunden."});}const desired=body.status?readText(body.status,20):null;if(id&&desired){if(!materialMovementStatuses.has(desired)||!((existing.status==="RECORDED"&&["APPROVED","CANCELLED"].includes(desired))||(existing.status==="APPROVED"&&desired==="CANCELLED"))){await c.rollback();return sendJson(response,400,{message:"UngÃ¼ltiger Bewegungsstatus."});}const reason=desired==="CANCELLED"?readText(body.notes,4000,{multiline:true}):"";if(desired==="CANCELLED"&&!reason){await c.rollback();return sendJson(response,400,{message:"Ein Stornierungsgrund ist erforderlich."});}if(desired==="APPROVED"&&["CONSUMPTION","ADJUSTMENT_OUT"].includes(existing.movement_type)&&await approvedMaterialBalance(c,existing.material_id)<Number(existing.quantity)){await c.rollback();return sendJson(response,409,{message:"Der Bestand reicht nicht aus."});}await c.execute(desired==="CANCELLED"?"UPDATE material_stock_movements SET status=?,notes=TRIM(CONCAT_WS('\\n\\n',NULLIF(notes,''),?)) WHERE id=?":"UPDATE material_stock_movements SET status=? WHERE id=?",desired==="CANCELLED"?[desired,`[Stornierungsgrund] ${reason}`,id]:[desired,id]);await auditEvent(c,"ADMIN",null,desired==="APPROVED"?"STOCK_MOVEMENT_APPROVED":"STOCK_MOVEMENT_CANCELLED","MATERIAL_STOCK_MOVEMENT",id,{status:desired});await c.commit();return sendJson(response,200,{id,status:desired,message:"Lagerbewegung aktualisiert."});}
+            if(existing&&existing.status!=="RECORDED"){await c.rollback();return sendJson(response,409,{message:"Nur offene Lagerbewegungen kÃ¶nnen geÃ¤ndert werden."});}const rawUnitCost=body.unit_cost_snapshot ?? body.unit_cost;const data={materialId:positiveId(body.material_id),orderId:body.order_id==null||body.order_id===""?null:positiveId(body.order_id),serviceReportId:body.service_report_id==null||body.service_report_id===""?null:positiveId(body.service_report_id),employeeId:body.employee_id==null||body.employee_id===""?null:positiveId(body.employee_id),movementType:readText(body.movement_type,20),quantity:materialQuantity(body.quantity),unitCost:rawUnitCost==null||rawUnitCost===""?null:materialDecimal(rawUnitCost,4),movementDate:readText(body.movement_date,10),reference:readText(body.reference,180,{optional:true}),notes:readText(body.notes,4000,{optional:true,multiline:true})};if(!data.materialId||data.orderId===null&&body.order_id!=null&&body.order_id!==""||data.serviceReportId===null&&body.service_report_id!=null&&body.service_report_id!==""||data.employeeId===null&&body.employee_id!=null&&body.employee_id!==""||!materialMovementTypes.has(data.movementType)||!data.quantity||(data.unitCost===null&&rawUnitCost!=null&&rawUnitCost!=="")||!isIsoDate(data.movementDate)||data.reference===null||data.notes===null){await c.rollback();return sendJson(response,400,{message:"Bitte prÃ¼fen Sie die Lagerbewegung."});}if(["CONSUMPTION","RETURN"].includes(data.movementType)&&(!data.orderId||!data.employeeId)){await c.rollback();return sendJson(response,400,{message:"Verbrauch und RÃ¼ckgabe brauchen Auftrag und Mitarbeiter."});}const relation=await materialMovementRelation(c,data);if(relation.error){await c.rollback();return sendJson(response,relation.status,{message:relation.error});}if(!existing){const[created]=await c.execute("INSERT INTO material_stock_movements(movement_number,material_id,order_id,service_report_id,employee_id,movement_type,quantity,unit_cost_snapshot,movement_date,status,reference,notes) VALUES (?,?,?,?,?,?,?,?,?,'RECORDED',?,?)",[crypto.randomUUID(),data.materialId,data.orderId,data.serviceReportId,data.employeeId,data.movementType,data.quantity,data.unitCost,data.movementDate,data.reference||null,data.notes||null]);await c.execute("UPDATE material_stock_movements SET movement_number=? WHERE id=?",[`MAT-${new Date().getFullYear()}-${String(created.insertId).padStart(6,"0")}`,created.insertId]);await auditEvent(c,"ADMIN",null,"STOCK_MOVEMENT_CREATED","MATERIAL_STOCK_MOVEMENT",created.insertId,{material_id:data.materialId,movement_type:data.movementType});await c.commit();return sendJson(response,201,{id:created.insertId,message:"Lagerbewegung erfasst."});}await c.execute("UPDATE material_stock_movements SET material_id=?,order_id=?,service_report_id=?,employee_id=?,movement_type=?,quantity=?,unit_cost_snapshot=?,movement_date=?,reference=?,notes=? WHERE id=?",[data.materialId,data.orderId,data.serviceReportId,data.employeeId,data.movementType,data.quantity,data.unitCost,data.movementDate,data.reference||null,data.notes||null,id]);await auditEvent(c,"ADMIN",null,"STOCK_MOVEMENT_CREATED","MATERIAL_STOCK_MOVEMENT",id,{updated:true});await c.commit();return sendJson(response,200,{id,message:"Lagerbewegung gespeichert."});
+        }catch(error){await c.rollback();return sendJson(response,error.code==="ER_SIGNAL_EXCEPTION"?400:error.code==="ER_DUP_ENTRY"?409:503,{message:error.code==="ER_SIGNAL_EXCEPTION"?"UngÃ¼ltige Leistungsbeziehung.":error.code==="ER_DUP_ENTRY"?"Bewegungsnummer ist bereits vergeben.":"Lagerbewegung konnte nicht gespeichert werden."});}finally{c.release();}
+    }
+    return sendJson(response,404,{message:"API-Endpunkt nicht gefunden."});
+}
+
+async function handleEmployeeMaterialConsumptions(request, response, pathname, session) {
+    const match=pathname.match(/^\/api\/employee\/material-consumptions(?:\/(\d+))?$/),id=match?.[1]?positiveId(match[1]):null;if(match?.[1]&&!id)return sendJson(response,404,{message:"Materialbewegung nicht gefunden."});
+    if(!id&&request.method==="GET"){const[rows]=await pool.execute("SELECT sm.id,sm.movement_number,sm.material_id,sm.order_id,sm.service_report_id,sm.movement_type,sm.quantity,sm.movement_date,sm.status,sm.notes,m.material_number,m.name AS material_name,m.unit,o.order_number FROM material_stock_movements sm JOIN materials m ON m.id=sm.material_id JOIN orders o ON o.id=sm.order_id WHERE sm.employee_id=? AND sm.movement_type IN ('CONSUMPTION','RETURN') AND EXISTS(SELECT 1 FROM order_assignments a WHERE a.order_id=sm.order_id AND a.employee_id=? AND a.status<>'STORNIERT') ORDER BY sm.movement_date DESC,sm.id DESC",[session.employeeId,session.employeeId]);return sendJson(response,200,{rows});}
+    if(id&&request.method==="GET"){const[rows]=await pool.execute("SELECT sm.id,sm.movement_number,sm.material_id,sm.order_id,sm.service_report_id,sm.movement_type,sm.quantity,sm.movement_date,sm.status,sm.notes,m.material_number,m.name AS material_name,m.unit,o.order_number FROM material_stock_movements sm JOIN materials m ON m.id=sm.material_id JOIN orders o ON o.id=sm.order_id WHERE sm.id=? AND sm.employee_id=? AND sm.movement_type IN ('CONSUMPTION','RETURN') AND EXISTS(SELECT 1 FROM order_assignments a WHERE a.order_id=sm.order_id AND a.employee_id=? AND a.status<>'STORNIERT')",[id,session.employeeId,session.employeeId]);return rows[0]?sendJson(response,200,{movement:rows[0]}):sendJson(response,404,{message:"Materialbewegung nicht gefunden."});}
+    if(id||request.method!=="POST")return sendJson(response,405,{message:"Methode nicht erlaubt."});if(!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"UngÃ¼ltige Verbrauchsdaten."})};const data={materialId:positiveId(body.material_id),orderId:positiveId(body.order_id),serviceReportId:body.service_report_id==null||body.service_report_id===""?null:positiveId(body.service_report_id),employeeId:session.employeeId,movementType:readText(body.movement_type||"CONSUMPTION",20),quantity:materialQuantity(body.quantity),movementDate:readText(body.movement_date,10),notes:readText(body.notes,4000,{optional:true,multiline:true})};if(!data.materialId||!data.orderId||data.serviceReportId===null&&body.service_report_id!=null&&body.service_report_id!==""||!["CONSUMPTION","RETURN"].includes(data.movementType)||!data.quantity||!isIsoDate(data.movementDate)||data.notes===null)return sendJson(response,400,{message:"Bitte prÃ¼fen Sie die Verbrauchsdaten."});const c=await pool.getConnection();try{await c.beginTransaction();const relation=await materialMovementRelation(c,data,{employeeId:session.employeeId,employeeOnly:true});if(relation.error){await c.rollback();return sendJson(response,relation.status,{message:relation.error});}if(data.movementType==="CONSUMPTION"&&await approvedMaterialBalance(c,data.materialId)<data.quantity){await c.rollback();return sendJson(response,409,{message:"Nicht genÃ¼gend freigegebener Materialbestand."});}if(data.movementType==="RETURN"){const[[used]]=await c.execute("SELECT COALESCE(SUM(CASE WHEN movement_type='CONSUMPTION' THEN quantity ELSE -quantity END),0) AS net_used FROM material_stock_movements WHERE material_id=? AND order_id=? AND employee_id=? AND status<>'CANCELLED' AND movement_type IN ('CONSUMPTION','RETURN')",[data.materialId,data.orderId,session.employeeId]);if(Number(used.net_used)<data.quantity){await c.rollback();return sendJson(response,409,{message:"Die RÃ¼ckgabe Ã¼bersteigt den erfassten Verbrauch."});}}const[created]=await c.execute("INSERT INTO material_stock_movements(movement_number,material_id,order_id,service_report_id,employee_id,movement_type,quantity,movement_date,status,notes) VALUES (?,?,?,?,?,?,?,?,'RECORDED',?)",[crypto.randomUUID(),data.materialId,data.orderId,data.serviceReportId,session.employeeId,data.movementType,data.quantity,data.movementDate,data.notes||null]);const number=`MAT-${new Date().getFullYear()}-${String(created.insertId).padStart(6,"0")}`;await c.execute("UPDATE material_stock_movements SET movement_number=? WHERE id=?",[number,created.insertId]);await auditEvent(c,"EMPLOYEE",session.employeeId,"STOCK_MOVEMENT_CREATED","MATERIAL_STOCK_MOVEMENT",created.insertId,{material_id:data.materialId,order_id:data.orderId,movement_type:data.movementType});await c.commit();return sendJson(response,201,{id:created.insertId,movementNumber:number,status:"RECORDED",message:"Materialbewegung erfasst."});}catch(error){await c.rollback();return sendJson(response,error.code==="ER_SIGNAL_EXCEPTION"?400:503,{message:error.code==="ER_SIGNAL_EXCEPTION"?"UngÃ¼ltige Leistungsbeziehung.":"Materialbewegung konnte nicht gespeichert werden."});}finally{c.release();}
 }
 
 async function handleAdminApi(request, response, pathname, searchParams) {
@@ -1767,12 +2480,31 @@ async function handleAdminApi(request, response, pathname, searchParams) {
         return sendJson(response, 200, { authenticated: false });
     }
 
+    if (pathname === "/api/admin/reports/pdf") {
+        const pdfSession = readAdminSession(request);
+        if (!pdfSession) return sendExportError(response, readCustomerSession(request) || readEmployeeSession(request) ? 403 : 401, readCustomerSession(request) || readEmployeeSession(request) ? "FORBIDDEN" : "UNAUTHORIZED", "Bitte melden Sie sich erneut an.");
+        return handleAdminReportPdf(request, response, searchParams, pdfSession);
+    }
+    if (pathname === "/api/admin/reports/export") {
+        const exportSession = readAdminSession(request);
+        if (!exportSession) {
+            if (readCustomerSession(request) || readEmployeeSession(request)) return sendExportError(response, 403, "FORBIDDEN", "Für den Berichtsexport fehlt die erforderliche Berechtigung.");
+            return sendExportError(response, 401, "UNAUTHORIZED", "Bitte melden Sie sich erneut an.");
+        }
+        return handleAdminReportExport(request, response, searchParams, exportSession);
+    }
+
     const session = adminSessionOrRespond(request, response);
     if (!session) return;
 
+    if (pathname === "/api/admin/reports/trends" || pathname === "/api/admin/reports/rankings") return handleAdminReportVisuals(request,response,pathname,searchParams);
+    if (/^\/api\/admin\/reports\/performance\/(?:operations|services|orders|receivables|recurring)$/.test(pathname)) return handleAdminPerformanceReports(request, response, pathname, searchParams);
+    if (/^\/api\/admin\/reports\/(?:dashboard|revenue|orders|invoices|customers|employees|materials)$/.test(pathname)) return handleAdminReports(request,response,pathname,searchParams);
+    if (pathname === "/api/admin/materials" || /^\/api\/admin\/materials\/\d+$/.test(pathname) || pathname === "/api/admin/material-stock-movements" || /^\/api\/admin\/material-stock-movements\/\d+$/.test(pathname) || /^\/api\/admin\/orders\/\d+\/material-requirements(?:\/\d+)?$/.test(pathname)) return handleAdminMaterials(request,response,pathname,searchParams);
+    if (pathname === "/api/admin/service-reports" || /^\/api\/admin\/service-reports\/\d+(?:\/(?:review|share))?$/.test(pathname)) return handleAdminServiceReports(request,response,pathname,searchParams);
     if (pathname === "/api/admin/documents" || /^\/api\/admin\/documents\/\d+$/.test(pathname)) return handleAdminDocuments(request,response,pathname,searchParams);
     if (pathname === "/api/admin/messages" || /^\/api\/admin\/messages\/\d+\/read$/.test(pathname) || pathname === "/api/admin/notifications" || /^\/api\/admin\/notifications\/\d+\/read$/.test(pathname) || pathname === "/api/admin/audit-logs") return handleAdminPhase12(request,response,pathname,searchParams);
-    if (/^\/api\/admin\/finance\/(?:transactions|employee-cash-payments|cash-transfers)(?:\/\d+)?$/.test(pathname) || /^\/api\/admin\/finance\/receipts\/\d+$/.test(pathname)) return handleAdminFinance(request,response,pathname,searchParams);
+    if (pathname === "/api/admin/finance/dashboard" || /^\/api\/admin\/finance\/employee-cash-payments\/\d+\/receipt$/.test(pathname) || /^\/api\/admin\/finance\/(?:transactions|employee-cash-payments|cash-transfers)(?:\/\d+)?$/.test(pathname) || /^\/api\/admin\/finance\/receipts\/\d+$/.test(pathname)) return handleAdminFinance(request,response,pathname,searchParams);
 
     if (pathname === "/api/admin/quotes" || /^\/api\/admin\/quotes\/\d+(?:\/items(?:\/\d+)?|\/create-order)?$/.test(pathname) || pathname === "/api/admin/contracts" || /^\/api\/admin\/contracts\/\d+$/.test(pathname)) {
         return handleAdminCommercial(request, response, pathname, searchParams);
@@ -2047,6 +2779,35 @@ async function handleApi(request, response, pathname, searchParams) {
     }
 }
 
+async function handleCustomerServiceReports(request, response, pathname, session) {
+    const match = pathname.match(/^\/api\/customer\/service-reports(?:\/(\d+)(?:\/(confirm))?)?$/);
+    const id = match?.[1] ? Number(match[1]) : null;
+    const confirming = Boolean(match?.[2]);
+    const fields = "r.id,r.report_number,r.order_id,r.assignment_id,r.service_date,r.started_at,r.finished_at,r.summary,r.customer_notes,r.status,r.submitted_at,r.reviewed_at,r.shared_with_customer_at,r.customer_confirmed_at,r.created_at,r.updated_at,o.order_number,o.title AS order_title,e.first_name AS employee_first_name,e.last_name AS employee_last_name";
+    const join = " FROM service_reports r JOIN orders o ON o.id=r.order_id JOIN employees e ON e.id=r.employee_id";
+    if (!id && request.method === "GET") {
+        const [rows] = await pool.execute(`SELECT ${fields}${join} WHERE r.customer_id=? AND r.status IN ('SHARED','CUSTOMER_CONFIRMED') ORDER BY r.service_date DESC,r.id DESC`,[session.customerId]);
+        return sendJson(response,200,{rows});
+    }
+    if (id && !confirming && request.method === "GET") {
+        const [rows] = await pool.execute(`SELECT ${fields}${join} WHERE r.id=? AND r.customer_id=? AND r.status IN ('SHARED','CUSTOMER_CONFIRMED')`,[id,session.customerId]);
+        return rows[0] ? sendJson(response,200,{report:rows[0]}) : sendJson(response,404,{message:"Leistungsnachweis nicht gefunden."});
+    }
+    if (!id || !confirming || request.method !== "POST") return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+    const connection=await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+        const [rows]=await connection.execute("SELECT id,report_number,customer_id,status FROM service_reports WHERE id=? AND customer_id=? FOR UPDATE",[id,session.customerId]);
+        const report=rows[0]; if(!report){await connection.rollback();return sendJson(response,404,{message:"Leistungsnachweis nicht gefunden."});}
+        if(report.status!=="SHARED"){await connection.rollback();return sendJson(response,400,{message:"Nur freigegebene Leistungsnachweise können bestätigt werden."});}
+        await connection.execute("UPDATE service_reports SET status='CUSTOMER_CONFIRMED',customer_confirmed_at=NOW() WHERE id=? AND customer_id=?",[id,session.customerId]);
+        await auditEvent(connection,"CUSTOMER",session.customerId,"SERVICE_REPORT_CUSTOMER_CONFIRMED","SERVICE_REPORT",id,null);
+        await connection.execute("INSERT INTO notifications(recipient_type,recipient_id,notification_type,title,body,entity_type,entity_id) VALUES ('ADMIN',NULL,'SERVICE_REPORT',?,?, 'SERVICE_REPORT',?)",["Leistungsnachweis bestätigt",`Der Kunde hat den Leistungsnachweis ${report.report_number} bestätigt.`,id]);
+        await connection.commit();return sendJson(response,200,{id,status:"CUSTOMER_CONFIRMED",message:"Leistungsnachweis bestätigt."});
+    } catch(error){await connection.rollback();console.error("[service-reports customer] failed:",error.code||"database_error");return sendJson(response,503,{message:"Bestätigung konnte nicht gespeichert werden."});} finally { connection.release(); }
+}
+
 async function handleCustomerApi(request, response, pathname, searchParams) {
     if (!pool) return sendJson(response, 503, { message: "Das Kundenportal ist derzeit nicht verfügbar." });
     const loginLimited = () => takeAdminLoginRateLimit(request);
@@ -2085,6 +2846,7 @@ async function handleCustomerApi(request, response, pathname, searchParams) {
     if (pathname === "/api/customer/logout") { if (request.method !== "POST") return sendJson(response, 405, { message: "Methode nicht erlaubt." }); if (!isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." }); const session = readCustomerSession(request); if (session) customerSessions.delete(session.token); response.setHeader("Set-Cookie", `${CUSTOMER_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secureAdminCookie ? "; Secure" : ""}`); return sendJson(response, 200, { authenticated: false }); }
     if (pathname === "/api/customer/session") { const session = customerSessionOrRespond(request,response); if (!session) return; const [rows] = await pool.execute("SELECT id,customer_number,first_name,last_name,email FROM customers WHERE id = ? AND status = 'active'", [session.customerId]); return rows[0] ? sendJson(response,200,{authenticated:true,customer:rows[0]}) : sendJson(response,401,{message:"Bitte melden Sie sich an."}); }
     const session = customerSessionOrRespond(request,response); if (!session) return;
+    if (pathname === "/api/customer/service-reports" || /^\/api\/customer\/service-reports\/\d+(?:\/confirm)?$/.test(pathname)) return handleCustomerServiceReports(request,response,pathname,session);
     const customerPaymentMatch = pathname.match(/^\/api\/customer\/payments(?:\/(\d+))?$/);
     if (customerPaymentMatch) {
         if (request.method !== "GET") return sendJson(response,405,{message:"Methode nicht erlaubt."});
@@ -2178,6 +2940,81 @@ async function saveEmployeeDocument(file, taskId, employeeId, description, order
     } catch (error) { await fs.promises.unlink(filePath).catch(() => {}); throw error; }
 }
 
+async function saveEmployeeCashReceipt(connection, file, payment, employeeId) {
+    if (!file || file.field !== "receipt" || file.unsafeName || !file.originalName || !file.buffer?.length || file.buffer.length > EMPLOYEE_MAX_FILE_BYTES) {
+        const error = new Error("invalid_receipt"); error.statusCode = 400; throw error;
+    }
+    const mime = detectQuoteMime(file.buffer);
+    if (!allowedQuoteMimes.has(mime) || (file.declaredMime && file.declaredMime !== mime)) {
+        const error = new Error("invalid_receipt_type"); error.statusCode = 400; throw error;
+    }
+    const [[existing]] = await connection.execute("SELECT id FROM financial_receipts WHERE employee_cash_payment_id=? LIMIT 1", [payment.id]);
+    if (existing) { const error = new Error("receipt_exists"); error.statusCode = 409; throw error; }
+    const storedFileName = crypto.randomUUID(), extension = allowedQuoteMimes.get(mime);
+    await fs.promises.mkdir(PRIVATE_DOCUMENT_UPLOAD_DIR, { recursive: true, mode: 0o700 });
+    const filePath = path.join(PRIVATE_DOCUMENT_UPLOAD_DIR, `${storedFileName}${extension}`);
+    await fs.promises.writeFile(filePath, file.buffer, { mode: 0o600, flag: "wx" });
+    try {
+        const [receipt] = await connection.execute("INSERT INTO financial_receipts (transaction_id,employee_cash_payment_id,customer_id,employee_id,file_name,stored_file_name,storage_path,mime_type,file_size,receipt_type) VALUES (?,?,?,?,?,?,?,?,?,'CUSTOMER_PAYMENT')", [payment.transaction_id, payment.id, payment.customer_id, employeeId, file.originalName, storedFileName, path.join("private-documents", `${storedFileName}${extension}`), mime, file.buffer.length]);
+        await auditEvent(connection, "EMPLOYEE", employeeId, "EMPLOYEE_CASH_PAYMENT_RECEIPT_UPLOADED", "FINANCIAL_RECEIPT", receipt.insertId, { payment_id: payment.id, mime, file_size: file.buffer.length });
+        return { id: receipt.insertId, file_name: file.originalName, mime_type: mime, file_size: file.buffer.length };
+    } catch (error) { await fs.promises.unlink(filePath).catch(() => {}); throw error; }
+}
+
+async function employeeServiceReport(connection, employeeId, id) {
+    const [rows] = await connection.execute(`SELECT r.id,r.report_number,r.order_id,r.assignment_id,r.customer_id,r.employee_id,r.service_date,r.started_at,r.finished_at,r.summary,r.customer_notes,r.status,r.submitted_at,r.reviewed_at,r.shared_with_customer_at,r.customer_confirmed_at,r.created_at,r.updated_at,o.order_number,o.title AS order_title,c.customer_number,c.first_name AS customer_first_name,c.last_name AS customer_last_name
+        FROM service_reports r JOIN order_assignments assignment_row ON assignment_row.id=r.assignment_id JOIN orders o ON o.id=r.order_id JOIN customers c ON c.id=r.customer_id
+        WHERE r.id=? AND r.employee_id=? AND assignment_row.employee_id=? AND assignment_row.order_id=r.order_id AND assignment_row.status <> 'STORNIERT'`, [id,employeeId,employeeId]);
+    return rows[0] || null;
+}
+
+async function handleEmployeeServiceReports(request, response, pathname, session) {
+    const match = pathname.match(/^\/api\/employee\/service-reports(?:\/(\d+)(?:\/(submit))?)?$/);
+    const id = match?.[1] ? Number(match[1]) : null;
+    const submitting = Boolean(match?.[2]);
+    if (!id && request.method === "GET") {
+        const [rows] = await pool.execute(`SELECT r.id,r.report_number,r.order_id,r.assignment_id,r.customer_id,r.service_date,r.started_at,r.finished_at,r.summary,r.customer_notes,r.status,r.submitted_at,r.reviewed_at,r.shared_with_customer_at,r.customer_confirmed_at,r.created_at,r.updated_at,o.order_number,o.title AS order_title,c.customer_number,c.first_name AS customer_first_name,c.last_name AS customer_last_name
+            FROM service_reports r JOIN order_assignments assignment_row ON assignment_row.id=r.assignment_id JOIN orders o ON o.id=r.order_id JOIN customers c ON c.id=r.customer_id
+            WHERE r.employee_id=? AND assignment_row.employee_id=? AND assignment_row.order_id=r.order_id AND assignment_row.status <> 'STORNIERT' ORDER BY r.service_date DESC,r.id DESC`, [session.employeeId,session.employeeId]);
+        return sendJson(response,200,{rows});
+    }
+    if (id && !submitting && request.method === "GET") { const report=await employeeServiceReport(pool,session.employeeId,id); return report ? sendJson(response,200,{report}) : sendJson(response,404,{message:"Leistungsnachweis nicht gefunden."}); }
+    if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+    let body; try { body=await readJson(request); } catch { return sendJson(response,400,{message:"Ungültige Leistungsnachweis-Daten."}); }
+    body = { ...body, internal_notes: "" };
+    const connection=await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+        if (!id && request.method === "POST") {
+            const data=serviceReportPayload(body); if(!data){await connection.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie die Leistungsdaten."});}
+            const relationship=await serviceReportRelationship(connection,data.orderId,data.assignmentId,session.employeeId); if(!relationship){await connection.rollback();return sendJson(response,404,{message:"Einsatz nicht gefunden."});}
+            const [created]=await connection.execute("INSERT INTO service_reports (report_number,order_id,assignment_id,customer_id,employee_id,service_date,started_at,finished_at,summary,internal_notes,customer_notes,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,'DRAFT')",[crypto.randomUUID(),data.orderId,data.assignmentId,relationship.customer_id,session.employeeId,data.serviceDate,data.startedAt,data.finishedAt,data.summary,data.internalNotes,data.customerNotes]);
+            const reportNumber=await createServiceReportNumber(connection,created.insertId);
+            await auditEvent(connection,"EMPLOYEE",session.employeeId,"SERVICE_REPORT_CREATED","SERVICE_REPORT",created.insertId,{order_id:data.orderId,assignment_id:data.assignmentId});
+            await connection.commit();return sendJson(response,201,{id:created.insertId,reportNumber,message:"Leistungsnachweis gespeichert."});
+        }
+        const report=await employeeServiceReport(connection,session.employeeId,id); if(!report){await connection.rollback();return sendJson(response,404,{message:"Leistungsnachweis nicht gefunden."});}
+        if (submitting && request.method === "POST") {
+            if(report.status!=="DRAFT"){await connection.rollback();return sendJson(response,400,{message:"Nur Entwürfe können eingereicht werden."});}
+            if(!report.summary){await connection.rollback();return sendJson(response,400,{message:"Bitte ergänzen Sie eine Leistungsbeschreibung."});}
+            await connection.execute("UPDATE service_reports SET status='SUBMITTED',submitted_at=NOW() WHERE id=? AND employee_id=?",[id,session.employeeId]);
+            await auditEvent(connection,"EMPLOYEE",session.employeeId,"SERVICE_REPORT_SUBMITTED","SERVICE_REPORT",id,{order_id:report.order_id});
+            await connection.execute("INSERT INTO notifications(recipient_type,recipient_id,notification_type,title,body,entity_type,entity_id) VALUES ('ADMIN',NULL,'SERVICE_REPORT',?,?, 'SERVICE_REPORT',?)",["Leistungsnachweis eingereicht",`Der Leistungsnachweis ${report.report_number} wurde eingereicht.`,id]);
+            await connection.commit();return sendJson(response,200,{id,status:"SUBMITTED",message:"Leistungsnachweis eingereicht."});
+        }
+        if (!submitting && request.method === "PATCH") {
+            if(!["DRAFT","RETURNED"].includes(report.status)){await connection.rollback();return sendJson(response,400,{message:"Eingereichte Leistungsnachweise können nicht mehr geändert werden."});}
+            const data=serviceReportPayload(body); if(!data){await connection.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie die Leistungsdaten."});}
+            const relationship=await serviceReportRelationship(connection,data.orderId,data.assignmentId,session.employeeId);if(!relationship){await connection.rollback();return sendJson(response,404,{message:"Einsatz nicht gefunden."});}
+            const nextStatus=report.status==="RETURNED"?"DRAFT":report.status;
+            await connection.execute("UPDATE service_reports SET order_id=?,assignment_id=?,customer_id=?,employee_id=?,service_date=?,started_at=?,finished_at=?,summary=?,internal_notes=?,customer_notes=?,status=? WHERE id=? AND employee_id=?",[data.orderId,data.assignmentId,relationship.customer_id,session.employeeId,data.serviceDate,data.startedAt,data.finishedAt,data.summary,data.internalNotes,data.customerNotes,nextStatus,id,session.employeeId]);
+            await auditEvent(connection,"EMPLOYEE",session.employeeId,"SERVICE_REPORT_UPDATED","SERVICE_REPORT",id,{from_status:report.status,to_status:nextStatus});
+            await connection.commit();return sendJson(response,200,{id,status:nextStatus,message:"Leistungsnachweis gespeichert."});
+        }
+        await connection.rollback();return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    } catch(error) { await connection.rollback(); console.error("[service-reports employee] failed:",error.code||"database_error");return sendJson(response,error.code==="ER_SIGNAL_EXCEPTION"?400:503,{message:error.code==="ER_SIGNAL_EXCEPTION"?"Ungültige Leistungsbeziehung.":"Leistungsnachweis konnte nicht gespeichert werden."}); } finally { connection.release(); }
+}
+
 async function handleEmployeeApi(request, response, pathname, searchParams) {
     if (!pool) return sendJson(response, 503, { message: "Das Mitarbeiterportal ist derzeit nicht verfügbar." });
 
@@ -2242,11 +3079,46 @@ async function handleEmployeeApi(request, response, pathname, searchParams) {
     }
 
     const session = employeeSessionOrRespond(request, response); if (!session) return;
+    if (pathname === "/api/employee/material-consumptions" || /^\/api\/employee\/material-consumptions\/\d+$/.test(pathname)) return handleEmployeeMaterialConsumptions(request,response,pathname,session);
+    if (pathname === "/api/employee/service-reports" || /^\/api\/employee\/service-reports\/\d+(?:\/submit)?$/.test(pathname)) return handleEmployeeServiceReports(request,response,pathname,session);
+    const cashReceiptMatch = pathname.match(/^\/api\/employee\/cash-payments\/(\d+)\/receipt$/);
+    if (cashReceiptMatch) {
+        const paymentId = Number(cashReceiptMatch[1]);
+        if (!Number.isSafeInteger(paymentId) || paymentId < 1) return sendJson(response, 404, { message: "Barzahlung nicht gefunden." });
+        if (request.method === "GET") {
+            const [rows] = await pool.execute("SELECT r.id,r.file_name,r.stored_file_name,r.mime_type FROM financial_receipts r JOIN employee_cash_payments p ON p.id=r.employee_cash_payment_id WHERE r.employee_cash_payment_id=? AND p.employee_id=?", [paymentId, session.employeeId]);
+            const receipt = rows[0];
+            if (!receipt) return sendJson(response, 404, { message: "Beleg nicht gefunden." });
+            const extension = allowedQuoteMimes.get(receipt.mime_type);
+            if (!extension) return sendJson(response, 404, { message: "Beleg nicht gefunden." });
+            const filePath = path.join(PRIVATE_DOCUMENT_UPLOAD_DIR, `${receipt.stored_file_name}${extension}`);
+            try {
+                const stat = await fs.promises.stat(filePath);
+                pool.execute("INSERT INTO audit_logs (actor_type,actor_id,action,entity_type,entity_id,metadata) VALUES ('EMPLOYEE',?,'EMPLOYEE_CASH_PAYMENT_RECEIPT_VIEWED','FINANCIAL_RECEIPT',?,?)", [session.employeeId, receipt.id, JSON.stringify({ payment_id: paymentId })]).catch(() => {});
+                response.writeHead(200, { "Content-Type": receipt.mime_type, "Content-Length": stat.size, "Content-Disposition": `attachment; filename="${receipt.file_name.replace(/["\\]/g, "_")}"`, "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" });
+                return fs.createReadStream(filePath).pipe(response);
+            } catch { return sendJson(response, 404, { message: "Beleg nicht gefunden." }); }
+        }
+        if (request.method !== "POST" || !isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
+        let multipart; try { multipart = await readMultipart(request); } catch (error) { return sendJson(response, error.statusCode || 400, { message: "Ungültiger oder zu großer Beleg." }); }
+        if (multipart.files.length !== 1) return sendJson(response, 400, { message: "Bitte laden Sie genau einen Beleg hoch." });
+        const connection = await pool.getConnection();
+        try {
+            await connection.beginTransaction();
+            const [rows] = await connection.execute("SELECT p.id,p.customer_id,p.status,t.id AS transaction_id FROM employee_cash_payments p LEFT JOIN financial_transactions t ON t.reference=p.payment_number AND t.transaction_type='INCOME' WHERE p.id=? AND p.employee_id=? FOR UPDATE", [paymentId, session.employeeId]);
+            const payment = rows[0];
+            if (!payment) { await connection.rollback(); return sendJson(response, 404, { message: "Barzahlung nicht gefunden." }); }
+            if (["ABGELEHNT", "STORNIERT"].includes(payment.status)) { await connection.rollback(); return sendJson(response, 409, { message: "Für diese Barzahlung kann kein Beleg hochgeladen werden." }); }
+            const receipt = await saveEmployeeCashReceipt(connection, multipart.files[0], payment, session.employeeId);
+            await connection.commit();
+            return sendJson(response, 201, { receipt, message: "Beleg sicher gespeichert." });
+        } catch (error) { await connection.rollback(); return sendJson(response, error.statusCode || 400, { message: error.message === "receipt_exists" ? "Für diese Barzahlung ist bereits ein Beleg vorhanden." : "Ungültiger oder zu großer Beleg." }); } finally { connection.release(); }
+    }
     const cashPaymentMatch = pathname.match(/^\/api\/employee\/cash-payments(?:\/(\d+))?$/);
     if (cashPaymentMatch) {
         const paymentId = cashPaymentMatch[1] ? Number(cashPaymentMatch[1]) : null;
         if (request.method === "GET") {
-            const [rows] = await pool.execute(`SELECT p.id,p.payment_number,p.customer_id,p.order_id,p.invoice_id,p.amount,p.payment_date,p.payment_method,p.purpose,p.receipt_number,p.status,p.customer_email_status,p.created_at,c.customer_number,c.first_name,c.last_name,o.order_number FROM employee_cash_payments p JOIN customers c ON c.id=p.customer_id JOIN orders o ON o.id=p.order_id WHERE p.employee_id=?${paymentId ? " AND p.id=?" : ""} ORDER BY p.payment_date DESC,p.id DESC`, paymentId ? [session.employeeId,paymentId] : [session.employeeId]);
+            const [rows] = await pool.execute(`SELECT p.id,p.payment_number,p.customer_id,p.order_id,p.invoice_id,p.amount,p.payment_date,p.payment_method,p.purpose,p.receipt_number,p.status,p.customer_email_status,p.created_at,c.customer_number,c.first_name,c.last_name,o.order_number,EXISTS(SELECT 1 FROM financial_receipts r WHERE r.employee_cash_payment_id=p.id) AS has_receipt FROM employee_cash_payments p JOIN customers c ON c.id=p.customer_id JOIN orders o ON o.id=p.order_id WHERE p.employee_id=?${paymentId ? " AND p.id=?" : ""} ORDER BY p.payment_date DESC,p.id DESC`, paymentId ? [session.employeeId,paymentId] : [session.employeeId]);
             if (paymentId && !rows[0]) return sendJson(response,404,{message:"Barzahlung nicht gefunden."});
             return sendJson(response,200,paymentId?{payment:rows[0]}:{rows});
         }
@@ -2296,10 +3168,19 @@ async function handleEmployeeApi(request, response, pathname, searchParams) {
         return sendJson(response, 200, { message: "Passwort geändert." });
     }
 
+    const employeeOrderInvoiceMatch = pathname.match(/^\/api\/employee\/orders\/(\d+)\/invoices$/);
+    if (employeeOrderInvoiceMatch && request.method === "GET") {
+        const orderId = Number(employeeOrderInvoiceMatch[1]);
+        const [assigned] = await pool.execute("SELECT o.id,o.customer_id FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE a.employee_id=? AND a.order_id=? AND a.status <> 'STORNIERT'", [session.employeeId, orderId]);
+        if (!assigned[0]) return sendJson(response, 404, { message: "Auftrag nicht gefunden." });
+        const [rows] = await pool.execute("SELECT id,invoice_number,status,outstanding_amount,due_date FROM invoices WHERE order_id=? AND customer_id=? ORDER BY invoice_date DESC,id DESC", [orderId, assigned[0].customer_id]);
+        return sendJson(response, 200, { rows });
+    }
+
     const employeeOrderMatch = pathname.match(/^\/api\/employee\/orders(?:\/(\d+))?$/);
     if (employeeOrderMatch && request.method === "GET") {
         const orderId = employeeOrderMatch[1] ? Number(employeeOrderMatch[1]) : null;
-        const [rows] = await pool.execute(`SELECT o.id,o.order_number,o.service_type,o.title,o.description,o.object_type,o.address,o.postal_code,o.city,o.preferred_date,o.status,o.priority,a.id AS assignment_id,a.assignment_date,a.start_time,a.end_time,a.status AS assignment_status,a.notes AS assignment_notes,c.first_name,c.last_name,c.customer_number,c.phone FROM order_assignments a JOIN orders o ON o.id=a.order_id JOIN customers c ON c.id=o.customer_id WHERE a.employee_id=?${orderId ? " AND o.id=?" : ""} AND a.status <> 'STORNIERT' ORDER BY a.assignment_date,a.start_time`, orderId ? [session.employeeId, orderId] : [session.employeeId]);
+        const [rows] = await pool.execute(`SELECT o.id,o.order_number,o.service_type,o.title,o.description,o.object_type,o.address,o.postal_code,o.city,o.preferred_date,o.status,o.priority,a.id AS assignment_id,a.assignment_date,a.start_time,a.end_time,a.status AS assignment_status,a.notes AS assignment_notes,c.id AS customer_id,c.first_name,c.last_name,c.customer_number,c.phone FROM order_assignments a JOIN orders o ON o.id=a.order_id JOIN customers c ON c.id=o.customer_id WHERE a.employee_id=?${orderId ? " AND o.id=?" : ""} AND a.status <> 'STORNIERT' ORDER BY a.assignment_date,a.start_time`, orderId ? [session.employeeId, orderId] : [session.employeeId]);
         if (orderId && !rows[0]) return sendJson(response, 404, { message: "Auftrag nicht gefunden." });
         return sendJson(response, 200, orderId ? { order: rows[0] } : { rows });
     }
