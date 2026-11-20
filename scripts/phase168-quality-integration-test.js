@@ -75,8 +75,8 @@ async function main() {
 
         const testHealth = await fetch(`${BASE}/api/health`).then(response => response.json());
         check("test health", testHealth.status === "ok" && testHealth.database === "connected");
-        const productionHealth = await fetch("http://127.0.0.1:3000/api/health").then(response => response.json());
-        check("production health read-only", productionHealth.status === "ok" && productionHealth.database === "connected");
+        // This suite is intentionally isolated. Do not contact the production listener.
+        check("isolated API base", BASE === "http://127.0.0.1:3001");
 
         const adminLogin = await request("/api/admin/login", { method: "POST", body: { username: process.env.ADMIN_USERNAME, password: process.env.PHASE168_TEST_ADMIN_PASSWORD } });
         check("admin login", adminLogin.status === 200 && adminLogin.cookie.startsWith("zo_admin_session="), String(adminLogin.status));

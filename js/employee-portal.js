@@ -1,7 +1,7 @@
 "use strict";
 document.addEventListener("DOMContentLoaded", () => {
     const $ = selector => document.querySelector(selector);
-    const state = { employee: null, tasks: [], orders: [], workLogs: [], documents: [], cashPayments: [], serviceReports: [], qualityActions: [], qualityActionBusy: false, serviceReportPage: 1, scheduleWeek: false };
+    const state = { employee: null, tasks: [], orders: [], workLogs: [], documents: [], notifications: [], materialConsumptions: [], availableMaterials: [], cashPayments: [], serviceReports: [], qualityActions: [], qualityActionBusy: false, materialBusy: false, serviceReportPage: 1, scheduleWeek: false };
     const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
     const dateText = value => value ? new Intl.DateTimeFormat("de-DE", { dateStyle: "medium" }).format(new Date(`${String(value).slice(0, 10)}T00:00:00`)) : "—";
     const showNotice = (message, success = false) => { const node = $("#employee-notice"); node.textContent = message; node.hidden = !message; node.classList.toggle("is-success", success); };
@@ -79,5 +79,45 @@ document.addEventListener("DOMContentLoaded", () => {
     $("#document-form").addEventListener("submit", async event => { event.preventDefault(); const form = event.currentTarget, taskId = new FormData(form).get("task_id"); try { await api(`/api/employee/tasks/${taskId}/documents`, { method:"POST", body:new FormData(form) }); form.reset(); showNotice("Dokument hochgeladen.", true); await loadDocuments(); } catch (error) { showNotice(error.message); } });
     $("#employee-profile-form").addEventListener("submit", async event => { event.preventDefault(); try { await api("/api/employee/profile", { method:"PATCH", body:JSON.stringify(Object.fromEntries(new FormData(event.currentTarget))) }); showNotice("Profil gespeichert.", true); } catch (error) { showNotice(error.message); } });
     $("#employee-password-form").addEventListener("submit", async event => { event.preventDefault(); try { const result = await api("/api/employee/change-password", { method:"POST", body:JSON.stringify(Object.fromEntries(new FormData(event.currentTarget))) }); event.currentTarget.reset(); showNotice(result.message, true); } catch (error) { showNotice(error.message); } });
+    function renderNotifications() {
+        const unread = state.notifications.filter(item => !item.read_at).length;
+        const badge = $("#employee-notification-count"); badge.textContent = unread; badge.hidden = !unread;
+        $("#employee-notification-list").innerHTML = state.notifications.map(item => `<article class="employee-row employee-notification${item.read_at ? "" : " is-unread"}"><div><strong>${escapeHtml(item.title || "Benachrichtigung")}</strong><p>${escapeHtml(item.body || "")}</p><small>${escapeHtml(item.notification_type || "System") } · ${escapeHtml(dateText(item.created_at))}${item.read_at ? " · Gelesen" : " · Ungelesen"}</small></div>${item.read_at ? "" : `<button class="button button-light" type="button" data-notification-read="${Number(item.id)}">Als gelesen markieren</button>`}</article>`).join("") || '<p class="empty-copy">Keine Benachrichtigungen vorhanden.</p>';
+    }
+    async function loadNotifications() {
+        $("#employee-notification-list").innerHTML = '<p class="empty-copy">Benachrichtigungen werden geladen …</p>';
+        try { const result = await api("/api/employee/notifications"); state.notifications = result.rows || []; renderNotifications(); }
+        catch (error) { $("#employee-notification-list").innerHTML = '<p class="empty-copy">Benachrichtigungen konnten nicht geladen werden.</p>'; showNotice(error.status === 401 ? "Ihre Sitzung ist abgelaufen. Bitte melden Sie sich erneut an." : error.message); }
+    }
+    async function markNotificationRead(id) {
+        try { const result = await api(`/api/employee/notifications/${Number(id)}/read`, { method:"PATCH", body:"{}" }); showNotice(result.message, true); await loadNotifications(); }
+        catch (error) { showNotice(error.message); }
+    }
+    const materialUnitLabel = unit => ({ STUECK:"Stück", LITER:"Liter", KILOGRAMM:"Kilogramm", METER:"Meter", PACKUNG:"Packung" }[unit] || unit || "—");
+    function renderMaterialConsumption() {
+        const orderSelect = $("#employee-material-order"), materialSelect = $("#employee-material-id");
+        orderSelect.innerHTML = `<option value="">Auftrag wählen</option>${state.orders.map(order => `<option value="${Number(order.id)}">${escapeHtml(order.order_number)} · ${escapeHtml(order.title)}</option>`).join("")}`;
+        materialSelect.innerHTML = `<option value="">Material wählen</option>${state.availableMaterials.map(material => `<option value="${Number(material.id)}">${escapeHtml(material.material_number)} · ${escapeHtml(material.name)} (${escapeHtml(materialUnitLabel(material.unit))})</option>`).join("")}`;
+        $("#employee-material-list").innerHTML = state.materialConsumptions.map(item => `<article class="employee-row"><div><strong>${escapeHtml(item.movement_number)} · ${escapeHtml(item.material_name)}</strong><p>${escapeHtml(item.order_number)} · ${escapeHtml(item.movement_type === "RETURN" ? "Rückgabe" : "Verbrauch")}</p><small>${escapeHtml(String(item.quantity))} ${escapeHtml(materialUnitLabel(item.unit))} · ${escapeHtml(dateText(item.movement_date))} · ${escapeHtml(item.status)}</small>${item.notes ? `<p>${escapeHtml(item.notes)}</p>` : ""}</div></article>`).join("") || '<p class="empty-copy">Noch keine Materialbewegungen erfasst.</p>';
+    }
+    async function loadMaterialConsumptions() {
+        $("#employee-material-list").innerHTML = '<p class="empty-copy">Materialbewegungen werden geladen …</p>';
+        try { const result = await api("/api/employee/material-consumptions"); state.materialConsumptions = result.rows || []; state.availableMaterials = result.materials || []; renderMaterialConsumption(); }
+        catch (error) { $("#employee-material-list").innerHTML = '<p class="empty-copy">Materialbewegungen konnten nicht geladen werden.</p>'; showNotice(error.status === 401 ? "Ihre Sitzung ist abgelaufen. Bitte melden Sie sich erneut an." : error.message); }
+    }
+    function setView(name) {
+        document.querySelectorAll(".employee-view").forEach(node => { node.hidden = node.id !== `employee-${name}`; });
+        document.querySelectorAll("[data-employee-view]").forEach(button => button.classList.toggle("is-active", button.dataset.employeeView === name));
+        const button = document.querySelector(`[data-employee-view="${name}"]`);
+        $("#employee-title").textContent = button ? button.childNodes[0].textContent.trim() : "Mitarbeiterportal";
+        const descriptions = { notifications:"Ihre persönlichen Systemhinweise und Statusmeldungen.", "material-consumption":"Erfassen Sie Material nur für Ihre eigenen, zugewiesenen Aufträge." };
+        $("#employee-subtitle").textContent = descriptions[name] || "Ihre persönlichen Daten und Aufgaben im Überblick.";
+    }
+    document.querySelectorAll("[data-employee-view]").forEach(button => button.addEventListener("click", async () => { const view = button.dataset.employeeView; if (view === "notifications") await loadNotifications(); if (view === "material-consumption") await loadMaterialConsumptions(); }));
+    $("#employee-notifications-refresh").addEventListener("click", () => loadNotifications());
+    $("#employee-notification-list").addEventListener("click", event => { const button = event.target.closest("[data-notification-read]"); if (button) markNotificationRead(button.dataset.notificationRead); });
+    $("#employee-material-refresh").addEventListener("click", () => loadMaterialConsumptions());
+    $("#employee-material-date").value = new Date().toISOString().slice(0,10);
+    $("#employee-material-form").addEventListener("submit", async event => { event.preventDefault(); if (state.materialBusy) return; const form = event.currentTarget, note = $("#employee-material-note"), button = $("#employee-material-submit"), payload = Object.fromEntries(new FormData(form)), quantity = Number(payload.quantity); note.textContent = ""; if (!payload.order_id || !payload.material_id) { note.textContent = "Bitte wählen Sie einen eigenen Auftrag und ein Material aus."; return; } if (!Number.isFinite(quantity) || quantity <= 0) { note.textContent = "Die Menge muss größer als 0 sein."; return; } state.materialBusy = true; button.disabled = true; try { const result = await api("/api/employee/material-consumptions", { method:"POST", body:JSON.stringify(payload) }); form.reset(); $("#employee-material-date").value = new Date().toISOString().slice(0,10); showNotice(result.message, true); await loadMaterialConsumptions(); } catch (error) { note.textContent = error.message; } finally { state.materialBusy = false; button.disabled = false; } });
     api("/api/employee/session").then(initializeDashboard).catch(() => { window.location.replace("mitarbeiter-anmelden.html"); });
 });

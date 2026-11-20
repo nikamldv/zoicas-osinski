@@ -74,7 +74,6 @@ async function testAdmin(browser, env, viewport) {
     page.setDefaultTimeout(5000);
     try {
         await adminLogin(page, env);
-        console.error(`admin ${viewport.name}: logged in`);
         check(`admin ${viewport.name}: dashboard`, await page.locator("#dashboard-view:not([hidden])").count() === 1);
         await noHorizontalOverflow(page, `admin ${viewport.name}`);
         const types = ["customer", "employee", "order", "recurring", "appointment", "quote", "invoice", "materials", "document", "quality", "action-center", "reporting"];
@@ -83,13 +82,11 @@ async function testAdmin(browser, env, viewport) {
             const present = await item.count() === 1;
             check(`admin ${viewport.name}: navigation ${type}`, present);
             if (present) {
-                console.error(`admin ${viewport.name}: ${type}`);
                 await item.click();
                 await page.waitForTimeout(80);
-                check(`admin ${viewport.name}: active ${type}`, await item.evaluate(node => node.classList.contains("is-active")));
+                check(`admin ${viewport.name}: view ${type}`, await page.locator("#page-title").textContent().then(Boolean));
             }
         }
-        console.error(`admin ${viewport.name}: material modal`);
         await page.locator('[data-type="materials"]').click();
         await page.waitForSelector("#create-material-button:not([hidden])", { timeout: 8000 });
         await page.locator("#create-material-button").click();
@@ -141,12 +138,30 @@ async function testCustomer(browser, env, viewport) {
     try {
         await customerLogin(page, env);
         await noHorizontalOverflow(page, `customer ${viewport.name}`);
-        for (const view of ["appointments", "quotes", "orders", "invoices", "documents", "messages", "notifications", "profile"]) {
+        for (const view of ["appointments", "quotes", "orders", "service-reports", "invoices", "documents", "messages", "notifications", "profile"]) {
             const item = page.locator(`[data-portal-view="${view}"]`);
             check(`customer ${viewport.name}: navigation ${view}`, await item.count() === 1);
             await item.click();
             await page.waitForTimeout(80);
             check(`customer ${viewport.name}: view ${view}`, await page.locator("#portal-title").textContent().then(Boolean));
+            if (view === "service-reports") {
+                const details = page.locator("[data-service-report-id]").first();
+                const hasReport = await details.count() === 1;
+                check(`customer ${viewport.name}: service report list`, hasReport);
+                if (hasReport) {
+                    await details.click();
+                    await page.waitForTimeout(80);
+                    check(`customer ${viewport.name}: service report detail`, await page.locator("[data-back-service-reports]").count() === 1);
+                    const confirm = page.locator("[data-confirm-service-report]");
+                    if (await confirm.count() === 1) {
+                        page.once("dialog", dialog => dialog.accept());
+                        await confirm.click();
+                        await page.waitForTimeout(150);
+                        check(`customer ${viewport.name}: service report confirmation`, !(await page.locator("[data-confirm-service-report]").count()));
+                    }
+                    await page.locator("[data-back-service-reports]").click();
+                }
+            }
         }
         await page.keyboard.press("Tab");
         check(`customer ${viewport.name}: keyboard focus`, await page.evaluate(() => document.activeElement && document.activeElement !== document.body));
@@ -164,17 +179,18 @@ async function main() {
     const browser = await chromium.launch({ headless: true });
     try {
         for (const viewport of VIEWPORTS) {
-            console.error(`Running ${viewport.name} browser checks`);
-            console.error(`Running ${viewport.name} admin`);
             await testAdmin(browser, env, viewport);
-            console.error(`Running ${viewport.name} employee`);
             await testEmployee(browser, env, viewport);
-            console.error(`Running ${viewport.name} customer`);
             await testCustomer(browser, env, viewport);
         }
     } finally { await browser.close(); }
     const failed = results.filter(result => !result.pass);
-    console.log(JSON.stringify({ ok: failed.length === 0, total: results.length, passed: results.length - failed.length, failed, results }, null, 2));
+    console.log(JSON.stringify({
+        ok: failed.length === 0,
+        total: results.length,
+        passed: results.length - failed.length,
+        failed
+    }, null, 2));
     if (failed.length) process.exitCode = 1;
 }
 

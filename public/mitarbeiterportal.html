@@ -23,6 +23,8 @@
                 <button data-employee-view="schedule" type="button">Mein Zeitplan</button>
                 <button data-employee-view="work" type="button">Arbeitszeit</button>
                 <button data-employee-view="documents" type="button">Dokumentation</button>
+                <button data-employee-view="notifications" type="button">Meine Benachrichtigungen <span id="employee-notification-count" class="employee-nav-count" hidden></span></button>
+                <button data-employee-view="material-consumption" type="button">Materialverbrauch</button>
                 <button data-employee-view="cash-payments" type="button">Meine Barzahlungen</button>
                 <button data-employee-view="profile" type="button">Mein Profil</button>
                 <button id="employee-logout" type="button">Abmelden</button>
@@ -87,6 +89,30 @@
 
                 <div id="employee-documents" class="employee-view" hidden>
                     <section class="employee-panel"><h2>Dokumentation hochladen</h2><form id="document-form" class="employee-form" enctype="multipart/form-data"><label>Aufgabe<select id="document-task" name="task_id" required><option value="">Aufgabe wählen</option></select></label><label>Auftrag<select id="document-order" name="order_id"><option value="">Ohne Auftragsbezug</option></select></label><label>Datei<input name="document" type="file" accept="image/jpeg,image/png,application/pdf" required></label><label class="wide">Beschreibung<textarea name="description" maxlength="1000"></textarea></label><button class="button button-primary" type="submit">Dokument hochladen</button></form><p class="form-note">Erlaubt: JPG, PNG oder PDF, maximal 5 MB. Dateien bleiben privat und sind nur berechtigten Mitarbeitenden zugänglich.</p></section><section class="employee-panel"><h2>Meine Dokumente</h2><div id="document-list" class="employee-list"></div></section>
+                </div>
+
+                <div id="employee-notifications" class="employee-view" hidden>
+                    <section class="employee-panel">
+                        <div class="employee-panel-head"><div><p class="section-kicker">BENACHRICHTIGUNGEN</p><h2>Meine Benachrichtigungen</h2><p>Sie sehen ausschließlich Nachrichten, die Ihrem Konto zugeordnet sind.</p></div><button id="employee-notifications-refresh" class="button button-light" type="button">Aktualisieren</button></div>
+                    </section>
+                    <section class="employee-panel"><div id="employee-notification-list" class="employee-list" aria-live="polite"></div></section>
+                </div>
+
+                <div id="employee-material-consumption" class="employee-view" hidden>
+                    <section class="employee-panel">
+                        <div class="employee-panel-head"><div><p class="section-kicker">LAGER &amp; EINSATZ</p><h2>Materialverbrauch erfassen</h2><p>Material darf ausschließlich für Ihre eigenen, zugewiesenen Aufträge erfasst werden.</p></div><button id="employee-material-refresh" class="button button-light" type="button">Aktualisieren</button></div>
+                        <form id="employee-material-form" class="employee-form" novalidate>
+                            <label>Auftrag<select id="employee-material-order" name="order_id" required><option value="">Auftrag wählen</option></select></label>
+                            <label>Material<select id="employee-material-id" name="material_id" required><option value="">Material wählen</option></select></label>
+                            <label>Bewegung<select name="movement_type" required><option value="CONSUMPTION">Verbrauch</option><option value="RETURN">Rückgabe</option></select></label>
+                            <label>Menge<input name="quantity" type="number" min="0.001" max="99999999" step="0.001" inputmode="decimal" required></label>
+                            <label>Datum<input id="employee-material-date" name="movement_date" type="date" required></label>
+                            <label class="wide">Notiz (optional)<textarea name="notes" maxlength="4000" placeholder="Optionaler Hinweis zum Einsatz"></textarea></label>
+                            <p id="employee-material-note" class="form-note wide" role="status" aria-live="polite"></p>
+                            <button id="employee-material-submit" class="button button-primary" type="submit">Materialverbrauch speichern</button>
+                        </form>
+                    </section>
+                    <section class="employee-panel"><h2>Meine Materialbewegungen</h2><div id="employee-material-list" class="employee-list" aria-live="polite"></div></section>
                 </div>
 
                 <div id="employee-cash-payments" class="employee-view" hidden>

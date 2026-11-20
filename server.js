@@ -2632,11 +2632,50 @@ async function handleAdminMaterials(request, response, pathname, searchParams) {
     return sendJson(response,404,{message:"API-Endpunkt nicht gefunden."});
 }
 
-async function handleEmployeeMaterialConsumptions(request, response, pathname, session) {
+async function handleEmployeeMaterialConsumptionsBase(request, response, pathname, session) {
     const match=pathname.match(/^\/api\/employee\/material-consumptions(?:\/(\d+))?$/),id=match?.[1]?positiveId(match[1]):null;if(match?.[1]&&!id)return sendJson(response,404,{message:"Materialbewegung nicht gefunden."});
-    if(!id&&request.method==="GET"){const[rows]=await pool.execute("SELECT sm.id,sm.movement_number,sm.material_id,sm.order_id,sm.service_report_id,sm.movement_type,sm.quantity,sm.movement_date,sm.status,sm.notes,m.material_number,m.name AS material_name,m.unit,o.order_number FROM material_stock_movements sm JOIN materials m ON m.id=sm.material_id JOIN orders o ON o.id=sm.order_id WHERE sm.employee_id=? AND sm.movement_type IN ('CONSUMPTION','RETURN') AND EXISTS(SELECT 1 FROM order_assignments a WHERE a.order_id=sm.order_id AND a.employee_id=? AND a.status<>'STORNIERT') ORDER BY sm.movement_date DESC,sm.id DESC",[session.employeeId,session.employeeId]);return sendJson(response,200,{rows});}
+    if(!id&&request.method==="GET"){const[rows,materials]=await Promise.all([pool.execute("SELECT sm.id,sm.movement_number,sm.material_id,sm.order_id,sm.service_report_id,sm.movement_type,sm.quantity,sm.movement_date,sm.status,sm.notes,m.material_number,m.name AS material_name,m.unit,o.order_number FROM material_stock_movements sm JOIN materials m ON m.id=sm.material_id JOIN orders o ON o.id=sm.order_id WHERE sm.employee_id=? AND sm.movement_type IN ('CONSUMPTION','RETURN') AND EXISTS(SELECT 1 FROM order_assignments a WHERE a.order_id=sm.order_id AND a.employee_id=? AND a.status<>'STORNIERT') ORDER BY sm.movement_date DESC,sm.id DESC",[session.employeeId,session.employeeId]),pool.execute(`SELECT m.id,m.material_number,m.name,m.unit FROM materials m LEFT JOIN material_stock_movements sm ON sm.material_id=m.id WHERE m.status='ACTIVE' GROUP BY m.id,m.material_number,m.name,m.unit HAVING ${materialBalanceSql}>0 ORDER BY m.name,m.id`)]);return sendJson(response,200,{rows:rows[0],materials:materials[0]});}
     if(id&&request.method==="GET"){const[rows]=await pool.execute("SELECT sm.id,sm.movement_number,sm.material_id,sm.order_id,sm.service_report_id,sm.movement_type,sm.quantity,sm.movement_date,sm.status,sm.notes,m.material_number,m.name AS material_name,m.unit,o.order_number FROM material_stock_movements sm JOIN materials m ON m.id=sm.material_id JOIN orders o ON o.id=sm.order_id WHERE sm.id=? AND sm.employee_id=? AND sm.movement_type IN ('CONSUMPTION','RETURN') AND EXISTS(SELECT 1 FROM order_assignments a WHERE a.order_id=sm.order_id AND a.employee_id=? AND a.status<>'STORNIERT')",[id,session.employeeId,session.employeeId]);return rows[0]?sendJson(response,200,{movement:rows[0]}):sendJson(response,404,{message:"Materialbewegung nicht gefunden."});}
     if(id||request.method!=="POST")return sendJson(response,405,{message:"Methode nicht erlaubt."});if(!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"UngÃ¼ltige Verbrauchsdaten."})};const data={materialId:positiveId(body.material_id),orderId:positiveId(body.order_id),serviceReportId:body.service_report_id==null||body.service_report_id===""?null:positiveId(body.service_report_id),employeeId:session.employeeId,movementType:readText(body.movement_type||"CONSUMPTION",20),quantity:materialQuantity(body.quantity),movementDate:readText(body.movement_date,10),notes:readText(body.notes,4000,{optional:true,multiline:true})};if(!data.materialId||!data.orderId||data.serviceReportId===null&&body.service_report_id!=null&&body.service_report_id!==""||!["CONSUMPTION","RETURN"].includes(data.movementType)||!data.quantity||!isIsoDate(data.movementDate)||data.notes===null)return sendJson(response,400,{message:"Bitte prÃ¼fen Sie die Verbrauchsdaten."});const c=await pool.getConnection();try{await c.beginTransaction();const relation=await materialMovementRelation(c,data,{employeeId:session.employeeId,employeeOnly:true});if(relation.error){await c.rollback();return sendJson(response,relation.status,{message:relation.error});}if(data.movementType==="CONSUMPTION"&&await approvedMaterialBalance(c,data.materialId)<data.quantity){await c.rollback();return sendJson(response,409,{message:"Nicht genÃ¼gend freigegebener Materialbestand."});}if(data.movementType==="RETURN"){const[[used]]=await c.execute("SELECT COALESCE(SUM(CASE WHEN movement_type='CONSUMPTION' THEN quantity ELSE -quantity END),0) AS net_used FROM material_stock_movements WHERE material_id=? AND order_id=? AND employee_id=? AND status<>'CANCELLED' AND movement_type IN ('CONSUMPTION','RETURN')",[data.materialId,data.orderId,session.employeeId]);if(Number(used.net_used)<data.quantity){await c.rollback();return sendJson(response,409,{message:"Die RÃ¼ckgabe Ã¼bersteigt den erfassten Verbrauch."});}}const[created]=await c.execute("INSERT INTO material_stock_movements(movement_number,material_id,order_id,service_report_id,employee_id,movement_type,quantity,movement_date,status,notes) VALUES (?,?,?,?,?,?,?,?,'RECORDED',?)",[crypto.randomUUID(),data.materialId,data.orderId,data.serviceReportId,session.employeeId,data.movementType,data.quantity,data.movementDate,data.notes||null]);const number=`MAT-${new Date().getFullYear()}-${String(created.insertId).padStart(6,"0")}`;await c.execute("UPDATE material_stock_movements SET movement_number=? WHERE id=?",[number,created.insertId]);await auditEvent(c,"EMPLOYEE",session.employeeId,"STOCK_MOVEMENT_CREATED","MATERIAL_STOCK_MOVEMENT",created.insertId,{material_id:data.materialId,order_id:data.orderId,movement_type:data.movementType});await c.commit();return sendJson(response,201,{id:created.insertId,movementNumber:number,status:"RECORDED",message:"Materialbewegung erfasst."});}catch(error){await c.rollback();return sendJson(response,error.code==="ER_SIGNAL_EXCEPTION"?400:503,{message:error.code==="ER_SIGNAL_EXCEPTION"?"UngÃ¼ltige Leistungsbeziehung.":"Materialbewegung konnte nicht gespeichert werden."});}finally{c.release();}
+}
+
+async function handleEmployeeMaterialConsumptions(request,response,pathname,session) {
+    if (request.method === "GET" || /\/\d+$/.test(pathname)) return handleEmployeeMaterialConsumptionsBase(request,response,pathname,session);
+    if (request.method !== "POST") return handleEmployeeMaterialConsumptionsBase(request,response,pathname,session);
+    if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+    let body; try { body = await readJson(request); } catch { return sendJson(response,400,{message:"Ungültige Verbrauchsdaten."}); }
+    const data = { materialId:positiveId(body.material_id), orderId:positiveId(body.order_id), serviceReportId:body.service_report_id == null || body.service_report_id === "" ? null : positiveId(body.service_report_id), employeeId:session.employeeId, movementType:readText(body.movement_type || "CONSUMPTION",20), quantity:materialQuantity(body.quantity), movementDate:readText(body.movement_date,10), notes:readText(body.notes,4000,{optional:true,multiline:true}) };
+    if (!data.materialId || !data.orderId || (data.serviceReportId === null && body.service_report_id != null && body.service_report_id !== "") || !["CONSUMPTION","RETURN"].includes(data.movementType) || !data.quantity || !isIsoDate(data.movementDate) || data.notes === null) return sendJson(response,400,{message:"Bitte prüfen Sie die Verbrauchsdaten."});
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+        const relation = await materialMovementRelation(connection,data,{employeeId:session.employeeId,employeeOnly:true});
+        if (relation.error) { await connection.rollback(); return sendJson(response,relation.status,{message:relation.error}); }
+        const [[duplicate]] = await connection.execute("SELECT id FROM material_stock_movements WHERE material_id=? AND order_id=? AND employee_id=? AND movement_type=? AND quantity=? AND movement_date=? AND service_report_id <=> ? AND COALESCE(notes,'')=COALESCE(?, '') AND status<>'CANCELLED' LIMIT 1 FOR UPDATE",[data.materialId,data.orderId,session.employeeId,data.movementType,data.quantity,data.movementDate,data.serviceReportId,data.notes]);
+        if (duplicate) { await connection.rollback(); return sendJson(response,409,{message:"Dieser Materialverbrauch wurde bereits erfasst."}); }
+        if (data.movementType === "CONSUMPTION" && await approvedMaterialBalance(connection,data.materialId) < data.quantity) { await connection.rollback(); return sendJson(response,409,{message:"Nicht genügend freigegebener Materialbestand."}); }
+        if (data.movementType === "RETURN") {
+            const [[used]] = await connection.execute("SELECT COALESCE(SUM(CASE WHEN movement_type='CONSUMPTION' THEN quantity ELSE -quantity END),0) AS net_used FROM material_stock_movements WHERE material_id=? AND order_id=? AND employee_id=? AND status<>'CANCELLED' AND movement_type IN ('CONSUMPTION','RETURN')",[data.materialId,data.orderId,session.employeeId]);
+            if (Number(used.net_used) < data.quantity) { await connection.rollback(); return sendJson(response,409,{message:"Die Rückgabe übersteigt den erfassten Verbrauch."}); }
+        }
+        const [created] = await connection.execute("INSERT INTO material_stock_movements(movement_number,material_id,order_id,service_report_id,employee_id,movement_type,quantity,movement_date,status,notes) VALUES (?,?,?,?,?,?,?,?,'RECORDED',?)",[crypto.randomUUID(),data.materialId,data.orderId,data.serviceReportId,session.employeeId,data.movementType,data.quantity,data.movementDate,data.notes || null]);
+        const movementNumber = `MAT-${new Date().getFullYear()}-${String(created.insertId).padStart(6,"0")}`;
+        await connection.execute("UPDATE material_stock_movements SET movement_number=? WHERE id=?",[movementNumber,created.insertId]);
+        await auditEvent(connection,"EMPLOYEE",session.employeeId,"STOCK_MOVEMENT_CREATED","MATERIAL_STOCK_MOVEMENT",created.insertId,{material_id:data.materialId,order_id:data.orderId,movement_type:data.movementType});
+        await connection.commit();
+        return sendJson(response,201,{id:created.insertId,movementNumber,status:"RECORDED",message:"Materialbewegung erfasst."});
+    } catch (error) { await connection.rollback(); return sendJson(response,error.code === "ER_SIGNAL_EXCEPTION" ? 400 : 503,{message:error.code === "ER_SIGNAL_EXCEPTION" ? "Ungültige Leistungsbeziehung." : "Materialbewegung konnte nicht gespeichert werden."}); }
+    finally { connection.release(); }
+}
+
+async function handleEmployeeNotifications(request,response,pathname,session){
+    const match=pathname.match(/^\/api\/employee\/notifications(?:\/(\d+)\/read)?$/),id=match?.[1]?positiveId(match[1]):null;
+    if(!match)return sendJson(response,404,{message:"API-Endpunkt nicht gefunden."});
+    if(!id&&request.method==="GET"){const[rows]=await pool.execute("SELECT id,notification_type,title,body,entity_type,entity_id,read_at,created_at FROM notifications WHERE recipient_type='EMPLOYEE' AND recipient_id=? ORDER BY created_at DESC,id DESC LIMIT 200",[session.employeeId]);return sendJson(response,200,{rows,unread:rows.filter(row=>!row.read_at).length});}
+    if(!id||request.method!=="PATCH")return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    if(!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+    const [result]=await pool.execute("UPDATE notifications SET read_at=COALESCE(read_at,NOW()) WHERE id=? AND recipient_type='EMPLOYEE' AND recipient_id=?",[id,session.employeeId]);
+    return result.affectedRows?sendJson(response,200,{message:"Benachrichtigung gelesen."}):sendJson(response,404,{message:"Benachrichtigung nicht gefunden."});
 }
 
 async function handleAdminApi(request, response, pathname, searchParams) {
@@ -3044,6 +3083,25 @@ async function handleCustomerServiceReports(request, response, pathname, session
     } catch(error){await connection.rollback();console.error("[service-reports customer] failed:",error.code||"database_error");return sendJson(response,503,{message:"Bestätigung konnte nicht gespeichert werden."});} finally { connection.release(); }
 }
 
+function sendCustomerInvoicePdf(response, invoice, items) {
+    const safeName = String(invoice.invoice_number || "rechnung").replace(/[^A-Za-z0-9_-]/g,"_");
+    const document = new PDFDocument({ size:"A4", margin:46, info:{ Title:`Rechnung ${invoice.invoice_number}`, Author:"Zoicas & Osinski" } });
+    response.writeHead(200,{ "Content-Type":"application/pdf", "Content-Disposition":`attachment; filename="${safeName}.pdf"`, "Cache-Control":"private, no-store", "X-Content-Type-Options":"nosniff" });
+    document.pipe(response);
+    const money = value => new Intl.NumberFormat("de-DE",{style:"currency",currency:"EUR"}).format(Number(value || 0));
+    document.rect(0,0,document.page.width,92).fill("#0B1F3A");
+    document.fillColor("#ffffff").fontSize(20).text("ZOICAS & OSINSKI",46,30).fontSize(10).text("REINIGUNGSSERVICE",46,57);
+    document.fillColor("#0B1F3A").fontSize(22).text("Rechnung",46,124).fontSize(11);
+    document.text(`Rechnungsnummer: ${invoice.invoice_number}`,46,160).text(`Rechnungsdatum: ${String(invoice.invoice_date).slice(0,10)}`,46,178).text(`Zahlungsziel: ${String(invoice.due_date).slice(0,10)}`,46,196);
+    document.text(String(invoice.customer_name_snapshot || "Kunde"),330,160,{width:210,align:"right"});
+    const y = 246; document.fontSize(10).fillColor("#0B1F3A").text("Leistung",46,y).text("Menge",326,y,{width:62,align:"right"}).text("Brutto",430,y,{width:110,align:"right"}); document.moveTo(46,y+17).lineTo(540,y+17).strokeColor("#9ab1c7").stroke();
+    let rowY=y+28; document.fillColor("#172b4d"); for(const item of items){ if(rowY>700){document.addPage();rowY=60;} document.text(String(item.title || "Leistung"),46,rowY,{width:260}).text(`${item.quantity} ${item.unit || ""}`,326,rowY,{width:62,align:"right"}).text(money(item.gross_amount),430,rowY,{width:110,align:"right"}); rowY+=24; }
+    rowY+=18; document.moveTo(320,rowY).lineTo(540,rowY).strokeColor("#9ab1c7").stroke(); rowY+=12;
+    document.fontSize(11).text(`Netto: ${money(invoice.net_amount)}`,330,rowY,{width:210,align:"right"}).text(`MwSt.: ${money(invoice.tax_amount)}`,330,rowY+20,{width:210,align:"right"}).fontSize(13).fillColor("#0B1F3A").text(`Brutto: ${money(invoice.gross_amount)}`,330,rowY+43,{width:210,align:"right"});
+    document.fontSize(8).fillColor("#526b84").text("Dieses Dokument wurde sicher im Kundenportal erstellt.",46,780,{width:494,align:"center"});
+    document.end();
+}
+
 async function handleCustomerApi(request, response, pathname, searchParams) {
     if (!pool) return sendJson(response, 503, { message: "Das Kundenportal ist derzeit nicht verfügbar." });
     const loginLimited = () => takeAdminLoginRateLimit(request);
@@ -3110,6 +3168,24 @@ async function handleCustomerApi(request, response, pathname, searchParams) {
         if (orderId && !rows[0]) return sendJson(response, 404, { message: "Auftrag nicht gefunden." });
         return sendJson(response, 200, orderId ? { order: rows[0] } : { rows });
     }
+    const customerQuoteReject = pathname.match(/^\/api\/customer\/quotes\/(\d+)\/reject$/);
+    if (customerQuoteReject) {
+        if (request.method !== "POST" || !isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+        let body; try { body = await readJson(request); } catch { return sendJson(response,400,{message:"Ungültige Angebotsdaten."}); }
+        const quoteId = Number(customerQuoteReject[1]), reason = readText(body.reason,1000,{optional:true,multiline:true});
+        if (!Number.isSafeInteger(quoteId) || quoteId < 1 || reason === null) return sendJson(response,400,{message:"Bitte prüfen Sie die Ablehnung."});
+        const connection = await pool.getConnection();
+        try {
+            await connection.beginTransaction();
+            const [result] = await connection.execute("UPDATE quotes SET status='ABGELEHNT' WHERE id=? AND customer_id=? AND status='GESENDET'",[quoteId,session.customerId]);
+            if (!result.affectedRows) { await connection.rollback(); return sendJson(response,409,{message:"Angebot nicht gefunden oder nicht zur Ablehnung verfügbar."}); }
+            await auditEvent(connection,"CUSTOMER",session.customerId,"QUOTE_REJECTED","QUOTE",quoteId,{reason:reason || null});
+            await connection.execute("INSERT INTO notifications(recipient_type,recipient_id,notification_type,title,body,entity_type,entity_id) VALUES ('ADMIN',NULL,'QUOTE',?,?, 'QUOTE',?)",["Angebot abgelehnt",reason ? `Ein Kunde hat ein Angebot abgelehnt: ${reason}` : "Ein Kunde hat ein Angebot abgelehnt.",quoteId]);
+            await connection.commit();
+            return sendJson(response,200,{message:"Das Angebot wurde als abgelehnt dokumentiert.",status:"ABGELEHNT"});
+        } catch (error) { await connection.rollback(); console.error("[customer quote reject] failed:",error.code || "database_error"); return sendJson(response,503,{message:"Das Angebot konnte nicht abgelehnt werden."}); }
+        finally { connection.release(); }
+    }
     const customerQuoteMatch = pathname.match(/^\/api\/customer\/quotes(?:\/(\d+)(?:\/accept)?)?$/);
     if (customerQuoteMatch) {
         const quoteId = customerQuoteMatch[1] ? Number(customerQuoteMatch[1]) : null;
@@ -3136,6 +3212,17 @@ async function handleCustomerApi(request, response, pathname, searchParams) {
         const [rows] = await pool.execute(`SELECT ${columns},(SELECT o.planned_start FROM orders o WHERE o.contract_id=co.id AND o.customer_id=co.customer_id AND o.status <> 'STORNIERT' AND o.planned_start >= NOW() ORDER BY o.planned_start LIMIT 1) AS next_service_at,(SELECT o.status FROM orders o WHERE o.contract_id=co.id AND o.customer_id=co.customer_id AND o.status <> 'STORNIERT' AND o.planned_start >= NOW() ORDER BY o.planned_start LIMIT 1) AS next_service_status FROM contracts co WHERE co.customer_id=?${contractId ? " AND co.id=?" : ""} ORDER BY co.created_at DESC,co.id DESC`, contractId ? [session.customerId,contractId] : [session.customerId]);
         if (contractId && !rows[0]) return sendJson(response,404,{message:"Vertrag nicht gefunden."});
         return sendJson(response,200,contractId?{contract:rows[0]}:{rows});
+    }
+    const customerInvoicePdfMatch = pathname.match(/^\/api\/customer\/invoices\/(\d+)\/pdf$/);
+    if (customerInvoicePdfMatch) {
+        if (request.method !== "GET") return sendJson(response,405,{message:"Methode nicht erlaubt."});
+        const invoiceId = Number(customerInvoicePdfMatch[1]);
+        if (!Number.isSafeInteger(invoiceId) || invoiceId < 1) return sendJson(response,404,{message:"Rechnung nicht gefunden."});
+        const [rows] = await pool.execute("SELECT id,invoice_number,customer_name_snapshot,invoice_date,due_date,net_amount,tax_amount,gross_amount FROM invoices WHERE id=? AND customer_id=?",[invoiceId,session.customerId]);
+        const invoice = rows[0]; if (!invoice) return sendJson(response,404,{message:"Rechnung nicht gefunden."});
+        const [items] = await pool.execute("SELECT title,quantity,unit,gross_amount FROM invoice_items WHERE invoice_id=? ORDER BY sort_order,id",[invoiceId]);
+        auditEvent(pool,"CUSTOMER",session.customerId,"INVOICE_PDF_DOWNLOADED","INVOICE",invoiceId,null).catch(()=>{});
+        return sendCustomerInvoicePdf(response,invoice,items);
     }
     const customerInvoiceMatch = pathname.match(/^\/api\/customer\/invoices(?:\/(\d+))?$/);
     if (customerInvoiceMatch && request.method === "GET") {
@@ -3315,6 +3402,7 @@ async function handleEmployeeApi(request, response, pathname, searchParams) {
     }
 
     const session = employeeSessionOrRespond(request, response); if (!session) return;
+    if (pathname === "/api/employee/notifications" || /^\/api\/employee\/notifications\/\d+\/read$/.test(pathname)) return handleEmployeeNotifications(request,response,pathname,session);
     if (pathname === "/api/employee/material-consumptions" || /^\/api\/employee\/material-consumptions\/\d+$/.test(pathname)) return handleEmployeeMaterialConsumptions(request,response,pathname,session);
     if (pathname === "/api/employee/service-reports" || /^\/api\/employee\/service-reports\/\d+(?:\/submit)?$/.test(pathname)) return handleEmployeeServiceReports(request,response,pathname,session);
     if (pathname === "/api/employee/quality-actions" || /^\/api\/employee\/quality-actions\/\d+$/.test(pathname)) return handleEmployeeQualityActions(request,response,pathname,session);
