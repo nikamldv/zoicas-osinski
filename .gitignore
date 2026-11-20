@@ -1,4 +1,17 @@
 .env
+.env.production
+.env.production.local
+.env.test
+.env.backup
+.env.backup.test
+.env.recovery.test
 database/bootstrap-user.temp.sql
 node_modules/
 storage/quote-uploads/
+storage/employee-documents/
+storage/private-documents/
+storage/database-backups/
+storage/recovery-work/
+storage/test-quote-uploads/
+storage/test-employee-documents/
+storage/test-private-documents/

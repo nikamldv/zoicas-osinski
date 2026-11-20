@@ -269,9 +269,9 @@ async function loadPerformance(){const params=reportParams(),paths=["operations"
 async function loadReporting({force=false}={}){const params=reportParams();byId("reporting-period-label").textContent="Zeitraum wird geladen …";reportingMessage("Bericht wird geladen …","success");try{const result=await loadReport("/api/admin/reports/dashboard",params,{force});byId("reporting-period-label").textContent=reportingPeriodLabel({from:result.meta.from,to:result.meta.to,compare:params.compare});renderReportCards(result.data,params.compare);const current=params.compare?result.data.current:result.data,sections=[["Revenue","revenue"],["Invoices","invoices"],["Orders","orders"],["Customers","customers"],["Employees","employees"],["Materials","materials"]];byId("reporting-summary").innerHTML=sections.map(([label,name])=>`<article class="reporting-section"><h3>${label}</h3><p>Zusammenfassung für den gewählten Zeitraum.</p><button class="detail-button" data-report-detail="${name}" type="button">Details anzeigen</button><div id="report-detail-${name}"></div></article>`).join("");reportingMessage("");}catch(error){reportingMessage(error.status===401?"Sitzung abgelaufen. Bitte melden Sie sich erneut an.":error.message||"Der Bericht konnte nicht geladen werden.");}}
 
 function updateViewHeading() {
-    const career = currentType === "career", finance = currentType === "finance", reporting = currentType === "reporting", serviceReport = currentType === "service-report", materials = currentType === "materials";
+    const career = currentType === "career", finance = currentType === "finance", reporting = currentType === "reporting", actionCenter = currentType === "action-center", serviceReport = currentType === "service-report", materials = currentType === "materials", quality = currentType === "quality";
     const quote = currentType === "quote", offer = currentType === "offer", contract = currentType === "contract", recurring = currentType === "recurring", invoice = currentType === "invoice", appointment = currentType === "appointment", customer = currentType === "customer", employee = currentType === "employee", order = currentType === "order", schedule = currentType === "schedule", document = currentType === "document", message = currentType === "message", notification = currentType === "notification", audit = currentType === "audit";
-    byId("page-title").textContent = materials ? "Materialverwaltung" : serviceReport ? "Leistungsnachweise" : finance ? "Finanzen" : schedule ? "Einsatzplanung" : recurring ? "Wiederkehrende Aufträge" : invoice ? "Rechnungen" : contract ? "Verträge" : offer ? "Angebote" : order ? "Aufträge" : employee ? "Mitarbeiter" : customer ? "Kunden" : appointment ? "Termine" : quote ? "Angebotsanfragen" : career ? "Bewerbungen" : "Kontaktanfragen";
+    byId("page-title").textContent = actionCenter ? "Aktionscenter" : quality ? "Qualität & Vorfälle" : materials ? "Materialverwaltung" : serviceReport ? "Leistungsnachweise" : finance ? "Finanzen" : schedule ? "Einsatzplanung" : recurring ? "Wiederkehrende Aufträge" : invoice ? "Rechnungen" : contract ? "Verträge" : offer ? "Angebote" : order ? "Aufträge" : employee ? "Mitarbeiter" : customer ? "Kunden" : appointment ? "Termine" : quote ? "Angebotsanfragen" : career ? "Bewerbungen" : "Kontaktanfragen";
     byId("records-title").textContent = recurring ? "Automatisierte Einsatzpläne & Protokolle" : invoice ? "Rechnungsverwaltung" : contract ? "Vertragsverwaltung" : offer ? "Angebotsverwaltung" : order ? "Auftragsverwaltung" : employee ? "Mitarbeiterverwaltung" : customer ? "Registrierte Kunden" : appointment ? "Gebuchte Termine" : quote ? "Aktuelle Angebotsanfragen" : career ? "Aktuelle Bewerbungen" : "Aktuelle Kontaktanfragen";
     byId("service-heading").textContent = recurring ? "INTERVALL / NÄCHSTER LAUF" : invoice || contract || offer || order ? "LEISTUNG / BETRAG" : employee ? "POSITION / ROLLE" : appointment || quote ? "DIENSTLEISTUNG / ORT" : career ? "BEREICH" : "LEISTUNG";
     byId("create-employee-button").hidden = !employee;
@@ -293,11 +293,13 @@ function updateViewHeading() {
     byId("schedule-panel").hidden = !schedule;
     byId("finance-panel").hidden = !finance;
     byId("reporting-panel").hidden = !reporting;
+    byId("action-center-panel").hidden = !actionCenter;
     byId("service-reports-panel").hidden = !serviceReport;
     byId("materials-panel").hidden = !materials;
-    document.querySelector(".stats-grid").hidden = reporting;
-    document.querySelector(".records-panel").hidden = schedule || finance || reporting || serviceReport || materials;
-    document.querySelector(".privacy-note").hidden = schedule || finance || reporting || serviceReport || materials;
+    byId("quality-panel").hidden = !quality;
+    document.querySelector(".stats-grid").hidden = reporting || actionCenter || quality;
+    document.querySelector(".records-panel").hidden = schedule || finance || reporting || actionCenter || serviceReport || materials || quality;
+    document.querySelector(".privacy-note").hidden = schedule || finance || reporting || actionCenter || serviceReport || materials || quality;
     document.querySelectorAll(".nav-item").forEach(button => button.classList.toggle("is-active", button.dataset.type === currentType));
     const quoteOnlyStatuses = new Set(["offer_sent", "accepted", "declined", "completed"]);
     const commercialStatuses = new Set(["all", "ENTWURF", "GESENDET", "ANGENOMMEN", "ABGELEHNT", "ABGELAUFEN", "STORNIERT"]);
@@ -875,6 +877,18 @@ async function loadRequirementOrders(){const result=await api("/api/admin/orders
 async function loadMaterialRequirements(){const control=byId("requirement-order-control");control.hidden=false;await loadRequirementOrders();byId("materials-head").innerHTML="<th>MATERIAL</th><th>MENGE</th><th>EINHEIT</th><th>BESTAND</th><th>STATUS</th><th>AKTIONEN</th>";if(!requirementOrderId){byId("materials-body").innerHTML='<tr><td colspan="6">Bitte wählen Sie zuerst einen Auftrag aus.</td></tr>';return;}const result=await api(`/api/admin/orders/${requirementOrderId}/material-requirements`),stock=new Map(materialRows.map(row=>[Number(row.id),row]));byId("materials-body").innerHTML=(result.rows||[]).map(row=>{const item=stock.get(Number(row.material_id));return `<tr><td>${escapeHtml(row.material_number)} · ${escapeHtml(row.name)}</td><td>${escapeHtml(String(row.planned_quantity))}</td><td>${escapeHtml(row.unit)}</td><td>${item?escapeHtml(String(item.current_stock)):"—"}</td><td>${item?materialPill(item.stock_status):"—"}</td><td><button class="detail-button" data-requirement-edit="${Number(row.id)}">Bearbeiten</button> <button class="detail-button" data-requirement-delete="${Number(row.id)}">Löschen</button></td></tr>`}).join("")||'<tr><td colspan="6">Für diesen Auftrag sind noch keine Materialien geplant.</td></tr>';}
 function openRequirement(row=null){if(!requirementOrderId){materialNotice("Bitte wählen Sie zuerst einen Auftrag aus.");return;}const form=byId("requirement-form");form.reset();form.elements.id.value=row?.id||"";byId("requirement-dialog-title").textContent=row?"Materialbedarf bearbeiten":"Materialbedarf hinzufügen";byId("requirement-material").innerHTML='<option value="">Material wählen</option>'+materialRows.filter(item=>item.status==="ACTIVE").map(item=>`<option value="${Number(item.id)}" data-unit="${escapeHtml(item.unit)}">${escapeHtml(item.material_number)} · ${escapeHtml(item.name)}</option>`).join("");if(row){form.elements.material_id.value=row.material_id;form.elements.required_quantity.value=row.planned_quantity;form.elements.status.value=row.status;form.elements.notes.value=row.notes||"";byId("requirement-unit").value=row.unit;}byId("requirement-form-note").hidden=true;byId("requirement-dialog").showModal();}
 
+let actionCenterPage = 1;
+function actionCenterMessage(message, kind="error"){const node=byId("action-center-message");node.textContent=message;node.className=`dashboard-message${kind==="success"?" is-success":""}`;node.hidden=!message;}
+function actionPriorityLabel(priority){return priority==="critical"?"Kritisch":priority==="high"?"Hoch":"Normal";}
+function actionAreaLabel(area){return ({orders:"Aufträge",invoices:"Rechnungen",service_reports:"Leistungsnachweise",materials:"Material & Lager",quality:"Qualität & Vorfälle",automation:"Automation",notifications:"Benachrichtigungen"})[area]||area;}
+function actionDate(value){return value?formatDate(value):"—";}
+async function loadActionCenter(){const priority=byId("action-center-priority").value,area=byId("action-center-area").value,query=new URLSearchParams({page:String(actionCenterPage),page_size:"20"});if(priority)query.set("priority",priority);if(area)query.set("area",area);byId("action-center-body").innerHTML='<tr><td colspan="5">Aktionscenter wird geladen …</td></tr>';actionCenterMessage("");try{const result=await api(`/api/admin/action-center?${query}`),summary=result.summary||{};byId("action-center-cards").innerHTML=[["Kritisch",summary.critical||0,"critical"],["Hohe Priorität",summary.high||0,"high"],["Fehlende Leistungsnachweise",summary.service_reports||0,"high"],["Überfällige Rechnungen",summary.invoices||0,"critical"],["Niedrige Bestände",summary.materials||0,"high"],["Ungelesene Hinweise",summary.notifications||0,"normal"]].map(([label,value,priorityClass])=>`<article class="finance-card action-card-${priorityClass}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(reportNumber(value))}</strong></article>`).join("");byId("nav-action-count").textContent=String(Number(summary.critical||0)+Number(summary.high||0));byId("action-center-body").innerHTML=(result.items||[]).map(item=>`<tr><td><span class="action-priority action-priority-${escapeHtml(item.priority)}">${escapeHtml(actionPriorityLabel(item.priority))}</span></td><td>${escapeHtml(actionAreaLabel(item.area))}</td><td><strong>${escapeHtml(item.title)}</strong><div class="message-preview">${escapeHtml(item.description||"")}</div></td><td>${escapeHtml(actionDate(item.date))}</td><td><button type="button" class="detail-button" data-action-target="${escapeHtml(item.target)}" data-action-id="${Number(item.entity_id)||""}">Öffnen</button></td></tr>`).join("")||'<tr><td colspan="5">Keine Hinweise für die ausgewählten Filter.</td></tr>';byId("action-center-page-info").textContent=`Seite ${result.page} von ${result.totalPages} · ${result.total} Einträge`;byId("action-center-previous").disabled=result.page<=1;byId("action-center-next").disabled=result.page>=result.totalPages;}catch(error){byId("action-center-cards").innerHTML="";byId("action-center-body").innerHTML='<tr><td colspan="5">Aktionscenter konnte nicht geladen werden.</td></tr>';actionCenterMessage(error.status===401?"Sitzung abgelaufen. Bitte melden Sie sich erneut an.":error.message||"Aktionscenter konnte nicht geladen werden.");if(error.status===401)showLogin("Ihre Sitzung ist abgelaufen. Bitte melden Sie sich erneut an.");}}
+byId("action-center-refresh").addEventListener("click",()=>{actionCenterPage=1;loadActionCenter();});
+["action-center-priority","action-center-area"].forEach(id=>byId(id).addEventListener("change",()=>{actionCenterPage=1;loadActionCenter();}));
+byId("action-center-previous").addEventListener("click",()=>{if(actionCenterPage>1){actionCenterPage-=1;loadActionCenter();}});
+byId("action-center-next").addEventListener("click",()=>{actionCenterPage+=1;loadActionCenter();});
+byId("action-center-body").addEventListener("click",event=>{const button=event.target.closest("[data-action-target]");if(!button)return;const target=button.dataset.actionTarget;if(!document.querySelector(`.nav-item[data-type="${target}"]`))return;currentType=target;currentPage=1;updateViewHeading();if(target==="materials")loadMaterials().catch(error=>setNotice(error.message));else if(target==="service-report")loadServiceReports().catch(error=>setNotice(error.message));else if(target==="notification")loadSubmissions().catch(error=>setNotice(error.message));else loadSubmissions().catch(error=>setNotice(error.message));});
+
 document.querySelectorAll(".nav-item").forEach(button => {
     button.addEventListener("click", async () => {
         if (currentType === button.dataset.type) return;
@@ -882,7 +896,7 @@ document.querySelectorAll(".nav-item").forEach(button => {
         currentPage = 1;
         byId("status-filter").value = "all";
         updateViewHeading();
-        if (currentType === "schedule") { try { await loadSchedule(); } catch (error) { setNotice(error.message); } } else if (currentType === "finance") { try { setFinanceFilterOptions(); await loadFinance(); } catch (error) { setNotice(error.message); } } else if (currentType === "reporting") { await Promise.all([loadReporting(),loadVisuals()]); } else if (currentType === "service-report") { await loadServiceReports(); } else if (currentType === "materials") { await loadMaterials(); } else loadSubmissions();
+        if (currentType === "schedule") { try { await loadSchedule(); } catch (error) { setNotice(error.message); } } else if (currentType === "finance") { try { setFinanceFilterOptions(); await loadFinance(); } catch (error) { setNotice(error.message); } } else if (currentType === "action-center") { await loadActionCenter(); } else if (currentType === "reporting") { await Promise.all([loadReporting(),loadVisuals()]); } else if (currentType === "service-report") { await loadServiceReports(); } else if (currentType === "quality") { await window.loadQualityIncidents?.(); } else if (currentType === "materials") { await loadMaterials(); } else loadSubmissions();
     });
 });
 
@@ -1147,16 +1161,126 @@ byId("logout-button").addEventListener("click", async () => {
 });
 
 byId("finance-period").addEventListener("change", () => loadFinance().catch(error => setNotice(error.message)));
-byId("reporting-period").addEventListener("change",event=>{const custom=event.target.value==="custom";byId("reporting-from-field").hidden=!custom;byId("reporting-to-field").hidden=!custom;byId("reporting-from").required=custom;byId("reporting-to").required=custom;});
+byId("reporting-period").addEventListener("change",event=>{const custom=event.target.value==="custom";byId("reporting-from-field").hidden=!custom;byId("reporting-to-field").hidden=!custom;byId("reporting-from").required=custom;byId("reporting-to").required=custom;performancePage=1;});
 let performancePage=1;let performanceLoading=false;
 function performanceState(message){const node=byId("performance-content");node.innerHTML=`<p class="reporting-chart-loading" role="status">${escapeHtml(message)}</p>`;}
 function performanceChart(title,labels,values,formatter){if(!values.length||values.every(value=>Number(value||0)===0))return `<article class="reporting-section"><h3>${escapeHtml(title)}</h3><p>Keine Daten für den ausgewählten Zeitraum vorhanden.</p></article>`;const max=Math.max(1,...values.map(Number));const width=420,height=210,bar=width/values.length-12;return `<article class="reporting-section"><h3>${escapeHtml(title)}</h3><svg class="performance-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}">${values.map((value,index)=>{const h=Math.max(2,Number(value)/max*130),x=12+index*(bar+12),y=160-h;return `<rect x="${x}" y="${y}" width="${bar}" height="${h}" fill="#176d9d"><title>${escapeHtml(`${labels[index]}: ${formatter(value)}`)}</title></rect><text x="${x+bar/2}" y="178" text-anchor="middle" font-size="9">${escapeHtml(String(labels[index]).slice(0,14))}</text><text x="${x+bar/2}" y="${y-5}" text-anchor="middle" font-size="8">${escapeHtml(formatter(value))}</text>`}).join("")}</svg></article>`;}
 function performanceOrderTable(data){let section=document.querySelector(".performance-order-section");if(!section){section=document.createElement("section");section.className="performance-order-section";section.innerHTML='<h3>Order Efficiency</h3><div class="table-scroll"><table><thead><tr><th>Auftrag</th><th>Kunde</th><th>Status</th><th>Geplant</th><th>Tatsächlich</th><th>Materialkosten</th><th>Umsatz</th><th>Contribution vor Personalkosten</th></tr></thead><tbody></tbody></table></div><div class="finance-pagination"><button type="button" class="button button-light" data-performance-prev aria-label="Vorherige Seite">← Zurück</button><span data-performance-page></span><button type="button" class="button button-light" data-performance-next aria-label="Nächste Seite">Weiter →</button></div>';byId("performance-content").after(section);section.addEventListener("click",event=>{if(event.target.closest("[data-performance-prev]")&&performancePage>1){performancePage--;loadPerformance()}if(event.target.closest("[data-performance-next]")&&performancePage<data.total_pages){performancePage++;loadPerformance()}})}const body=section.querySelector("tbody");body.innerHTML=(data.items||[]).length?(data.items||[]).map(row=>`<tr><td>${escapeHtml(row.order_number)}</td><td>${escapeHtml(row.customer_name)}</td><td>${escapeHtml(row.status)}</td><td>${escapeHtml(`${Number(row.planned_hours||0).toFixed(1)} h`)}</td><td>${escapeHtml(`${Number(row.actual_hours||0).toFixed(1)} h`)}</td><td>${escapeHtml(reportEuro(row.material_cost))}</td><td>${escapeHtml(reportEuro(row.price_gross_snapshot))}</td><td>${escapeHtml(reportEuro(row.contribution_before_personnel_costs))}</td></tr>`).join(""):'<tr><td colspan="8">Keine Daten für den ausgewählten Zeitraum vorhanden.</td></tr>';section.querySelector("[data-performance-page]").textContent=`Seite ${data.page} / ${data.total_pages} · ${data.total} Einträge`;section.querySelector("[data-performance-prev]").disabled=data.page<=1;section.querySelector("[data-performance-next]").disabled=data.page>=data.total_pages;}
 async function loadPerformance(){if(performanceLoading)return;performanceLoading=true;performanceState("Leistungsanalyse wird geladen…");try{const params=reportParams(),query=new URLSearchParams({period:params.period,compare:String(params.compare),page:String(performancePage),page_size:"10"});if(params.period==="custom"){query.set("from",params.from);query.set("to",params.to)}const endpoints=["operations","services","receivables","recurring"].map(name=>api(`/api/admin/reports/performance/${name}?${query}`));const [operations,services,receivables,recurring,orders]=await Promise.all([...endpoints,api(`/api/admin/reports/performance/orders?${query}`)]);const op=operations.data,svc=services.data,rec=receivables.data,rng=recurring.data;byId("performance-cards").innerHTML=[["Auftragsabschlussrate",`${Number(op.completion_rate||0).toFixed(1)}%`],["Stornierungsrate",`${Number(op.cancellation_rate||0).toFixed(1)}%`],["Geplante Stunden",`${Number(op.planned_hours||0).toFixed(1)} h`],["Tatsächliche Stunden",`${Number(op.actual_hours||0).toFixed(1)} h`],["Service-Report-Abschlussrate",`${Number(op.service_report_completion_rate||0).toFixed(1)}%`],["Contribution vor Personalkosten",reportEuro((svc.items||[]).reduce((sum,row)=>sum+Number(row.contribution_before_personnel_costs||0),0))],["Überfällige Forderungen",reportEuro(rec.overdue_invoice_amount)]].map(([label,value])=>`<article class="finance-card"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`).join("");byId("performance-content").innerHTML=`<section class="reporting-chart-grid">${performanceChart("Umsatz nach Leistung",(svc.items||[]).map(row=>row.service_type),(svc.items||[]).map(row=>row.revenue),reportEuro)}${performanceChart("Geplante vs tatsächliche Stunden",["Geplant","Tatsächlich"],[op.planned_hours,op.actual_hours],value=>`${Number(value||0).toFixed(1)} h`)}${performanceChart("Forderungsalterung",["Aktuell","1–30","31–60","61–90",">90"],[rec.buckets?.current,rec.buckets?.days_1_30,rec.buckets?.days_31_60,rec.buckets?.days_61_90,rec.buckets?.days_90_plus],reportEuro)}</section><article class="reporting-section"><h3>Service Performance</h3>${(svc.items||[]).length?`<div class="table-scroll"><table><thead><tr><th>Leistung</th><th>Umsatz</th><th>Aufträge</th><th>Abgeschlossen</th><th>Storniert</th><th>Contribution vor Personalkosten</th></tr></thead><tbody>${svc.items.map(row=>`<tr><td>${escapeHtml(row.service_type)}</td><td>${escapeHtml(reportEuro(row.revenue))}</td><td>${escapeHtml(reportNumber(row.order_count))}</td><td>${escapeHtml(reportNumber(row.completed_orders))}</td><td>${escapeHtml(reportNumber(row.cancelled_orders))}</td><td>${escapeHtml(reportEuro(row.contribution_before_personnel_costs))}</td></tr>`).join("")}</tbody></table></div>`:"<p>Keine Daten für den ausgewählten Zeitraum vorhanden.</p>"}</article><article class="reporting-section"><h3>Wiederkehrende Aufträge</h3><p>Aktive Verträge: ${escapeHtml(reportNumber(rng.recurring_contracts))}<br>Generiert: ${escapeHtml(reportNumber(rng.generated_orders))}<br>Erfolgreich: ${escapeHtml(reportNumber(rng.successful_generation))}<br>Duplikate: ${escapeHtml(reportNumber(rng.duplicate_outcomes))}<br>Fehler: ${escapeHtml(reportNumber(rng.error_outcomes))}</p></article>`;performanceOrderTable(orders.data)}catch(error){byId("performance-cards").innerHTML="";performanceState("Die Leistungsanalyse konnte nicht geladen werden.")}finally{performanceLoading=false}}
-byId("reporting-refresh").addEventListener("click",()=>{performancePage=1;loadPerformance();});
-byId("reporting-refresh").addEventListener("click",()=>{reportingCache.clear();loadReporting({force:true});loadVisuals();});
-byId("reporting-refresh").addEventListener("click",()=>loadPerformance().catch(error=>reportingMessage(error.message||"Die Leistungsanalyse konnte nicht geladen werden.")));
+byId("reporting-refresh").addEventListener("click",()=>{performancePage=1;reportingCache.clear();Promise.all([loadReporting({force:true}),loadVisuals(),loadPerformance()]).catch(error=>reportingMessage(error.message||"Der Bericht konnte nicht geladen werden."));});
 document.querySelector('[data-type="reporting"]')?.addEventListener("click",()=>setTimeout(()=>loadPerformance().catch(error=>reportingMessage(error.message||"Die Leistungsanalyse konnte nicht geladen werden.")),0));
+
+let performanceFilterOptionsPromise = null;
+
+function performanceFilterValue(id) {
+    return String(byId(id)?.value || "").trim();
+}
+
+function buildPerformanceQueryParams(endpoint, { page = performancePage } = {}) {
+    const params = reportParams();
+    const query = new URLSearchParams({ period: params.period, compare: String(params.compare) });
+    if (params.period === "custom") { query.set("from", params.from); query.set("to", params.to); }
+    const serviceType = performanceFilterValue("performance-service");
+    const customerId = performanceFilterValue("performance-customer");
+    const employeeId = performanceFilterValue("performance-employee");
+    if (serviceType) query.set("service_type", serviceType);
+    if (customerId) query.set("customer_id", customerId);
+    if (["operations", "orders"].includes(endpoint) && employeeId) query.set("employee_id", employeeId);
+    if (endpoint === "orders") { query.set("page", String(page)); query.set("page_size", "10"); }
+    return query;
+}
+
+async function loadAllReportOptionRows(endpoint) {
+    const first = await api(`${endpoint}${endpoint.includes("?") ? "&" : "?"}page=1`);
+    const rows = [...(first.rows || [])];
+    const pageSize = Number(first.pageSize || first.page_size || rows.length || 1);
+    const totalPages = Math.min(20, Math.max(1, Math.ceil(Number(first.total || rows.length) / pageSize)));
+    for (let page = 2; page <= totalPages; page += 1) {
+        const result = await api(`${endpoint}${endpoint.includes("?") ? "&" : "?"}page=${page}`);
+        rows.push(...(result.rows || []));
+    }
+    return rows;
+}
+
+function setPerformanceSelectOptions(id, placeholder, rows, getValue, getLabel) {
+    const select = byId(id), selected = select.value;
+    const unique = new Map();
+    rows.forEach(row => { const value = String(getValue(row) || "").trim(); if (value) unique.set(value, getLabel(row)); });
+    select.innerHTML = `<option value="">${escapeHtml(placeholder)}</option>${[...unique.entries()].sort((a,b) => String(a[1]).localeCompare(String(b[1]), "de")).map(([value,label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`).join("")}`;
+    if (unique.has(selected)) select.value = selected;
+}
+
+async function loadPerformanceFilterOptions() {
+    if (performanceFilterOptionsPromise) return performanceFilterOptionsPromise;
+    performanceFilterOptionsPromise = Promise.all([
+        loadAllReportOptionRows("/api/admin/customers"),
+        loadAllReportOptionRows("/api/admin/employees?status=ACTIVE"),
+        loadAllReportOptionRows("/api/admin/orders")
+    ]).then(([customers, employees, orders]) => {
+        setPerformanceSelectOptions("performance-customer", "Alle Kunden", customers, row => row.id, row => `${row.first_name || ""} ${row.last_name || ""}`.trim() || row.customer_number || row.email || `Kunde #${row.id}`);
+        setPerformanceSelectOptions("performance-employee", "Alle Mitarbeiter", employees, row => row.id, row => `${row.first_name || ""} ${row.last_name || ""}`.trim() || row.employee_number || `Mitarbeiter #${row.id}`);
+        setPerformanceSelectOptions("performance-service", "Alle Leistungen", orders, row => row.service_type, row => row.service_type);
+    }).catch(error => {
+        performanceFilterOptionsPromise = null;
+        reportingMessage(error.message || "Filteroptionen konnten nicht geladen werden.");
+    });
+    return performanceFilterOptionsPromise;
+}
+
+function performanceOrderSection() {
+    return document.querySelector(".performance-order-section");
+}
+
+async function loadPerformance() {
+    if (performanceLoading) return;
+    performanceLoading = true;
+    byId("performance-cards").innerHTML = "";
+    performanceState("Leistungsanalyse wird geladen …");
+    const existingTable = performanceOrderSection();
+    if (existingTable) existingTable.hidden = true;
+    try {
+        await loadPerformanceFilterOptions();
+        const request = endpoint => api(`/api/admin/reports/performance/${endpoint}?${buildPerformanceQueryParams(endpoint)}`);
+        const [operations, services, receivables, recurring, orders] = await Promise.all([
+            request("operations"), request("services"), request("receivables"), request("recurring"), request("orders")
+        ]);
+        const op = operations.data, svc = services.data, rec = receivables.data, rng = recurring.data;
+        byId("performance-cards").innerHTML = [
+            ["Aufträge", reportNumber(op.order_count)],
+            ["Auftragsabschlussrate", `${Number(op.completion_rate || 0).toFixed(1)}%`],
+            ["Stornierungsrate", `${Number(op.cancellation_rate || 0).toFixed(1)}%`],
+            ["Geplante Stunden", `${Number(op.planned_hours || 0).toFixed(1)} h`],
+            ["Tatsächliche Stunden", `${Number(op.actual_hours || 0).toFixed(1)} h`],
+            ["Service-Report-Abschlussrate", `${Number(op.service_report_completion_rate || 0).toFixed(1)}%`],
+            ["Überfällige Forderungen", reportEuro(rec.overdue_invoice_amount)]
+        ].map(([label,value]) => `<article class="finance-card"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`).join("");
+        byId("performance-content").innerHTML = `<section class="reporting-chart-grid">${performanceChart("Umsatz nach Leistung", (svc.items || []).map(row => row.service_type), (svc.items || []).map(row => row.revenue), reportEuro)}${performanceChart("Geplante vs. tatsächliche Stunden", ["Geplant", "Tatsächlich"], [op.planned_hours, op.actual_hours], value => `${Number(value || 0).toFixed(1)} h`)}${performanceChart("Forderungsalterung", ["Aktuell", "1–30", "31–60", "61–90", ">90"], [rec.buckets?.current,rec.buckets?.days_1_30,rec.buckets?.days_31_60,rec.buckets?.days_61_90,rec.buckets?.days_90_plus], reportEuro)}</section><article class="reporting-section"><h3>Service Performance</h3>${(svc.items || []).length ? `<div class="table-scroll"><table><thead><tr><th>Leistung</th><th>Umsatz</th><th>Aufträge</th><th>Abgeschlossen</th><th>Storniert</th><th>Contribution vor Personalkosten</th></tr></thead><tbody>${svc.items.map(row => `<tr><td>${escapeHtml(row.service_type)}</td><td>${escapeHtml(reportEuro(row.revenue))}</td><td>${escapeHtml(reportNumber(row.order_count))}</td><td>${escapeHtml(reportNumber(row.completed_orders))}</td><td>${escapeHtml(reportNumber(row.cancelled_orders))}</td><td>${escapeHtml(reportEuro(row.contribution_before_personnel_costs))}</td></tr>`).join("")}</tbody></table></div>` : "<p>Keine Daten für den ausgewählten Zeitraum oder Filter vorhanden.</p>"}</article><article class="reporting-section"><h3>Wiederkehrende Aufträge</h3><p>Aktive Verträge: ${escapeHtml(reportNumber(rng.recurring_contracts))}<br>Generiert: ${escapeHtml(reportNumber(rng.generated_orders))}<br>Erfolgreich: ${escapeHtml(reportNumber(rng.successful_generation))}<br>Duplikate: ${escapeHtml(reportNumber(rng.duplicate_outcomes))}<br>Fehler: ${escapeHtml(reportNumber(rng.error_outcomes))}</p></article>`;
+        performanceOrderTable(orders.data);
+        const table = performanceOrderSection(); if (table) table.hidden = false;
+    } catch (error) {
+        byId("performance-cards").innerHTML = "";
+        if (error.status === 401) showLogin("Ihre Sitzung ist abgelaufen. Bitte melden Sie sich erneut an.");
+        performanceState(error.message || "Die Leistungsanalyse konnte nicht geladen werden.");
+    } finally { performanceLoading = false; }
+}
+
+function resetPerformanceFilters() {
+    byId("reporting-period").value = "month";
+    byId("reporting-from").value = "";
+    byId("reporting-to").value = "";
+    byId("reporting-compare").checked = false;
+    byId("reporting-from-field").hidden = true;
+    byId("reporting-to-field").hidden = true;
+    byId("reporting-from").required = false;
+    byId("reporting-to").required = false;
+    ["performance-service", "performance-customer", "performance-employee"].forEach(id => { byId(id).value = ""; });
+    performancePage = 1;
+}
+
+byId("performance-apply-filters").addEventListener("click", () => { performancePage = 1; loadPerformance().catch(error => reportingMessage(error.message)); });
+byId("performance-clear-filters").addEventListener("click", () => { resetPerformanceFilters(); loadPerformance().catch(error => reportingMessage(error.message)); });
+document.querySelectorAll("#performance-service,#performance-customer,#performance-employee").forEach(field => field.addEventListener("change", () => { performancePage = 1; }));
+
 byId("reporting-export-csv").addEventListener("click",downloadReportingCsv);
 byId("reporting-export-pdf").addEventListener("click",downloadReportingPdf);
 byId("reporting-print").addEventListener("click",()=>window.print());

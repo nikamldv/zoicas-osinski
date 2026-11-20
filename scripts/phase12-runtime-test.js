@@ -4,10 +4,27 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const mysql = require("mysql2/promise");
 
-const base = process.env.PHASE12_TEST_BASE || "http://127.0.0.1:3001";
+const ROOT = path.resolve(__dirname, "..");
+const TEST_ENV_FILE = process.env.ENV_FILE;
+let base = "";
 const results = [];
 const check = (name, pass, detail = "") => { results.push({ name, pass, detail }); if (!pass) throw new Error(`${name}: ${detail}`); };
-function loadEnv() { for (const line of fs.readFileSync(path.resolve(__dirname, "..", ".env"), "utf8").split(/\r?\n/)) { const i = line.indexOf("="); if (i > 0 && !process.env[line.slice(0, i)]) process.env[line.slice(0, i)] = line.slice(i + 1); } }
+function loadIsolatedTestEnv() {
+  if (TEST_ENV_FILE !== ".env.test") throw new Error("Refusing to run: set ENV_FILE=.env.test for the isolated test environment.");
+  const envPath = path.resolve(ROOT, TEST_ENV_FILE);
+  if (envPath !== path.join(ROOT, ".env.test") || !fs.existsSync(envPath)) throw new Error("Refusing to run: the isolated .env.test configuration is unavailable.");
+  for (const line of fs.readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const i = line.indexOf("=");
+    if (i > 0) process.env[line.slice(0, i)] = line.slice(i + 1);
+  }
+}
+function requireIsolatedTestEnvironment() {
+  if (process.env.MYSQL_DATABASE !== "zoicas_osinski_test") throw new Error("Refusing to run: MYSQL_DATABASE must be zoicas_osinski_test.");
+  if (Number(process.env.PORT) !== 3001) throw new Error("Refusing to run: PORT must be 3001.");
+  const configuredBase = process.env.PHASE12_TEST_BASE || "http://127.0.0.1:3001";
+  if (configuredBase !== "http://127.0.0.1:3001") throw new Error("Refusing to run: PHASE12_TEST_BASE must be http://127.0.0.1:3001.");
+  return configuredBase;
+}
 function passwordHash(password) { return new Promise((resolve, reject) => { const salt = crypto.randomBytes(16); crypto.scrypt(password, salt, 64, (error, key) => error ? reject(error) : resolve(`scrypt$${salt.toString("hex")}$${key.toString("hex")}`)); }); }
 function cookieOf(response) { return String(response.headers.get("set-cookie") || "").split(";")[0]; }
 async function request(route, { method = "GET", body, cookie, form = false } = {}) {
@@ -20,12 +37,16 @@ async function request(route, { method = "GET", body, cookie, form = false } = {
 function documentForm({ customerId, name, bytes, mime = "image/png", type = "SONSTIGES" }) { const form = new FormData(); form.set("customer_id", String(customerId)); form.set("document_type", type); form.set("visibility", "CUSTOMER"); form.set("file", new Blob([bytes], { type: mime }), name); return form; }
 
 (async () => {
-  loadEnv();
+  loadIsolatedTestEnv();
+  base = requireIsolatedTestEnvironment();
+  // Reuse the existing isolated Phase 16.8 admin credential when dedicated
+  // Phase 12 aliases are not configured. Both values still come only from
+  // .env.test and the script remains fail-closed without either pair.
+  const adminUser = process.env.PHASE12_TEST_ADMIN_USER || process.env.ADMIN_USERNAME;
+  const adminPassword = process.env.PHASE12_TEST_ADMIN_PASSWORD || process.env.PHASE168_TEST_ADMIN_PASSWORD;
+  check("test admin configuration", Boolean(adminUser && adminPassword));
   const db = await mysql.createConnection({ host: process.env.MYSQL_HOST, port: Number(process.env.MYSQL_PORT || 3306), user: process.env.MYSQL_ADMIN_USER, password: process.env.MYSQL_ADMIN_PASSWORD, database: process.env.MYSQL_DATABASE, charset: "utf8mb4" });
   const stamp = `${Date.now()}${crypto.randomInt(100, 999)}`;
-  const adminUser = process.env.PHASE12_TEST_ADMIN_USER;
-  const adminPassword = process.env.PHASE12_TEST_ADMIN_PASSWORD;
-  check("test admin configuration", Boolean(adminUser && adminPassword));
   const adminLogin = await request("/api/admin/login", { method: "POST", body: { username: adminUser, password: adminPassword } });
   check("admin login", adminLogin.status === 200, `${adminLogin.status} ${adminLogin.json?.message || ""}`);
   const admin = cookieOf(adminLogin.response); check("admin session cookie", admin.startsWith("zo_admin_session="));
@@ -76,7 +97,12 @@ function documentForm({ customerId, name, bytes, mime = "image/png", type = "SON
   const [employeeInsert] = await db.execute("INSERT INTO employees (first_name,last_name,email,phone,password_hash,role,status,employee_number,position,notes) VALUES (?,?,?,?,?,'EMPLOYEE','ACTIVE',?,?,?)", ["TEST DATA", "Phase 12 Employee", employeeEmail, "+49123456788", employeeHash, employeeNumber, "Phase 12 Test", "TEST DATA – Phase 12"]); const employeeId = employeeInsert.insertId;
   const hours = [1,2,3,4,5,6,7].map(weekday => ({ weekday, start_time: "08:00", end_time: "18:00" })); const hoursResult = await request(`/api/admin/employees/${employeeId}/work-hours`, { method: "PATCH", cookie: admin, body: { hours } }); check("employee working hours", hoursResult.status === 200, String(hoursResult.status));
   const assignment = await request(`/api/admin/orders/${orderId}/assignments`, { method: "POST", cookie: admin, body: { employee_id: employeeId, assignment_date: "2026-12-01", start_time: "09:00", end_time: "10:00", status: "GEPLANT", notes: "TEST DATA – Phase 12" } }); check("employee assignment", assignment.status === 201, String(assignment.status));
-  const schedule = await request("/api/admin/recurring-orders", { method: "POST", cookie: admin, body: { contract_id: contractCreate.json.id, start_date: "2026-11-16", recurrence_type: "EINMALIG", weekdays: "1", preferred_start_time: "09:00", duration_minutes: 60, preferred_employee_id: employeeId, active: "1" } }); check("recurring schedule", schedule.status === 201, String(schedule.status));
+  // Keep the one-time schedule inside the generator's forward-looking window.
+  // The former fixed date had already passed, so zero generated orders was the
+  // correct application result rather than a regression.
+  const generatorDate = new Date(); generatorDate.setDate(generatorDate.getDate() + 1);
+  const generatorStartDate = generatorDate.toISOString().slice(0, 10);
+  const schedule = await request("/api/admin/recurring-orders", { method: "POST", cookie: admin, body: { contract_id: contractCreate.json.id, start_date: generatorStartDate, recurrence_type: "EINMALIG", weekdays: "1", preferred_start_time: "09:00", duration_minutes: 60, preferred_employee_id: employeeId, active: "1" } }); check("recurring schedule", schedule.status === 201, String(schedule.status));
   const generated = await request("/api/admin/recurring-orders/generate", { method: "POST", cookie: admin, body: { days: 7 } }); check("recurring order generation", generated.status >= 200 && generated.status < 300 && Number(generated.json.summary.created) >= 1, `${generated.status} ${JSON.stringify(generated.json)}`);
   const scheduledAudits = await request("/api/admin/audit-logs", { cookie: admin }); for (const action of ["EMPLOYEE_ASSIGNED", "RECURRING_ORDER_GENERATED"]) check(`audit ${action}`, scheduledAudits.json.rows.some(row => row.action === action), "missing");
   await db.execute("INSERT INTO employee_tasks (employee_id,title,description,status,priority,created_by) VALUES (?,?,'TEST DATA – Phase 12','OPEN','NORMAL','phase12-runtime-test')", [employeeId, "TEST DATA – Phase 12 Task"]);

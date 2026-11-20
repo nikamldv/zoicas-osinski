@@ -12,8 +12,13 @@ const ROOT = __dirname;
 const STATIC_ROOTS = ["public", "assets", "Css", "js"]
     .map(directory => path.resolve(ROOT, directory));
 
-if (process.env.LOAD_DOTENV !== "false" && fs.existsSync(path.join(ROOT, ".env")) && typeof process.loadEnvFile === "function") {
-    process.loadEnvFile(path.join(ROOT, ".env"));
+const ENV_FILE = process.env.ENV_FILE || ".env";
+const ENV_PATH = path.resolve(ROOT, ENV_FILE);
+if (!ENV_PATH.startsWith(`${ROOT}${path.sep}`) && ENV_PATH !== path.join(ROOT, ".env")) {
+    throw new Error("ENV_FILE must refer to a project-local configuration file.");
+}
+if (process.env.LOAD_DOTENV !== "false" && fs.existsSync(ENV_PATH) && typeof process.loadEnvFile === "function") {
+    process.loadEnvFile(ENV_PATH);
 }
 
 const PORT = Number(process.env.PORT || 3000);
@@ -45,7 +50,23 @@ const employeeSessions = new Map();
 const CUSTOMER_SESSION_TTL_MS = Math.min(Math.max(Number(process.env.CUSTOMER_SESSION_TTL_MINUTES || 480), 15), 720) * 60 * 1000;
 const EMPLOYEE_SESSION_TTL_MS = Math.min(Math.max(Number(process.env.EMPLOYEE_SESSION_TTL_MINUTES || 480), 15), 720) * 60 * 1000;
 const EMPLOYEE_INVITE_TTL_HOURS = Math.min(Math.max(Number(process.env.EMPLOYEE_INVITE_TTL_HOURS || 72), 1), 168);
+const NODE_ENV = String(process.env.NODE_ENV || "development").trim().toLowerCase();
+const IS_PRODUCTION = NODE_ENV === "production";
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || `http://${HOST}:${PORT}`).replace(/\/+$/, "");
+const TRUST_PROXY = process.env.TRUST_PROXY === "true";
+const TRUSTED_ORIGINS = new Set(
+    String(process.env.TRUSTED_ORIGINS || (IS_PRODUCTION ? PUBLIC_BASE_URL : ""))
+        .split(",")
+        .map(value => value.trim())
+        .filter(Boolean)
+        .map(value => {
+            try { return new URL(value).origin; } catch { return ""; }
+        })
+        .filter(Boolean)
+);
+const ENABLE_HSTS = process.env.ENABLE_HSTS === "true";
+const PRODUCTION_CSP = process.env.CONTENT_SECURITY_POLICY
+    || "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; connect-src 'self'; frame-src 'none'";
 const smtpConfigured = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASSWORD && process.env.SMTP_FROM);
 const customerLoginBuckets = new Map();
 const adminLoginBuckets = new Map();
@@ -56,6 +77,37 @@ const ADMIN_HASH_MATCH = ADMIN_PASSWORD_HASH.match(/^scrypt\$([a-f\d]{32})\$([a-
 const adminAuthConfigured = Boolean(ADMIN_USERNAME && ADMIN_HASH_MATCH);
 const secureAdminCookie = process.env.COOKIE_SECURE === "true"
     || (process.env.COOKIE_SECURE !== "false" && process.env.NODE_ENV === "production");
+
+function productionConfigurationErrors() {
+    if (!IS_PRODUCTION) return [];
+    const errors = [];
+    let publicUrl;
+    try { publicUrl = new URL(PUBLIC_BASE_URL); } catch { publicUrl = null; }
+    if (!publicUrl || publicUrl.protocol !== "https:" || publicUrl.pathname !== "/" || publicUrl.search || publicUrl.hash) {
+        errors.push("PUBLIC_BASE_URL must be a canonical HTTPS origin");
+    }
+    if (!new Set(["127.0.0.1", "::1", "localhost"]).has(HOST)) {
+        errors.push("HOST must remain loopback-only behind the HTTPS reverse proxy");
+    }
+    if (process.env.COOKIE_SECURE !== "true") errors.push("COOKIE_SECURE=true is required");
+    if (process.env.TRUST_PROXY !== "true") errors.push("TRUST_PROXY=true is required behind the HTTPS reverse proxy");
+    if (process.env.MYSQL_SSL !== "true") errors.push("MYSQL_SSL=true is required");
+    if (!TRUSTED_ORIGINS.size || [...TRUSTED_ORIGINS].some(origin => !origin.startsWith("https://"))) {
+        errors.push("TRUSTED_ORIGINS must contain HTTPS origins");
+    }
+    if (publicUrl && !TRUSTED_ORIGINS.has(publicUrl.origin)) errors.push("PUBLIC_BASE_URL must be included in TRUSTED_ORIGINS");
+    if (!process.env.MYSQL_HOST || !process.env.MYSQL_USER || !process.env.MYSQL_PASSWORD || !process.env.MYSQL_DATABASE) {
+        errors.push("application MySQL configuration is incomplete");
+    }
+    if (!process.env.MYSQL_ADMIN_USER || !process.env.MYSQL_ADMIN_PASSWORD) errors.push("admin MySQL configuration is incomplete");
+    if (!ADMIN_USERNAME || !ADMIN_HASH_MATCH) errors.push("admin authentication configuration is incomplete");
+    return errors;
+}
+
+const productionConfigErrors = productionConfigurationErrors();
+if (productionConfigErrors.length) {
+    throw new Error(`Unsafe production configuration: ${productionConfigErrors.join("; ")}`);
+}
 
 const mysql = require("mysql2/promise");
 const databaseConfigured = Boolean(
@@ -155,6 +207,9 @@ const materialStatuses = new Set(["ACTIVE", "INACTIVE", "ARCHIVED"]);
 const materialRequirementStatuses = new Set(["PLANNED", "ORDERED", "READY", "CANCELLED"]);
 const materialMovementTypes = new Set(["RECEIPT", "CONSUMPTION", "RETURN", "ADJUSTMENT_IN", "ADJUSTMENT_OUT"]);
 const materialMovementStatuses = new Set(["RECORDED", "APPROVED", "CANCELLED"]);
+const qualityIncidentStatuses = new Set(["OPEN", "IN_REVIEW", "IN_PROGRESS", "WAITING_CUSTOMER", "RESOLVED", "CLOSED", "CANCELLED"]);
+const qualityIncidentSeverities = new Set(["LOW", "NORMAL", "HIGH", "CRITICAL"]);
+const qualityActionStatuses = new Set(["OPEN", "IN_PROGRESS", "COMPLETED", "CANCELLED"]);
 
 function sendJson(response, statusCode, payload) {
     const body = JSON.stringify(payload);
@@ -167,11 +222,25 @@ function sendJson(response, statusCode, payload) {
     response.end(body);
 }
 
+function applySecurityHeaders(response) {
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+    response.setHeader("X-Frame-Options", "DENY");
+    response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+    response.setHeader("Permissions-Policy", "camera=(), geolocation=(), microphone=()");
+    if (IS_PRODUCTION) {
+        response.setHeader("Content-Security-Policy", PRODUCTION_CSP);
+        if (ENABLE_HSTS) response.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    }
+}
+
 function isSameOriginRequest(request) {
     const origin = request.headers.origin;
     const host = String(request.headers.host || "").toLowerCase();
     if (!origin || !host) return false;
     try {
+        if (IS_PRODUCTION) return TRUSTED_ORIGINS.has(new URL(origin).origin);
         return new URL(origin).host.toLowerCase() === host;
     } catch {
         return false;
@@ -1057,6 +1126,115 @@ function reportComparisonTree(current, previous) {
     if (current && previous && typeof current === "object" && typeof previous === "object" && !Array.isArray(current) && !Array.isArray(previous)) return Object.fromEntries(Object.keys(current).filter(key => Object.prototype.hasOwnProperty.call(previous, key)).map(key => [key, reportComparisonTree(current[key], previous[key])]));
     return { current, previous, difference: null, percent: null };
 }
+async function handleAdminPerformanceReportFilters(response, type, range, options, filters, searchParams) {
+    const { serviceType, customerId, employeeId } = filters;
+    if (employeeId && ["services", "receivables", "recurring"].includes(type)) return sendJson(response, 400, { message: "Mitarbeiterfilter wird fuer diesen Bericht nicht unterstuetzt." });
+    const [customerRows, employeeRows] = await Promise.all([
+        customerId ? adminPool.execute("SELECT id FROM customers WHERE id=?", [customerId]) : Promise.resolve([[]]),
+        employeeId ? adminPool.execute("SELECT id FROM employees WHERE id=?", [employeeId]) : Promise.resolve([[]])
+    ]);
+    if (customerId && !customerRows[0][0]) return sendJson(response, 404, { message: "Kunde nicht gefunden." });
+    if (employeeId && !employeeRows[0][0]) return sendJson(response, 404, { message: "Mitarbeiter nicht gefunden." });
+
+    const orderClauses = ["DATE(o.created_at) BETWEEN ? AND ?"], orderValues = [range.from, range.to];
+    if (serviceType) { orderClauses.push("o.service_type=?"); orderValues.push(serviceType); }
+    if (customerId) { orderClauses.push("o.customer_id=?"); orderValues.push(customerId); }
+    if (employeeId) {
+        // EXISTS is deliberately used instead of joining assignments: one order stays one order.
+        orderClauses.push("(EXISTS (SELECT 1 FROM order_assignments oa_filter WHERE oa_filter.order_id=o.id AND oa_filter.employee_id=?) OR EXISTS (SELECT 1 FROM employee_work_logs wl_filter WHERE wl_filter.order_id=o.id AND wl_filter.employee_id=?))");
+        orderValues.push(employeeId, employeeId);
+    }
+    const orderWhere = orderClauses.join(" AND ");
+
+    if (type === "operations") {
+        const assignmentClauses = ["a.assignment_date BETWEEN ? AND ?", "a.status<>'STORNIERT'"], assignmentValues = [range.from, range.to];
+        const workLogClauses = ["w.work_date BETWEEN ? AND ?", "w.end_time>w.start_time"], workLogValues = [range.from, range.to];
+        const reportClauses = ["r.service_date BETWEEN ? AND ?"], reportValues = [range.from, range.to];
+        if (serviceType) { assignmentClauses.push("o.service_type=?"); assignmentValues.push(serviceType); workLogClauses.push("o.service_type=?"); workLogValues.push(serviceType); reportClauses.push("o.service_type=?"); reportValues.push(serviceType); }
+        if (customerId) { assignmentClauses.push("o.customer_id=?"); assignmentValues.push(customerId); workLogClauses.push("o.customer_id=?"); workLogValues.push(customerId); reportClauses.push("o.customer_id=?"); reportValues.push(customerId); }
+        if (employeeId) { assignmentClauses.push("a.employee_id=?"); assignmentValues.push(employeeId); workLogClauses.push("w.employee_id=?"); workLogValues.push(employeeId); reportClauses.push("r.employee_id=?"); reportValues.push(employeeId); }
+        const [[orders], [planned], [actual], [reports]] = await Promise.all([
+            adminPool.execute(`SELECT COUNT(*) total,SUM(o.status='ERLEDIGT') completed,SUM(o.status='STORNIERT') cancelled FROM orders o WHERE ${orderWhere}`, orderValues),
+            adminPool.execute(`SELECT COALESCE(SUM(TIME_TO_SEC(TIMEDIFF(a.end_time,a.start_time))/3600),0) hours,COUNT(*) total,SUM(a.status='ERLEDIGT') completed FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE ${assignmentClauses.join(" AND ")}`, assignmentValues),
+            adminPool.execute(`SELECT COALESCE(SUM(GREATEST(0,(TIME_TO_SEC(w.end_time)-TIME_TO_SEC(w.start_time))/3600-(w.break_minutes/60))),0) hours FROM employee_work_logs w JOIN orders o ON o.id=w.order_id WHERE ${workLogClauses.join(" AND ")}`, workLogValues),
+            adminPool.execute(`SELECT COUNT(*) total,SUM(r.status IN ('SUBMITTED','REVIEWED','SHARED','CUSTOMER_CONFIRMED')) completed FROM service_reports r JOIN orders o ON o.id=r.order_id WHERE ${reportClauses.join(" AND ")}`, reportValues)
+        ]);
+        const total = reportNumber(orders.total);
+        return sendJson(response, 200, { success:true, data:{ planned_hours:reportNumber(planned.hours), actual_hours:reportNumber(actual.hours), order_count:total, completion_rate:total ? reportNumber(orders.completed)*100/total : 0, cancellation_rate:total ? reportNumber(orders.cancelled)*100/total : 0, assignment_count:reportNumber(planned.total), assignment_completion_rate:reportNumber(planned.total) ? reportNumber(planned.completed)*100/reportNumber(planned.total) : 0, service_report_completion_rate:reportNumber(reports.total) ? reportNumber(reports.completed)*100/reportNumber(reports.total) : 0 }, meta:{period:range.period,from:range.from,to:range.to,compare:options.compare} });
+    }
+    if (type === "services") {
+        const clauses = ["DATE(o.created_at) BETWEEN ? AND ?"], values = [range.from, range.to];
+        if (serviceType) { clauses.push("o.service_type=?"); values.push(serviceType); }
+        if (customerId) { clauses.push("o.customer_id=?"); values.push(customerId); }
+        const [rows] = await adminPool.execute(`SELECT o.service_type,COUNT(*) order_count,SUM(o.status='ERLEDIGT') completed_orders,SUM(o.status='STORNIERT') cancelled_orders,COALESCE(SUM(o.price_gross_snapshot),0) revenue,COALESCE(SUM((SELECT SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)) FROM material_stock_movements sm WHERE sm.order_id=o.id AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION')),0) material_cost FROM orders o WHERE ${clauses.join(" AND ")} GROUP BY o.service_type ORDER BY revenue DESC,o.service_type`, values);
+        return sendJson(response,200,{success:true,data:{items:rows.map(row=>({...row,contribution_before_personnel_costs:reportNumber(row.revenue)-reportNumber(row.material_cost)}))},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}});
+    }
+    if (type === "orders") {
+        const page=Number(searchParams.get("page")||1), pageSize=Number(searchParams.get("page_size")||25);
+        if(!Number.isInteger(page)||page<1||!Number.isInteger(pageSize)||pageSize<1||pageSize>100) return sendJson(response,400,{message:"Ungueltige Seitennavigation."});
+        const search=String(searchParams.get("search")||"").trim(); if(search.length>80)return sendJson(response,400,{message:"Ungueltige Suche."});
+        const searchClause=search?" AND (o.order_number LIKE ? OR o.title LIKE ?)":"", searchValues=search?[`%${search}%`,`%${search}%`]:[];
+        const [[count],[rows]]=await Promise.all([
+            adminPool.execute(`SELECT COUNT(*) total FROM orders o WHERE ${orderWhere}${searchClause}`,[...orderValues,...searchValues]),
+            adminPool.execute(`SELECT o.order_number,o.service_type,o.status,o.price_gross_snapshot,CONCAT(c.first_name,' ',c.last_name) customer_name,COALESCE((SELECT SUM(TIME_TO_SEC(TIMEDIFF(a.end_time,a.start_time))/3600) FROM order_assignments a WHERE a.order_id=o.id AND a.status<>'STORNIERT'),0) planned_hours,COALESCE((SELECT SUM(GREATEST(0,(TIME_TO_SEC(w.end_time)-TIME_TO_SEC(w.start_time))/3600-(w.break_minutes/60))) FROM employee_work_logs w WHERE w.order_id=o.id AND w.end_time>w.start_time),0) actual_hours,COALESCE((SELECT SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)) FROM material_stock_movements sm WHERE sm.order_id=o.id AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION'),0) material_cost FROM orders o JOIN customers c ON c.id=o.customer_id WHERE ${orderWhere}${searchClause} ORDER BY o.created_at DESC LIMIT ? OFFSET ?`,[...orderValues,...searchValues,pageSize,(page-1)*pageSize])
+        ]);
+        return sendJson(response,200,{success:true,data:{items:rows.map(row=>({...row,contribution_before_personnel_costs:reportNumber(row.price_gross_snapshot)-reportNumber(row.material_cost)})),page,page_size:pageSize,total:reportNumber(count.total),total_pages:Math.max(1,Math.ceil(reportNumber(count.total)/pageSize))},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}});
+    }
+    if (type === "receivables") {
+        const clauses=["i.invoice_date BETWEEN ? AND ?", "i.status NOT IN ('ENTWURF','STORNIERT')"], values=[range.from,range.to];
+        if(customerId){clauses.push("i.customer_id=?");values.push(customerId);} if(serviceType){clauses.push("o.service_type=?");values.push(serviceType);}
+        const [rows]=await adminPool.execute(`SELECT i.gross_amount,i.due_date,COALESCE(SUM(p.amount),0) paid FROM invoices i LEFT JOIN orders o ON o.id=i.order_id LEFT JOIN invoice_payments p ON p.invoice_id=i.id WHERE ${clauses.join(" AND ")} GROUP BY i.id,i.gross_amount,i.due_date`,values);
+        const buckets={current:0,days_1_30:0,days_31_60:0,days_61_90:0,days_90_plus:0};let overdue_invoice_count=0,overdue_invoice_amount=0,open_balance=0;
+        rows.forEach(row=>{const open=Math.max(0,reportNumber(row.gross_amount)-reportNumber(row.paid));if(!open)return;open_balance+=open;const days=Math.max(0,Math.floor((new Date(`${reportBerlinDate()}T12:00:00Z`)-new Date(`${String(row.due_date).slice(0,10)}T12:00:00Z`))/86400000));if(days===0)buckets.current+=open;else if(days<=30)buckets.days_1_30+=open;else if(days<=60)buckets.days_31_60+=open;else if(days<=90)buckets.days_61_90+=open;else buckets.days_90_plus+=open;if(days>0){overdue_invoice_count++;overdue_invoice_amount+=open;}});
+        return sendJson(response,200,{success:true,data:{buckets,overdue_invoice_count,overdue_invoice_amount,open_balance},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}});
+    }
+    if (type === "recurring") {
+        const contractClauses=["c.interval_type<>'EINMALIG'","c.status='AKTIV'","c.start_date<=?","(c.end_date IS NULL OR c.end_date>=?)"], contractValues=[range.to,range.from];
+        const logClauses=["al.execution_date BETWEEN ? AND ?"], logValues=[range.from,range.to];
+        if(customerId){contractClauses.push("c.customer_id=?");contractValues.push(customerId);logClauses.push("c.customer_id=?");logValues.push(customerId);} if(serviceType){contractClauses.push("c.service_type=?");contractValues.push(serviceType);logClauses.push("c.service_type=?");logValues.push(serviceType);}
+        const [[contracts],[logs]]=await Promise.all([
+            adminPool.execute(`SELECT COUNT(*) total FROM contracts c WHERE ${contractClauses.join(" AND ")}`,contractValues),
+            adminPool.execute(`SELECT COUNT(*) total,SUM(al.result='SUCCESS') successful,SUM(al.action LIKE '%DUPLICATE%') duplicates,SUM(al.result IN ('FAILED','NO_AVAILABILITY')) errors FROM automation_logs al JOIN contracts c ON c.id=al.contract_id WHERE ${logClauses.join(" AND ")}`,logValues)
+        ]);
+        return sendJson(response,200,{success:true,data:{recurring_contracts:reportNumber(contracts.total),generated_orders:reportNumber(logs.total),successful_generation:reportNumber(logs.successful),duplicate_outcomes:reportNumber(logs.duplicates),error_outcomes:reportNumber(logs.errors)},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}});
+    }
+    return sendJson(response,404,{message:"Leistungsanalyse nicht gefunden."});
+}
+
+async function handleAdminActionCenter(request, response, searchParams) {
+    if (!adminPool) return sendJson(response, 503, { message: "Aktionscenter ist derzeit nicht verfuegbar." });
+    if (request.method !== "GET") return sendJson(response, 405, { message: "Methode nicht erlaubt." });
+    const priority = String(searchParams.get("priority") || "").trim();
+    const area = String(searchParams.get("area") || "").trim();
+    const page = Number(searchParams.get("page") || 1), pageSize = Number(searchParams.get("page_size") || 20);
+    const priorities = new Set(["critical", "high", "normal"]), areas = new Set(["orders", "invoices", "service_reports", "materials", "automation", "notifications", "quality"]);
+    if ((priority && !priorities.has(priority)) || (area && !areas.has(area)) || !Number.isInteger(page) || page < 1 || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 50) return sendJson(response, 400, { message: "Ungueltige Aktionscenter-Filter." });
+    try {
+        const [unassigned, overdue, missingReports, lowStock, automationFailures, unreadNotifications, qualityAlerts] = await Promise.all([
+            adminPool.execute("SELECT o.id,o.order_number,o.title,o.preferred_date FROM orders o WHERE o.status IN ('NEU','GEPLANT','ZUGEWIESEN') AND NOT EXISTS (SELECT 1 FROM order_assignments a WHERE a.order_id=o.id AND a.status<>'STORNIERT') ORDER BY o.preferred_date IS NULL,o.preferred_date,o.id DESC LIMIT 100"),
+            adminPool.execute("SELECT i.id,i.invoice_number,i.due_date,GREATEST(0,i.gross_amount-COALESCE((SELECT SUM(p.amount) FROM invoice_payments p WHERE p.invoice_id=i.id),0)) open_amount FROM invoices i WHERE i.status NOT IN ('ENTWURF','STORNIERT','BEZAHLT') AND i.due_date<? AND i.gross_amount>COALESCE((SELECT SUM(p.amount) FROM invoice_payments p WHERE p.invoice_id=i.id),0) ORDER BY i.due_date ASC LIMIT 100", [reportBerlinDate()]),
+            adminPool.execute("SELECT a.id,a.order_id,o.order_number,a.assignment_date FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE a.status='ERLEDIGT' AND a.assignment_date<=? AND NOT EXISTS (SELECT 1 FROM service_reports r WHERE r.assignment_id=a.id AND r.status IN ('SUBMITTED','REVIEWED','SHARED','CUSTOMER_CONFIRMED')) ORDER BY a.assignment_date ASC LIMIT 100", [reportBerlinDate()]),
+            adminPool.execute(`SELECT m.id,m.material_number,m.name,m.minimum_stock,${materialBalanceSql} AS current_stock FROM materials m LEFT JOIN material_stock_movements sm ON sm.material_id=m.id WHERE m.status='ACTIVE' GROUP BY m.id,m.material_number,m.name,m.minimum_stock HAVING current_stock<=m.minimum_stock ORDER BY (current_stock-m.minimum_stock) ASC,m.id ASC LIMIT 100`),
+            adminPool.execute("SELECT id,contract_id,generated_order_id,action,result,created_at FROM automation_logs WHERE result IN ('FAILED','NO_AVAILABILITY') ORDER BY created_at DESC,id DESC LIMIT 100"),
+            adminPool.execute("SELECT id,notification_type,title,body,entity_type,entity_id,created_at FROM notifications WHERE recipient_type='ADMIN' AND read_at IS NULL ORDER BY created_at DESC,id DESC LIMIT 100"),
+            adminPool.execute("SELECT id,incident_number,title,severity,status,due_date,'INCIDENT' kind FROM quality_incidents WHERE status NOT IN ('RESOLVED','CLOSED','CANCELLED') AND (severity='CRITICAL' OR (due_date IS NOT NULL AND due_date<CURDATE())) UNION ALL SELECT a.id,qi.incident_number,a.title,qi.severity,a.status,a.due_date,'ACTION' kind FROM quality_corrective_actions a JOIN quality_incidents qi ON qi.id=a.incident_id WHERE qi.status NOT IN ('RESOLVED','CLOSED','CANCELLED') AND a.status NOT IN ('COMPLETED','CANCELLED') AND a.due_date IS NOT NULL AND a.due_date<CURDATE() ORDER BY due_date ASC LIMIT 100")
+        ]);
+        const items = [
+            ...unassigned[0].map(row => ({ priority:"high",area:"orders",title:"Auftrag ohne Einsatzplanung",description:`${row.order_number}${row.title ? ` · ${row.title}` : ""}`,date:row.preferred_date,entity_type:"ORDER",entity_id:row.id,target:"order" })),
+            ...overdue[0].map(row => ({ priority:"critical",area:"invoices",title:"Rechnung ueberfaellig",description:`${row.invoice_number} · offen ${reportNumber(row.open_amount)} EUR`,date:row.due_date,entity_type:"INVOICE",entity_id:row.id,target:"invoice" })),
+            ...missingReports[0].map(row => ({ priority:"high",area:"service_reports",title:"Leistungsnachweis fehlt",description:`${row.order_number} · Einsatz ${String(row.assignment_date).slice(0,10)}`,date:row.assignment_date,entity_type:"ORDER",entity_id:row.order_id,target:"service-report" })),
+            ...lowStock[0].map(row => ({ priority:"high",area:"materials",title:"Mindestbestand erreicht",description:`${row.material_number} · ${row.name} (${row.current_stock}/${row.minimum_stock})`,date:null,entity_type:"MATERIAL",entity_id:row.id,target:"materials" })),
+            ...automationFailures[0].map(row => ({ priority:"normal",area:"automation",title:"Automatisierung pruefen",description:`${row.action} · ${row.result}`,date:row.created_at,entity_type:"AUTOMATION_LOG",entity_id:row.id,target:"recurring" })),
+            ...unreadNotifications[0].map(row => ({ priority:"normal",area:"notifications",title:row.title,description:row.body || row.notification_type,date:row.created_at,entity_type:row.entity_type || "NOTIFICATION",entity_id:row.entity_id || row.id,target:"notification" })),
+            ...qualityAlerts[0].map(row => ({ priority:row.severity === "CRITICAL" ? "critical" : "high",area:"quality",title:row.kind === "ACTION" ? "Korrekturmaßnahme überfällig" : "Qualitätsmeldung prüfen",description:`${row.incident_number} · ${row.title}`,date:row.due_date,entity_type:row.kind === "ACTION" ? "QUALITY_CORRECTIVE_ACTION" : "QUALITY_INCIDENT",entity_id:row.id,target:"quality" }))
+        ];
+        const rank = { critical:0, high:1, normal:2 };
+        const filtered = items.filter(item => (!priority || item.priority === priority) && (!area || item.area === area)).sort((a,b) => rank[a.priority]-rank[b.priority] || String(a.date || "9999-12-31").localeCompare(String(b.date || "9999-12-31")) || a.title.localeCompare(b.title,"de"));
+        const summary = { critical:items.filter(item=>item.priority==="critical").length, high:items.filter(item=>item.priority==="high").length, normal:items.filter(item=>item.priority==="normal").length, orders:unassigned[0].length, invoices:overdue[0].length, service_reports:missingReports[0].length, materials:lowStock[0].length, automation:automationFailures[0].length, notifications:unreadNotifications[0].length, quality:qualityAlerts[0].length };
+        return sendJson(response, 200, { success:true, summary, items:filtered.slice((page-1)*pageSize,page*pageSize), total:filtered.length, page, pageSize, totalPages:Math.max(1,Math.ceil(filtered.length/pageSize)) });
+    } catch (error) { console.error("[action-center] failed:", error.code || "database_error", error.message || ""); return sendJson(response, 503, { message: "Aktionscenter konnte nicht geladen werden." }); }
+}
+
 async function handleAdminPerformanceReports(request, response, pathname, searchParams) {
     // Phase 16.6: filters are built as SQL predicates.  EXISTS prevents a
     // multi-employee assignment from multiplying an order's financial values.
@@ -1072,6 +1250,16 @@ async function handleAdminPerformanceReports(request, response, pathname, search
     if (request.method !== "GET") return sendJson(response, 405, { message: "Methode nicht erlaubt." });
     const options = normalizeReportRequest(searchParams); if (options.error) return sendJson(response, 400, { message: options.error });
     const range = options.range, type = pathname.split("/").pop();
+    // Filtered reports use the SQL builder above. It applies predicates before
+    // aggregation, counting and pagination; the legacy path remains unchanged
+    // for an unfiltered request.
+    if (rawService || (rawCustomer !== null && rawCustomer !== "") || (rawEmployee !== null && rawEmployee !== "")) {
+        return handleAdminPerformanceReportFilters(response, type, range, options, {
+            serviceType: rawService,
+            customerId: rawCustomer ? positiveId(rawCustomer) : null,
+            employeeId: rawEmployee ? positiveId(rawEmployee) : null
+        }, searchParams);
+    }
     try {
         if (type === "operations") {
             const [[orders], [planned], [actual], [reports]] = await Promise.all([
@@ -1084,7 +1272,7 @@ async function handleAdminPerformanceReports(request, response, pathname, search
         if (type === "services") { const [rows] = await adminPool.execute("SELECT o.service_type,COUNT(*) order_count,SUM(o.status='ERLEDIGT') completed_orders,SUM(o.status='STORNIERT') cancelled_orders,COALESCE(SUM(o.price_gross_snapshot),0) revenue,COALESCE(SUM((SELECT SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)) FROM material_stock_movements sm WHERE sm.order_id=o.id AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION')),0) material_cost FROM orders o WHERE DATE(o.created_at) BETWEEN ? AND ? GROUP BY o.service_type ORDER BY revenue DESC,o.service_type", [range.from,range.to]); return sendJson(response,200,{success:true,data:{items:rows.map(row=>({...row,contribution_before_personnel_costs:reportNumber(row.revenue)-reportNumber(row.material_cost)}))},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
         if (type === "orders") { const page=Number(searchParams.get("page")||1),pageSize=Number(searchParams.get("page_size")||25); if(!Number.isInteger(page)||page<1||!Number.isInteger(pageSize)||pageSize<1||pageSize>100)return sendJson(response,400,{message:"Ungültige Seitennavigation."}); const search=String(searchParams.get("search")||"").trim(); if(search.length>80)return sendJson(response,400,{message:"Ungültige Suche."}); const query=search?" AND (o.order_number LIKE ? OR o.title LIKE ?)":"",values=search?[`%${search}%`,`%${search}%`]:[]; const [[count],[rows]]=await Promise.all([adminPool.execute(`SELECT COUNT(*) total FROM orders o WHERE DATE(o.created_at) BETWEEN ? AND ?${query}`,[range.from,range.to,...values]),adminPool.execute(`SELECT o.order_number,o.service_type,o.status,o.price_gross_snapshot,CONCAT(c.first_name,' ',c.last_name) customer_name,COALESCE((SELECT SUM(TIME_TO_SEC(TIMEDIFF(a.end_time,a.start_time))/3600) FROM order_assignments a WHERE a.order_id=o.id AND a.status<>'STORNIERT'),0) planned_hours,COALESCE((SELECT SUM(GREATEST(0,(TIME_TO_SEC(w.end_time)-TIME_TO_SEC(w.start_time))/3600-(w.break_minutes/60))) FROM employee_work_logs w WHERE w.order_id=o.id AND w.end_time>w.start_time),0) actual_hours,COALESCE((SELECT SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)) FROM material_stock_movements sm WHERE sm.order_id=o.id AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION'),0) material_cost FROM orders o JOIN customers c ON c.id=o.customer_id WHERE DATE(o.created_at) BETWEEN ? AND ?${query} ORDER BY o.created_at DESC LIMIT ? OFFSET ?`,[range.from,range.to,...values,pageSize,(page-1)*pageSize])]); return sendJson(response,200,{success:true,data:{items:rows.map(row=>({...row,contribution_before_personnel_costs:reportNumber(row.price_gross_snapshot)-reportNumber(row.material_cost)})),page,page_size:pageSize,total:reportNumber(count.total),total_pages:Math.max(1,Math.ceil(reportNumber(count.total)/pageSize))},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
         if (type === "receivables") { const [rows]=await adminPool.execute("SELECT i.gross_amount,i.due_date,COALESCE(SUM(p.amount),0) paid FROM invoices i LEFT JOIN invoice_payments p ON p.invoice_id=i.id WHERE i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT') GROUP BY i.id,i.gross_amount,i.due_date",[range.from,range.to]);const buckets={current:0,days_1_30:0,days_31_60:0,days_61_90:0,days_90_plus:0};let overdue_invoice_count=0,overdue_invoice_amount=0,open_balance=0;rows.forEach(row=>{const open=Math.max(0,reportNumber(row.gross_amount)-reportNumber(row.paid));if(!open)return;open_balance+=open;const days=Math.max(0,Math.floor((new Date(`${reportBerlinDate()}T12:00:00Z`)-new Date(`${String(row.due_date).slice(0,10)}T12:00:00Z`))/86400000));if(days===0)buckets.current+=open;else if(days<=30)buckets.days_1_30+=open;else if(days<=60)buckets.days_31_60+=open;else if(days<=90)buckets.days_61_90+=open;else buckets.days_90_plus+=open;if(days>0){overdue_invoice_count++;overdue_invoice_amount+=open;}});return sendJson(response,200,{success:true,data:{buckets,overdue_invoice_count,overdue_invoice_amount,open_balance},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
-        if (type === "recurring") { const [[contracts],[logs]]=await Promise.all([adminPool.execute("SELECT COUNT(*) total FROM contracts WHERE interval_type<>'EINMALIG' AND status='AKTIV' AND start_date<=? AND (end_date IS NULL OR end_date>=?)",[range.to,range.from]),adminPool.execute("SELECT COUNT(*) total,SUM(status IN ('SUCCESS','CREATED','GENERATED')) successful,SUM(status LIKE '%DUPLICATE%') duplicates,SUM(status IN ('ERROR','FAILED')) errors FROM automation_logs WHERE DATE(created_at) BETWEEN ? AND ?",[range.from,range.to])]);return sendJson(response,200,{success:true,data:{recurring_contracts:reportNumber(contracts.total),generated_orders:reportNumber(logs.total),successful_generation:reportNumber(logs.successful),duplicate_outcomes:reportNumber(logs.duplicates),error_outcomes:reportNumber(logs.errors)},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
+        if (type === "recurring") { const [[contracts],[logs]]=await Promise.all([adminPool.execute("SELECT COUNT(*) total FROM contracts WHERE interval_type<>'EINMALIG' AND status='AKTIV' AND start_date<=? AND (end_date IS NULL OR end_date>=?)",[range.to,range.from]),adminPool.execute("SELECT COUNT(*) total,SUM(result='SUCCESS') successful,SUM(action LIKE '%DUPLICATE%') duplicates,SUM(result IN ('FAILED','NO_AVAILABILITY')) errors FROM automation_logs WHERE execution_date BETWEEN ? AND ?",[range.from,range.to])]);return sendJson(response,200,{success:true,data:{recurring_contracts:reportNumber(contracts.total),generated_orders:reportNumber(logs.total),successful_generation:reportNumber(logs.successful),duplicate_outcomes:reportNumber(logs.duplicates),error_outcomes:reportNumber(logs.errors)},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
         return sendJson(response,404,{message:"Leistungsanalyse nicht gefunden."});
     } catch(error){console.error("[performance-report] failed:",error.code||"database_error");return sendJson(response,503,{message:"Leistungsanalyse konnte nicht geladen werden."});}
 }
@@ -2269,6 +2457,52 @@ async function handleAdminServiceReports(request, response, pathname, searchPara
     } catch (error) { await connection.rollback(); console.error("[service-reports admin] failed:",error.code || "database_error"); return sendJson(response,error.code === "ER_SIGNAL_EXCEPTION" ? 400 : 503,{message:error.code === "ER_SIGNAL_EXCEPTION" ? "Ungültige Leistungsbeziehung." : "Leistungsnachweis konnte nicht gespeichert werden."}); } finally { connection.release(); }
 }
 
+const qualityIncidentFields = `qi.*,c.customer_number,c.first_name AS customer_first_name,c.last_name AS customer_last_name,o.order_number,o.title AS order_title,e.employee_number,e.first_name AS assigned_employee_first_name,e.last_name AS assigned_employee_last_name`;
+const qualityIncidentJoin = ` FROM quality_incidents qi JOIN customers c ON c.id=qi.customer_id LEFT JOIN orders o ON o.id=qi.order_id LEFT JOIN employees e ON e.id=qi.assigned_employee_id`;
+
+function qualityPage(searchParams) { const page=Number(searchParams.get("page")||1),pageSize=Number(searchParams.get("page_size")||searchParams.get("pageSize")||25); return Number.isInteger(page)&&page>0&&Number.isInteger(pageSize)&&pageSize>0&&pageSize<=100?{page,pageSize,offset:(page-1)*pageSize}:null; }
+function qualityTransition(from,to) { return ({OPEN:["IN_REVIEW","IN_PROGRESS","CANCELLED"],IN_REVIEW:["IN_PROGRESS","WAITING_CUSTOMER","CANCELLED"],IN_PROGRESS:["WAITING_CUSTOMER","RESOLVED","CANCELLED"],WAITING_CUSTOMER:["IN_PROGRESS","RESOLVED","CANCELLED"],RESOLVED:["IN_PROGRESS","CLOSED"],CLOSED:[],CANCELLED:[]}[from]||[]).includes(to); }
+function qualityIncidentData(body) {
+    const customerId=positiveId(body.customer_id), optionalId=name=>body[name]==null||body[name]===""?null:positiveId(body[name]);
+    const orderId=optionalId("order_id"),assignmentId=optionalId("assignment_id"),serviceReportId=optionalId("service_report_id"),assignedEmployeeId=optionalId("assigned_employee_id"),category=readText(body.category,80),severity=readText(body.severity||"NORMAL",20),title=readText(body.title,180),description=readText(body.description,8000,{multiline:true}),internalNotes=readText(body.internal_notes,8000,{optional:true,multiline:true}),rootCause=readText(body.root_cause,8000,{optional:true,multiline:true}),dueDate=body.due_date==null||body.due_date===""?null:readText(body.due_date,10);
+    if(!customerId||(body.order_id!=null&&body.order_id!==""&&!orderId)||(body.assignment_id!=null&&body.assignment_id!==""&&!assignmentId)||(body.service_report_id!=null&&body.service_report_id!==""&&!serviceReportId)||(body.assigned_employee_id!=null&&body.assigned_employee_id!==""&&!assignedEmployeeId)||!category||!qualityIncidentSeverities.has(severity)||!title||!description||internalNotes===null||rootCause===null||(dueDate&&!isIsoDate(dueDate)))return null;
+    return {customerId,orderId,assignmentId,serviceReportId,assignedEmployeeId,category,severity,title,description,internalNotes:internalNotes||null,rootCause:rootCause||null,dueDate};
+}
+function qualityActionData(body,{allowCompleted=false}={}) { const assignedEmployeeId=body.assigned_employee_id==null||body.assigned_employee_id===""?null:positiveId(body.assigned_employee_id),title=readText(body.title,180),description=readText(body.description,8000,{optional:true,multiline:true}),dueDate=body.due_date==null||body.due_date===""?null:readText(body.due_date,10),status=readText(body.status||"OPEN",20); if((body.assigned_employee_id!=null&&body.assigned_employee_id!==""&&!assignedEmployeeId)||!title||description===null||(dueDate&&!isIsoDate(dueDate))||!qualityActionStatuses.has(status)||(!allowCompleted&&status!=="OPEN"))return null;return {assignedEmployeeId,title,description:description||null,dueDate,status}; }
+async function qualityRelations(connection,data) {
+    const [[customer]]=await connection.execute("SELECT id FROM customers WHERE id=?",[data.customerId]);if(!customer)return {error:"Kunde nicht gefunden.",status:404};
+    let order=null;if(data.orderId){const [[row]]=await connection.execute("SELECT id,customer_id FROM orders WHERE id=?",[data.orderId]);if(!row||Number(row.customer_id)!==data.customerId)return {error:"Der Auftrag gehört nicht zu diesem Kunden.",status:400};order=row;}
+    if(data.assignmentId){if(!order)return {error:"Ein Einsatz benötigt einen Auftrag.",status:400};const [[row]]=await connection.execute("SELECT order_id,employee_id FROM order_assignments WHERE id=? AND status<>'STORNIERT'",[data.assignmentId]);if(!row||Number(row.order_id)!==Number(order.id)||(data.assignedEmployeeId&&Number(row.employee_id)!==data.assignedEmployeeId))return {error:"Einsatz und Auftrag passen nicht zusammen.",status:400};}
+    if(data.serviceReportId){if(!order)return {error:"Ein Leistungsnachweis benötigt einen Auftrag.",status:400};const [[row]]=await connection.execute("SELECT order_id,assignment_id,customer_id FROM service_reports WHERE id=?",[data.serviceReportId]);if(!row||Number(row.order_id)!==Number(order.id)||Number(row.customer_id)!==data.customerId||(data.assignmentId&&Number(row.assignment_id)!==data.assignmentId))return {error:"Leistungsnachweis passt nicht zur Qualitätsmeldung.",status:400};}
+    if(data.assignedEmployeeId){const [[employee]]=await connection.execute("SELECT id FROM employees WHERE id=? AND status='ACTIVE'",[data.assignedEmployeeId]);if(!employee)return {error:"Aktiver Mitarbeiter nicht gefunden.",status:404};}return {};
+}
+async function qualityForAdmin(connection,id) { const [rows]=await connection.execute(`SELECT ${qualityIncidentFields}${qualityIncidentJoin} WHERE qi.id=?`,[id]);if(!rows[0])return null;const incident=rows[0];const[actions]=await connection.execute("SELECT a.*,e.employee_number,e.first_name,e.last_name FROM quality_corrective_actions a LEFT JOIN employees e ON e.id=a.assigned_employee_id WHERE a.incident_id=? ORDER BY a.due_date IS NULL,a.due_date,a.id",[id]);return {...incident,actions}; }
+async function qualityIncompleteActions(connection,id) { const [[row]]=await connection.execute("SELECT COUNT(*) total FROM quality_corrective_actions WHERE incident_id=? AND status NOT IN ('COMPLETED','CANCELLED')",[id]);return Number(row.total)>0; }
+async function createQualityNumber(connection,id) { const number=`QI-${new Date().getFullYear()}-${String(id).padStart(6,"0")}`;await connection.execute("UPDATE quality_incidents SET incident_number=? WHERE id=?",[number,id]);return number; }
+
+async function handleAdminQualityIncidents(request,response,pathname,searchParams) {
+    const match=pathname.match(/^\/api\/admin\/quality-incidents(?:\/(\d+)(?:\/(actions)(?:\/(\d+))?|\/(resolve|close))?)?$/),id=match?.[1]?positiveId(match[1]):null,actionResource=match?.[2]||null,actionId=match?.[3]?positiveId(match[3]):null,workflow=match?.[4]||null;
+    if(!adminPool)return sendJson(response,503,{message:"Die Datenbankrechte für Qualitätsmeldungen sind nicht eingerichtet."});
+    if(!id&&request.method==="GET"){
+        const page=qualityPage(searchParams),status=String(searchParams.get("status")||""),severity=String(searchParams.get("severity")||""),customerId=searchParams.get("customer_id")?positiveId(searchParams.get("customer_id")):null,employeeId=searchParams.get("employee_id")?positiveId(searchParams.get("employee_id")):null,orderId=searchParams.get("order_id")?positiveId(searchParams.get("order_id")):null,from=String(searchParams.get("from")||""),to=String(searchParams.get("to")||""),search=readText(searchParams.get("search")||"",100,{optional:true});
+        if(!page||(status&&!qualityIncidentStatuses.has(status))||(severity&&!qualityIncidentSeverities.has(severity))||(searchParams.get("customer_id")&&!customerId)||(searchParams.get("employee_id")&&!employeeId)||(searchParams.get("order_id")&&!orderId)||(from&&!isIsoDate(from))||(to&&!isIsoDate(to))||(from&&to&&from>to)||search===null)return sendJson(response,400,{message:"Ungültige Qualitätsfilter."});
+        const where=[],values=[];for(const [field,value] of [["qi.status",status],["qi.severity",severity],["qi.customer_id",customerId],["qi.assigned_employee_id",employeeId],["qi.order_id",orderId]])if(value){where.push(`${field}=?`);values.push(value)}if(from){where.push("DATE(qi.created_at)>=?");values.push(from)}if(to){where.push("DATE(qi.created_at)<=?");values.push(to)}if(search){where.push("(qi.incident_number LIKE ? OR qi.title LIKE ? OR qi.category LIKE ? OR c.customer_number LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ?)");for(let n=0;n<6;n++)values.push(`%${search}%`)}const clause=where.length?` WHERE ${where.join(" AND ")}`:"";
+        const [[countRows],[rows]]=await Promise.all([adminPool.execute(`SELECT COUNT(*) total${qualityIncidentJoin}${clause}`,values),adminPool.execute(`SELECT ${qualityIncidentFields}${qualityIncidentJoin}${clause} ORDER BY FIELD(qi.severity,'CRITICAL','HIGH','NORMAL','LOW'),qi.due_date IS NULL,qi.due_date,qi.id DESC LIMIT ? OFFSET ?`,[...values,page.pageSize,page.offset])]);return sendJson(response,200,{rows,total:Number(countRows[0].total),page:page.page,pageSize:page.pageSize,totalPages:Math.max(1,Math.ceil(Number(countRows[0].total)/page.pageSize))});
+    }
+    if(id&&!actionResource&&!workflow&&request.method==="GET"){const incident=await qualityForAdmin(adminPool,id);return incident?sendJson(response,200,{incident}):sendJson(response,404,{message:"Qualitätsmeldung nicht gefunden."});}
+    if(!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Qualitätsdaten."})};const c=await adminPool.getConnection();
+    try{await c.beginTransaction();
+        if(!id&&request.method==="POST"){const data=qualityIncidentData(body),invalid=!data;if(invalid){await c.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie die Qualitätsdaten."})}const relation=await qualityRelations(c,data);if(relation.error){await c.rollback();return sendJson(response,relation.status,{message:relation.error})}const[created]=await c.execute("INSERT INTO quality_incidents (incident_number,customer_id,order_id,assignment_id,service_report_id,created_by_type,created_by_id,assigned_employee_id,category,severity,status,title,description,internal_notes,root_cause,due_date) VALUES (?,?,?,?,?,'ADMIN',NULL,?,?,?,'OPEN',?,?,?,?,?)",[crypto.randomUUID(),data.customerId,data.orderId,data.assignmentId,data.serviceReportId,data.assignedEmployeeId,data.category,data.severity,data.title,data.description,data.internalNotes,data.rootCause,data.dueDate]);const number=await createQualityNumber(c,created.insertId);await auditEvent(c,"ADMIN",null,"QUALITY_INCIDENT_CREATED","QUALITY_INCIDENT",created.insertId,{customer_id:data.customerId,order_id:data.orderId,severity:data.severity});if(data.assignedEmployeeId){await auditEvent(c,"ADMIN",null,"QUALITY_INCIDENT_ASSIGNED","QUALITY_INCIDENT",created.insertId,{assigned_employee_id:data.assignedEmployeeId});await notifyEmployee(c,data.assignedEmployeeId,"QUALITY_INCIDENT","Qualitätsmeldung zugewiesen",`Die Qualitätsmeldung ${number} wurde Ihnen zugewiesen.`,"QUALITY_INCIDENT",created.insertId);}await c.commit();return sendJson(response,201,{id:created.insertId,incidentNumber:number,status:"OPEN",message:"Qualitätsmeldung erstellt."});}
+        const incident=await qualityForAdmin(c,id);if(!incident){await c.rollback();return sendJson(response,404,{message:"Qualitätsmeldung nicht gefunden."})}
+        if(!actionResource&&!workflow&&request.method==="PATCH"){if(["RESOLVED","CLOSED"].includes(body.status)){await c.rollback();return sendJson(response,400,{message:"Für Lösung und Abschluss verwenden Sie den vorgesehenen Workflow."})}const data=qualityIncidentData(body);if(!data||["CLOSED","CANCELLED"].includes(incident.status)){await c.rollback();return sendJson(response,data?409:400,{message:data?"Die Qualitätsmeldung kann nicht geändert werden.":"Bitte prüfen Sie die Qualitätsdaten."})}const relation=await qualityRelations(c,data);if(relation.error){await c.rollback();return sendJson(response,relation.status,{message:relation.error})}const next=body.status?readText(body.status,24):incident.status;if(!qualityIncidentStatuses.has(next)||!qualityTransition(incident.status,next)){await c.rollback();return sendJson(response,400,{message:"Ungültiger Statusübergang."})}await c.execute("UPDATE quality_incidents SET customer_id=?,order_id=?,assignment_id=?,service_report_id=?,assigned_employee_id=?,category=?,severity=?,status=?,title=?,description=?,internal_notes=?,root_cause=?,due_date=? WHERE id=?",[data.customerId,data.orderId,data.assignmentId,data.serviceReportId,data.assignedEmployeeId,data.category,data.severity,next,data.title,data.description,data.internalNotes,data.rootCause,data.dueDate,id]);const event=Number(incident.assigned_employee_id)!==Number(data.assignedEmployeeId)?"QUALITY_INCIDENT_ASSIGNED":"QUALITY_INCIDENT_UPDATED";await auditEvent(c,"ADMIN",null,event,"QUALITY_INCIDENT",id,{status:next,assigned_employee_id:data.assignedEmployeeId});if(data.assignedEmployeeId&&Number(incident.assigned_employee_id)!==Number(data.assignedEmployeeId))await notifyEmployee(c,data.assignedEmployeeId,"QUALITY_INCIDENT","Qualitätsmeldung zugewiesen",`Die Qualitätsmeldung ${incident.incident_number} wurde Ihnen zugewiesen.`,"QUALITY_INCIDENT",id);await c.commit();return sendJson(response,200,{id,status:next,message:"Qualitätsmeldung gespeichert."});}
+        if(actionResource&&!actionId&&request.method==="POST"){if(["RESOLVED","CLOSED","CANCELLED"].includes(incident.status)){await c.rollback();return sendJson(response,409,{message:"Für diese Qualitätsmeldung können keine Maßnahmen angelegt werden."})}const data=qualityActionData(body);if(!data){await c.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie die Maßnahmen-Daten."})}if(data.assignedEmployeeId){const[[employee]]=await c.execute("SELECT id FROM employees WHERE id=? AND status='ACTIVE'",[data.assignedEmployeeId]);if(!employee){await c.rollback();return sendJson(response,404,{message:"Aktiver Mitarbeiter nicht gefunden."})}}const[created]=await c.execute("INSERT INTO quality_corrective_actions (incident_id,assigned_employee_id,title,description,due_date,status) VALUES (?,?,?,?,?,?)",[id,data.assignedEmployeeId,data.title,data.description,data.dueDate,data.status]);await auditEvent(c,"ADMIN",null,"QUALITY_ACTION_CREATED","QUALITY_CORRECTIVE_ACTION",created.insertId,{incident_id:id,assigned_employee_id:data.assignedEmployeeId});if(data.assignedEmployeeId)await notifyEmployee(c,data.assignedEmployeeId,"QUALITY_ACTION","Korrekturmaßnahme zugewiesen",`Für ${incident.incident_number} wurde Ihnen eine Maßnahme zugewiesen.`,"QUALITY_CORRECTIVE_ACTION",created.insertId);await c.commit();return sendJson(response,201,{id:created.insertId,message:"Korrekturmaßnahme erstellt."});}
+        if(actionResource&&actionId&&request.method==="PATCH"){const[[action]]=await c.execute("SELECT id,status,assigned_employee_id FROM quality_corrective_actions WHERE id=? AND incident_id=? FOR UPDATE",[actionId,id]);if(!action){await c.rollback();return sendJson(response,404,{message:"Korrekturmaßnahme nicht gefunden."})}const data=qualityActionData(body,{allowCompleted:true});const transition=(action.status==="OPEN"&&["IN_PROGRESS","COMPLETED","CANCELLED"].includes(data?.status))||(action.status==="IN_PROGRESS"&&["COMPLETED","CANCELLED"].includes(data?.status));if(!data||!transition){await c.rollback();return sendJson(response,!data?400:409,{message:!data?"Bitte prüfen Sie die Maßnahmen-Daten.":"Ungültiger Maßnahmenübergang."})}if(data.assignedEmployeeId){const[[employee]]=await c.execute("SELECT id FROM employees WHERE id=? AND status='ACTIVE'",[data.assignedEmployeeId]);if(!employee){await c.rollback();return sendJson(response,404,{message:"Aktiver Mitarbeiter nicht gefunden."})}}await c.execute("UPDATE quality_corrective_actions SET assigned_employee_id=?,title=?,description=?,due_date=?,status=?,completed_at=? WHERE id=?",[data.assignedEmployeeId,data.title,data.description,data.dueDate,data.status,data.status==="COMPLETED"?new Date():null,actionId]);await auditEvent(c,"ADMIN",null,data.status==="COMPLETED"?"QUALITY_ACTION_COMPLETED":"QUALITY_INCIDENT_UPDATED",data.status==="COMPLETED"?"QUALITY_CORRECTIVE_ACTION":"QUALITY_INCIDENT",data.status==="COMPLETED"?actionId:id,{incident_id:id});if(data.assignedEmployeeId&&Number(data.assignedEmployeeId)!==Number(action.assigned_employee_id))await notifyEmployee(c,data.assignedEmployeeId,"QUALITY_ACTION","Korrekturmaßnahme zugewiesen",`Für ${incident.incident_number} wurde Ihnen eine Maßnahme zugewiesen.`,"QUALITY_CORRECTIVE_ACTION",actionId);await c.commit();return sendJson(response,200,{id:actionId,status:data.status,message:"Korrekturmaßnahme gespeichert."});}
+        if(workflow&&request.method==="POST"){const target=workflow==="resolve"?"RESOLVED":"CLOSED";if(!qualityTransition(incident.status,target)){await c.rollback();return sendJson(response,400,{message:"Ungültiger Statusübergang."})}if(await qualityIncompleteActions(c,id)){await c.rollback();return sendJson(response,409,{message:"Offene Korrekturmaßnahmen müssen zuerst abgeschlossen oder storniert werden."})}await c.execute(target==="RESOLVED"?"UPDATE quality_incidents SET status='RESOLVED',resolved_at=NOW() WHERE id=?":"UPDATE quality_incidents SET status='CLOSED',closed_at=NOW() WHERE id=?",[id]);await auditEvent(c,"ADMIN",null,target==="RESOLVED"?"QUALITY_INCIDENT_RESOLVED":"QUALITY_INCIDENT_CLOSED","QUALITY_INCIDENT",id,null);if(target==="RESOLVED")await c.execute("INSERT INTO notifications(recipient_type,recipient_id,notification_type,title,body,entity_type,entity_id) VALUES ('ADMIN',NULL,'QUALITY_INCIDENT',?,?, 'QUALITY_INCIDENT',?)",["Qualitätsmeldung gelöst",`Die Qualitätsmeldung ${incident.incident_number} wurde gelöst.`,id]);await c.commit();return sendJson(response,200,{id,status:target,message:target==="RESOLVED"?"Qualitätsmeldung gelöst.":"Qualitätsmeldung abgeschlossen."});}
+        await c.rollback();return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    }catch(error){await c.rollback();console.error("[quality-incidents admin] failed:",error.code||"database_error");return sendJson(response,error.code==="ER_DUP_ENTRY"?409:503,{message:error.code==="ER_DUP_ENTRY"?"Die Qualitätsnummer ist bereits vergeben.":"Qualitätsmeldung konnte nicht gespeichert werden."})}finally{c.release()}
+}
+async function handleEmployeeQualityActions(request,response,pathname,session){const match=pathname.match(/^\/api\/employee\/quality-actions(?:\/(\d+))?$/),id=match?.[1]?positiveId(match[1]):null,fields="a.id,a.incident_id,a.title,a.description,a.due_date,a.status,a.completed_at,a.created_at,a.updated_at,qi.incident_number,qi.category,qi.severity,qi.title AS incident_title,qi.description AS incident_description,qi.due_date AS incident_due_date,o.order_number",join=" FROM quality_corrective_actions a JOIN quality_incidents qi ON qi.id=a.incident_id LEFT JOIN orders o ON o.id=qi.order_id";if(request.method==="GET"){const[rows]=await pool.execute(`SELECT ${fields}${join} WHERE a.assigned_employee_id=?${id?" AND a.id=?":""} ORDER BY a.due_date IS NULL,a.due_date,a.id DESC`,id?[session.employeeId,id]:[session.employeeId]);if(id&&!rows[0])return sendJson(response,404,{message:"Korrekturmaßnahme nicht gefunden."});return sendJson(response,200,id?{action:rows[0]}:{rows});}if(!id||request.method!=="PATCH")return sendJson(response,405,{message:"Methode nicht erlaubt."});if(!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Maßnahmen-Daten."})}const next=readText(body.status,20);if(!qualityActionStatuses.has(next))return sendJson(response,400,{message:"Ungültiger Maßnahmenstatus."});const c=await pool.getConnection();try{await c.beginTransaction();const[[action]]=await c.execute("SELECT a.id,a.incident_id,a.status,qi.incident_number FROM quality_corrective_actions a JOIN quality_incidents qi ON qi.id=a.incident_id WHERE a.id=? AND a.assigned_employee_id=? FOR UPDATE",[id,session.employeeId]);if(!action){await c.rollback();return sendJson(response,404,{message:"Korrekturmaßnahme nicht gefunden."})}if(!((action.status==="OPEN"&&["IN_PROGRESS","COMPLETED"].includes(next))||(action.status==="IN_PROGRESS"&&next==="COMPLETED"))){await c.rollback();return sendJson(response,400,{message:"Ungültiger Maßnahmenübergang."})}await c.execute("UPDATE quality_corrective_actions SET status=?,completed_at=? WHERE id=? AND assigned_employee_id=?",[next,next==="COMPLETED"?new Date():null,id,session.employeeId]);if(next==="COMPLETED"){await auditEvent(c,"EMPLOYEE",session.employeeId,"QUALITY_ACTION_COMPLETED","QUALITY_CORRECTIVE_ACTION",id,{incident_id:action.incident_id});await c.execute("INSERT INTO notifications(recipient_type,recipient_id,notification_type,title,body,entity_type,entity_id) VALUES ('ADMIN',NULL,'QUALITY_ACTION',?,?, 'QUALITY_CORRECTIVE_ACTION',?)",["Korrekturmaßnahme abgeschlossen",`Eine Korrekturmaßnahme für ${action.incident_number} wurde abgeschlossen.`,id])}await c.commit();return sendJson(response,200,{id,status:next,message:"Korrekturmaßnahme aktualisiert."})}catch(error){await c.rollback();console.error("[quality-actions employee] failed:",error.code||"database_error");return sendJson(response,503,{message:"Korrekturmaßnahme konnte nicht gespeichert werden."})}finally{c.release()}}
+
 function positiveId(value) {
     const id = Number(value);
     return Number.isSafeInteger(id) && id > 0 ? id : null;
@@ -2497,6 +2731,8 @@ async function handleAdminApi(request, response, pathname, searchParams) {
     const session = adminSessionOrRespond(request, response);
     if (!session) return;
 
+    if (pathname === "/api/admin/action-center") return handleAdminActionCenter(request, response, searchParams);
+    if (pathname === "/api/admin/quality-incidents" || /^\/api\/admin\/quality-incidents\/\d+(?:\/(?:actions(?:\/\d+)?|resolve|close))?$/.test(pathname)) return handleAdminQualityIncidents(request,response,pathname,searchParams);
     if (pathname === "/api/admin/reports/trends" || pathname === "/api/admin/reports/rankings") return handleAdminReportVisuals(request,response,pathname,searchParams);
     if (/^\/api\/admin\/reports\/performance\/(?:operations|services|orders|receivables|recurring)$/.test(pathname)) return handleAdminPerformanceReports(request, response, pathname, searchParams);
     if (/^\/api\/admin\/reports\/(?:dashboard|revenue|orders|invoices|customers|employees|materials)$/.test(pathname)) return handleAdminReports(request,response,pathname,searchParams);
@@ -3081,6 +3317,7 @@ async function handleEmployeeApi(request, response, pathname, searchParams) {
     const session = employeeSessionOrRespond(request, response); if (!session) return;
     if (pathname === "/api/employee/material-consumptions" || /^\/api\/employee\/material-consumptions\/\d+$/.test(pathname)) return handleEmployeeMaterialConsumptions(request,response,pathname,session);
     if (pathname === "/api/employee/service-reports" || /^\/api\/employee\/service-reports\/\d+(?:\/submit)?$/.test(pathname)) return handleEmployeeServiceReports(request,response,pathname,session);
+    if (pathname === "/api/employee/quality-actions" || /^\/api\/employee\/quality-actions\/\d+$/.test(pathname)) return handleEmployeeQualityActions(request,response,pathname,session);
     const cashReceiptMatch = pathname.match(/^\/api\/employee\/cash-payments\/(\d+)\/receipt$/);
     if (cashReceiptMatch) {
         const paymentId = Number(cashReceiptMatch[1]);
@@ -3314,6 +3551,7 @@ async function serveStatic(request, response, pathname) {
 }
 
 const server = http.createServer(async (request, response) => {
+    applySecurityHeaders(response);
     let requestUrl;
     let pathname;
     try {
@@ -3339,12 +3577,16 @@ server.headersTimeout = 15_000;
 server.requestTimeout = 30_000;
 server.keepAliveTimeout = 5_000;
 
-server.listen(PORT, HOST, () => {
-    console.log(`Website server listening at http://${HOST}:${PORT}`);
-    if (!pool) console.warn("MySQL is not configured; form submissions will return HTTP 503 until .env is set.");
-    if (!adminAuthConfigured) console.warn("Admin dashboard login is disabled until ADMIN_USERNAME and ADMIN_PASSWORD_HASH are configured.");
-    if (!adminPool) console.warn("Admin dashboard data access is disabled until MYSQL_ADMIN_USER and MYSQL_ADMIN_PASSWORD are configured.");
-});
+if (process.env.VALIDATE_CONFIG_ONLY === "true") {
+    console.log(`Configuration validation passed for ${NODE_ENV}.`);
+} else {
+    server.listen(PORT, HOST, () => {
+        console.log(`Website server listening at http://${HOST}:${PORT}`);
+        if (!pool) console.warn("MySQL is not configured; form submissions will return HTTP 503 until .env is set.");
+        if (!adminAuthConfigured) console.warn("Admin dashboard login is disabled until ADMIN_USERNAME and ADMIN_PASSWORD_HASH are configured.");
+        if (!adminPool) console.warn("Admin dashboard data access is disabled until MYSQL_ADMIN_USER and MYSQL_ADMIN_PASSWORD are configured.");
+    });
+}
 
 async function shutdown() {
     server.close(async () => {
