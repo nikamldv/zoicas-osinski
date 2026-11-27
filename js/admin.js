@@ -16,7 +16,7 @@ const statusLabels = {
     pending: "Neu", confirmed: "Bestätigt", cancelled: "Storniert"
 };
 
-let currentType = "contact";
+let currentType = "home";
 let currentPage = 1;
 let currentRows = [];
 let searchTimer;
@@ -36,6 +36,10 @@ let serviceReportRows = [];
 let serviceReportFilteredRows = [];
 let serviceReportPage = 1;
 const serviceReportPageSize = 25;
+let attendancePage = 1;
+let locationSimulationRows = [];
+let selectedLiveLocationId = null;
+let locationMapRefreshTimer = null;
 let materialTab = "materials";
 let materialRows = [];
 let requirementOrderId = "";
@@ -66,6 +70,7 @@ async function api(url, options = {}) {
 }
 
 function showLogin(message = "") {
+    window.adminDashboard?.clear();
     dashboardView.hidden = true;
     loginView.hidden = false;
     const error = byId("login-error");
@@ -77,6 +82,7 @@ function showDashboard(username) {
     loginView.hidden = true;
     dashboardView.hidden = false;
     byId("account-name").textContent = username || "Admin";
+    window.adminDashboard?.updateUnread();
 }
 
 function setNotice(message, kind = "error") {
@@ -264,31 +270,129 @@ async function downloadReportingPdf(){let params;try{params=reportParams()}catch
 function svgLine(title,rows,keys,labels=keys){if(!rows.length)return `<p class="reporting-chart-empty">Keine Daten für den ausgewählten Zeitraum vorhanden.</p>`;const values=rows.flatMap(r=>keys.map(k=>Number(r[k]||0))),max=Math.max(1,...values),width=360,height=170,left=42,right=14,top=26,bottom=34,plotWidth=width-left-right,plotHeight=height-top-bottom,point=(row,index,key)=>({x:left+index*(plotWidth/Math.max(1,rows.length-1)),y:top+plotHeight-(Number(row[key]||0)/max)*plotHeight}),points=key=>rows.map((row,index)=>{const p=point(row,index,key);return `${p.x},${p.y}`;}).join(" "),legend=keys.map((key,index)=>`<span><i class="reporting-legend-dot reporting-legend-${index}" aria-hidden="true"></i>${escapeHtml(labels[index]||key)}</span>`).join("");return `<div class="reporting-chart"><div class="reporting-legend" aria-label="Legende">${legend}</div><svg viewBox="0 0 ${width} ${height}" role="img" aria-labelledby="chart-${keys.join("-")}-title chart-${keys.join("-")}-desc"><title id="chart-${keys.join("-")}-title">${escapeHtml(title)}</title><desc id="chart-${keys.join("-")}-desc">${escapeHtml(title)}. Datenwerte können per Tastatur oder Maus abgerufen werden.</desc><line x1="${left}" y1="${top+plotHeight}" x2="${width-right}" y2="${top+plotHeight}" stroke="#b9cad8"/>${keys.map((key,index)=>`<polyline fill="none" stroke="${index?"#176d9d":"#78a915"}" stroke-width="3" points="${points(key)}"/>${rows.map((row,rowIndex)=>{const p=point(row,rowIndex,key),value=Number(row[key]||0);return `<circle class="reporting-chart-point" cx="${p.x}" cy="${p.y}" r="4" fill="${index?"#176d9d":"#78a915"}" tabindex="0"><title>${escapeHtml(`${labels[index]||key}: ${reportEuro(value)} · ${row.label||row.date}`)}</title></circle>`;}).join("")}`).join("")}<text x="${left}" y="${height-12}" fill="#668198" font-size="10">${escapeHtml(rows[0].label||rows[0].date)}</text><text x="${width-right}" y="${height-12}" text-anchor="end" fill="#668198" font-size="10">${escapeHtml(rows.at(-1).label||rows.at(-1).date)}</text><text x="${left}" y="16" fill="#668198" font-size="10">${escapeHtml(reportEuro(max))}</text></svg></div>`;}
 function rankList(title,rows,formatter){return `<article class="reporting-section"><h3>${escapeHtml(title)}</h3>${rows.length?`<ol class="reporting-rank-list">${rows.map(row=>`<li><strong>${escapeHtml(row.label||"—")}</strong><span>${escapeHtml(formatter(row))}</span></li>`).join("")}</ol>`:"<p>Keine Daten für den ausgewählten Zeitraum vorhanden.</p>"}</article>`;}
 async function loadVisuals(){let params;try{params=reportParams()}catch(error){return reportingMessage(error.message)}const visual=byId("reporting-visuals");visual.setAttribute("aria-busy","true");visual.innerHTML="<p class=\"reporting-chart-loading\">Diagramme werden geladen …</p>";try{const metrics=["revenue","cashflow","invoices","orders"],types=["customers","employees","materials"],results=await Promise.all([...metrics.map(metric=>loadReport(`/api/admin/reports/trends?metric=${metric}`,params)),...types.map(type=>loadReport(`/api/admin/reports/rankings?type=${type}&limit=10`,params))]);const [revenue,cashflow,invoices,orders,customers,employees,materials]=results.map(r=>r.data);visual.innerHTML=`<section class="reporting-chart-grid"><article class="reporting-section"><h3>Umsatzentwicklung</h3>${svgLine("Umsatz Netto und Brutto",revenue.series||[],["net","gross"],["Netto","Brutto"])}</article><article class="reporting-section"><h3>Einnahmen / Ausgaben</h3>${svgLine("Einnahmen und Ausgaben",cashflow.series||[],["income","expense"],["Einnahmen","Ausgaben"])}</article><article class="reporting-section"><h3>Rechnungsentwicklung</h3>${svgLine("Rechnungen",invoices.series||[],["issued","paid"],["Ausgestellt","Bezahlt"])}</article><article class="reporting-section"><h3>Auftragsentwicklung</h3>${svgLine("Neu angelegte Aufträge",orders.series||[],["new_orders"],["Neue Aufträge"])}</article></section><section class="reporting-summary">${rankList("Top Kunden",customers.items||[],r=>`${reportEuro(r.revenue_gross)} · ${reportNumber(r.order_count)} Aufträge`)}${rankList("Mitarbeiter",employees.items||[],r=>`${reportNumber(r.work_hours)} Std. · ${reportNumber(r.assignments)} Einsätze`)}${rankList("Materialverbrauch",materials.items||[],r=>`${reportNumber(r.consumed_quantity)} · ${reportEuro(r.consumption_cost)}`)}</section>`;}catch(error){visual.innerHTML="<p class=\"reporting-chart-error\">Diagramme konnten nicht geladen werden. Bitte aktualisieren Sie den Bericht.</p>";reportingMessage(error.message||"Der Bericht konnte nicht geladen werden.");}finally{visual.removeAttribute("aria-busy");}}
-function renderReportCards(data,compare){const current=compare?data.current:data,comparison=compare?data.comparison:null,f=current.finance||{},o=current.orders||{},c=current.customers||{},e=current.employees||{},m=current.materials||{};const cards=[["Umsatz Netto",f.invoiced?.net,"money"],["Umsatz Brutto",f.invoiced?.gross,"money"],["MwSt.",f.invoiced?.tax,"money"],["Einnahmen",f.financial_income,"money"],["Ausgaben",f.expenses,"money"],["Teilergebnis – unvollständig",f.partial_result_incomplete,"money"],["Offene Forderungen",f.outstanding_amount,"money"],["Überfällige Rechnungen",f.overdue_amount,"money"],["Gesamtaufträge",o.total,"number"],["Aktive Kunden",c.active_customers,"number"],["Aktive Mitarbeiter",e.active_employees,"number"],["Materialverbrauchskosten",m.consumption_costs,"money"]];byId("reporting-cards").innerHTML=cards.map(([label,value,type])=>{const key=label==="Umsatz Netto"?"invoiced.net":label==="Umsatz Brutto"?"invoiced.gross":label==="MwSt."?"invoiced.tax":label==="Einnahmen"?"financial_income":label==="Ausgaben"?"expenses":label==="Teilergebnis – unvollständig"?"partial_result_incomplete":label==="Offene Forderungen"?"outstanding_amount":label==="Gesamtaufträge"?"total":label==="Aktive Kunden"?"active_customers":label==="Aktive Mitarbeiter"?"active_employees":"consumption_costs";const delta=compare?(key.includes(".")?comparison?.finance?.[key.split(".")[1]]:comparison?.finance?.[key]||comparison?.orders?.[key]||comparison?.customers?.[key]||comparison?.employees?.[key]||comparison?.materials?.[key]):null;return `<article class="finance-card"><span>${escapeHtml(label)}</span><strong>${type==="money"?reportEuro(value):reportNumber(value)}</strong>${delta?`<small>Vorheriger Zeitraum: ${type==="money"?reportEuro(delta.previous):reportNumber(delta.previous)} · Δ ${type==="money"?reportEuro(delta.difference):reportNumber(delta.difference)}${delta.percent===null?"":" · "+escapeHtml(String(delta.percent))+"%"}</small>`:""}</article>`;}).join("");}
+function renderReportCards(data,compare){const current=compare?data.current:data,comparison=compare?data.comparison:null,f=current.finance||{},o=current.orders||{},c=current.customers||{},e=current.employees||{},m=current.materials||{};const cards=[["Fakturiert netto",f.invoiced?.net,"money"],["Fakturiert brutto",f.invoiced?.gross,"money"],["MwSt.",f.invoiced?.tax,"money"],["Rechnungszahlungen",f.invoice_payments,"money"],["Finanzbuchungen · Einnahmen",f.financial_income,"money"],["Ausgaben",f.expenses,"money"],["Teilergebnis – unvollständig",f.partial_result_incomplete,"money"],["Offene Forderungen",f.outstanding_amount,"money"],["Überfällige Rechnungen",f.overdue_amount,"money"],["Gesamtaufträge",o.total,"number"],["Aktive Kunden",c.active_customers,"number"],["Aktive Mitarbeiter",e.active_employees,"number"],["Materialverbrauchskosten",m.consumption_costs,"money"]];byId("reporting-cards").innerHTML=cards.map(([label,value,type])=>{const key=label==="Fakturiert netto"?"invoiced.net":label==="Fakturiert brutto"?"invoiced.gross":label==="MwSt."?"invoiced.tax":label==="Rechnungszahlungen"?"invoice_payments":label==="Finanzbuchungen · Einnahmen"?"financial_income":label==="Ausgaben"?"expenses":label==="Teilergebnis – unvollständig"?"partial_result_incomplete":label==="Offene Forderungen"?"outstanding_amount":label==="Überfällige Rechnungen"?"overdue_amount":label==="Gesamtaufträge"?"total":label==="Aktive Kunden"?"active_customers":label==="Aktive Mitarbeiter"?"active_employees":"consumption_costs";const delta=compare?(key.includes(".")?comparison?.finance?.[key.split(".")[1]]:comparison?.finance?.[key]||comparison?.orders?.[key]||comparison?.customers?.[key]||comparison?.employees?.[key]||comparison?.materials?.[key]):null;return `<article class="finance-card"><span>${escapeHtml(label)}</span><strong>${type==="money"?reportEuro(value):reportNumber(value)}</strong>${delta?`<small>Vorheriger Zeitraum: ${type==="money"?reportEuro(delta.previous):reportNumber(delta.previous)} · Δ ${type==="money"?reportEuro(delta.difference):reportNumber(delta.difference)}${delta.percent===null?"":" · "+escapeHtml(String(delta.percent))+"%"}</small>`:""}</article>`;}).join("");}
 async function loadPerformance(){const params=reportParams(),paths=["operations","services","receivables","recurring"],results=await Promise.all(paths.map(name=>loadReport(`/api/admin/reports/performance/${name}`,params)));const [operations,services,receivables,recurring]=results.map(result=>result.data);byId("performance-cards").innerHTML=[["Completion Rate",`${Number(operations.completion_rate||0).toFixed(1)}%`],["Cancellation Rate",`${Number(operations.cancellation_rate||0).toFixed(1)}%`],["Planned Hours",`${Number(operations.planned_hours||0).toFixed(1)} h`],["Actual Hours",`${Number(operations.actual_hours||0).toFixed(1)} h`],["Report Completion",`${Number(operations.service_report_completion_rate||0).toFixed(1)}%`],["Contribution vor Personalkosten",reportEuro((services.items||[]).reduce((sum,row)=>sum+Number(row.contribution_before_personnel_costs||0),0))],["Überfällige Forderungen",reportEuro(receivables.overdue_invoice_amount)]].map(([label,value])=>`<article class="finance-card"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`).join("");byId("performance-content").innerHTML=`<article class="reporting-section"><h3>Service Performance</h3>${(services.items||[]).length?`<ol class="reporting-rank-list">${services.items.map(row=>`<li><strong>${escapeHtml(row.service_type||"—")}</strong><span>${escapeHtml(reportEuro(row.revenue))} · ${escapeHtml(reportEuro(row.contribution_before_personnel_costs))}</span></li>`).join("")}</ol>`:"<p>Keine Daten für den ausgewählten Zeitraum.</p>"}</article><article class="reporting-section"><h3>Forderungsalterung</h3><p>Aktuell: ${escapeHtml(reportEuro(receivables.buckets?.current))}<br>1–30: ${escapeHtml(reportEuro(receivables.buckets?.days_1_30))}<br>31–60: ${escapeHtml(reportEuro(receivables.buckets?.days_31_60))}<br>61–90: ${escapeHtml(reportEuro(receivables.buckets?.days_61_90))}<br>90+: ${escapeHtml(reportEuro(receivables.buckets?.days_90_plus))}</p></article><article class="reporting-section"><h3>Wiederkehrende Aufträge</h3><p>Aktive Verträge: ${escapeHtml(reportNumber(recurring.recurring_contracts))}<br>Generierungen: ${escapeHtml(reportNumber(recurring.generated_orders))}<br>Erfolgreich: ${escapeHtml(reportNumber(recurring.successful_generation))}<br>Duplikate: ${escapeHtml(reportNumber(recurring.duplicate_outcomes))}<br>Fehler: ${escapeHtml(reportNumber(recurring.error_outcomes))}</p></article>`;}
-async function loadReporting({force=false}={}){const params=reportParams();byId("reporting-period-label").textContent="Zeitraum wird geladen …";reportingMessage("Bericht wird geladen …","success");try{const result=await loadReport("/api/admin/reports/dashboard",params,{force});byId("reporting-period-label").textContent=reportingPeriodLabel({from:result.meta.from,to:result.meta.to,compare:params.compare});renderReportCards(result.data,params.compare);const current=params.compare?result.data.current:result.data,sections=[["Revenue","revenue"],["Invoices","invoices"],["Orders","orders"],["Customers","customers"],["Employees","employees"],["Materials","materials"]];byId("reporting-summary").innerHTML=sections.map(([label,name])=>`<article class="reporting-section"><h3>${label}</h3><p>Zusammenfassung für den gewählten Zeitraum.</p><button class="detail-button" data-report-detail="${name}" type="button">Details anzeigen</button><div id="report-detail-${name}"></div></article>`).join("");reportingMessage("");}catch(error){reportingMessage(error.status===401?"Sitzung abgelaufen. Bitte melden Sie sich erneut an.":error.message||"Der Bericht konnte nicht geladen werden.");}}
+async function loadReporting({force=false}={}){const params=reportParams();byId("reporting-period-label").textContent="Zeitraum wird geladen …";reportingMessage("Bericht wird geladen …","success");try{const result=await loadReport("/api/admin/reports/dashboard",params,{force});byId("reporting-period-label").textContent=reportingPeriodLabel({from:result.meta.from,to:result.meta.to,compare:params.compare});renderReportCards(result.data,params.compare);const current=params.compare?result.data.current:result.data,sections=[["Finanzen","revenue"],["Rechnungen","invoices"],["Aufträge","orders"],["Kunden","customers"],["Mitarbeiter","employees"],["Material","materials"]];byId("reporting-summary").innerHTML=sections.map(([label,name])=>`<article class="reporting-section"><h3>${label}</h3><p>Zusammenfassung für den gewählten Zeitraum.</p><button class="detail-button" data-report-detail="${name}" type="button">Details anzeigen</button><div id="report-detail-${name}"></div></article>`).join("");reportingMessage("");}catch(error){reportingMessage(error.status===401?"Sitzung abgelaufen. Bitte melden Sie sich erneut an.":error.message||"Der Bericht konnte nicht geladen werden.");}}
+
+let attendanceRequest = 0;
+async function loadAttendance() {
+    const request = ++attendanceRequest;
+    const results = byId("attendance-results");
+    const message = byId("attendance-message");
+    const query = new URLSearchParams({ page: String(attendancePage), page_size: "25" });
+    [["status","attendance-status-filter"],["from","attendance-from"],["to","attendance-to"]].forEach(([key,id]) => { const value=byId(id).value.trim(); if(value) query.set(key,value); });
+    message.textContent = "Anwesenheit wird geladen …";
+    message.hidden = false;
+    results.setAttribute("aria-busy", "true");
+    try {
+        const result=await api(`/api/admin/attendance?${query}`), rows=result.rows || [];
+        if (request !== attendanceRequest) return;
+        message.hidden = true;
+        const label = value => ({PÜNKTLICH:"Pünktlich",VERSPÄTET:"Verspätet",NICHT_ERFASST:"Nicht erfasst",NICHT_BEWERTBAR:"Nicht bewertbar",CUSTOMER_CONFIRMED:"Kundenbestätigt"}[value] || value || "—");
+        byId("attendance-body").innerHTML=rows.map(row=>{const planned=row.start_time&&row.end_time?`${String(row.assignment_date||"").slice(0,10)} · ${String(row.start_time).slice(0,5)}–${String(row.end_time).slice(0,5)}`:"Nicht geplant";const attendance=row.attendance_status||"NICHT_ERFASST";const report=row.report_status?label(row.report_status):"Nicht eingereicht";const confirmed=row.customer_confirmed_at?formatDate(row.customer_confirmed_at):(row.report_status==="SHARED"?"Ausstehend":"Nicht erforderlich");return `<tr><td><strong>${escapeHtml(`${row.first_name||""} ${row.last_name||""}`.trim())}</strong><div class="person-phone">${escapeHtml(row.employee_number||"")}</div></td><td><strong>${escapeHtml(`${row.customer_first_name||""} ${row.customer_last_name||""}`.trim()||"—")}</strong><div class="person-phone">${escapeHtml(row.order_number||"—")} · ${escapeHtml(row.title||"")}</div></td><td>${escapeHtml(planned)}</td><td>${escapeHtml(formatDate(row.check_in_at))}</td><td>${escapeHtml(formatDate(row.check_out_at))}</td><td><span class="status-pill" data-status="${row.punctuality_status==="PÜNKTLICH"?"done":row.punctuality_status==="VERSPÄTET"?"in_progress":"new"}">${escapeHtml(label(row.punctuality_status))}</span></td><td>${escapeHtml(report)}</td><td>${escapeHtml(confirmed)}</td><td><span class="status-pill" data-status="${attendance==="CLOSED"?"done":attendance==="REVIEW_REQUIRED"?"in_progress":"new"}">${escapeHtml(label(attendance))}</span>${Number(row.review_required)?`<div class="person-phone">Prüfung nötig</div>`:""}</td></tr>`;}).join("");
+        byId("attendance-empty").hidden=rows.length!==0;
+        byId("attendance-page-info").textContent=result.total?`Einträge ${(result.page-1)*result.page_size+1}–${Math.min(result.page*result.page_size,result.total)} von ${result.total}`:"Keine Einträge";
+        byId("attendance-page-number").textContent=String(result.page||1);
+        byId("attendance-previous").disabled=(result.page||1)<=1;
+        byId("attendance-next").disabled=(result.page||1)>=(result.total_pages||1);
+        byId("nav-attendance-count").textContent=String(result.total||0);
+    } catch (error) {
+        if (request !== attendanceRequest) return;
+        message.textContent = error.message;
+        byId("attendance-body").replaceChildren();
+        byId("attendance-empty").hidden = true;
+    } finally {
+        if (request === attendanceRequest) results.removeAttribute("aria-busy");
+    }
+}
+
+async function loadLocationSimulations() {
+    const panel=byId("location-simulation-admin"), message=byId("location-simulation-admin-message");
+    try {
+        const result=await api("/api/admin/location-simulations"), rows=result.rows||[];
+        locationSimulationRows=rows;
+        panel.hidden=false; message.hidden=true;
+        byId("location-simulation-admin-body").innerHTML=rows.map(row=>`<tr><td><strong>${escapeHtml(`${row.first_name||""} ${row.last_name||""}`.trim())}</strong><div class="person-phone">${escapeHtml(row.employee_number||"")}</div></td><td><strong>${escapeHtml(row.order_number||"—")}</strong><div class="person-phone">${escapeHtml(row.title||"")}</div></td><td>${escapeHtml(row.location_status||"OFFLINE")}</td><td>${escapeHtml(formatDate(row.last_updated_at))}</td><td>${row.latitude===null||row.latitude===undefined?"—":`${escapeHtml(row.latitude)}, ${escapeHtml(row.longitude)}`}</td><td>${escapeHtml(formatDate(row.expires_at))}</td></tr>`).join("");
+        byId("location-simulation-admin-empty").hidden=rows.length!==0;
+        if (!byId("live-locations-panel").hidden) renderLiveLocationMap();
+        return true;
+    } catch(error) {
+        if(error.status===404){panel.hidden=true;byId("live-locations-panel").hidden=true;return false;}
+        panel.hidden=false; message.textContent=error.message; message.hidden=false; byId("location-simulation-admin-body").replaceChildren(); byId("location-simulation-admin-empty").hidden=false;
+        if (!byId("live-locations-panel").hidden) { byId("live-locations-message").textContent=error.message; byId("live-locations-message").hidden=false; }
+        return false;
+    }
+}
+
+function liveLocationState(row) { return ["ACTIVE","STALE","OFFLINE"].includes(row.location_status) ? row.location_status : "OFFLINE"; }
+function liveLocationPoint(row, rows) {
+    const positioned=rows.filter(item=>Number.isFinite(Number(item.latitude))&&Number.isFinite(Number(item.longitude)));
+    if (!positioned.length || !Number.isFinite(Number(row.latitude)) || !Number.isFinite(Number(row.longitude))) return { left:50, top:50 };
+    const latitudes=positioned.map(item=>Number(item.latitude)), longitudes=positioned.map(item=>Number(item.longitude));
+    const pad=.002, minLat=Math.min(...latitudes)-pad, maxLat=Math.max(...latitudes)+pad, minLng=Math.min(...longitudes)-pad, maxLng=Math.max(...longitudes)+pad;
+    let left=12+76*((Number(row.longitude)-minLng)/Math.max(.000001,maxLng-minLng)), top=88-76*((Number(row.latitude)-minLat)/Math.max(.000001,maxLat-minLat));
+    const overlapping=positioned.filter(item=>Number(item.latitude)===Number(row.latitude)&&Number(item.longitude)===Number(row.longitude));
+    if (overlapping.length>1) { const index=overlapping.findIndex(item=>Number(item.id)===Number(row.id)), angle=(Math.PI*2*index)/overlapping.length; left+=Math.cos(angle)*9; top+=Math.sin(angle)*9; }
+    return { left:Math.max(4,Math.min(96,left)), top:Math.max(4,Math.min(96,top)) };
+}
+function renderLiveLocationDetails(row) {
+    const node=byId("live-location-marker-detail");
+    if (!row) { node.innerHTML='<p class="empty-copy">Wählen Sie einen Marker auf der Simulationskarte.</p>'; return; }
+    node.innerHTML=`<strong>${escapeHtml(`${row.first_name||""} ${row.last_name||""}`.trim()||row.employee_number||"Mitarbeiter")}</strong><p><b>Auftrag:</b> ${escapeHtml(row.order_number||"—")} · ${escapeHtml(row.title||"—")}</p><p><b>Status:</b> ${escapeHtml(liveLocationState(row))}<br><b>Letztes Test-Update:</b> ${escapeHtml(formatDate(row.last_updated_at))}<br><b>Genauigkeit:</b> ${row.accuracy_meters==null?"—":`${escapeHtml(row.accuracy_meters)} m`}<br><b>Ablauf:</b> ${escapeHtml(formatDate(row.expires_at))}</p>`;
+}
+function renderLiveLocationMap() {
+    const map=byId("live-locations-map"), list=byId("live-locations-list-body"), empty=byId("live-locations-empty"), message=byId("live-locations-message"), rows=locationSimulationRows;
+    message.hidden=true;
+    if (!rows.length) { map.innerHTML='<p class="empty-copy">Keine aktive Standort-Simulation vorhanden.</p>'; list.replaceChildren(); empty.hidden=false; renderLiveLocationDetails(null); return; }
+    empty.hidden=true;
+    const positioned=rows.filter(row=>Number.isFinite(Number(row.latitude))&&Number.isFinite(Number(row.longitude)));
+    map.innerHTML=positioned.length?positioned.map((row,index)=>{const point=liveLocationPoint(row,positioned),name=`${row.first_name||""} ${row.last_name||""}`.trim()||row.employee_number||"Mitarbeiter",state=liveLocationState(row);return `<button class="simulation-marker simulation-marker-${state}" type="button" data-live-location-marker="${Number(row.id)}" style="left:${point.left.toFixed(2)}%;top:${point.top.toFixed(2)}%" aria-label="${escapeHtml(`${name}, ${state}, Auftrag ${row.order_number||"—"}`)}">${escapeHtml(name.slice(0,1).toUpperCase()||String(index+1))}</button>`;}).join(""):'<p class="empty-copy">Aktive Simulationen haben noch keine Testkoordinaten.</p>';
+    list.innerHTML=rows.map(row=>`<tr><td><strong>${escapeHtml(`${row.first_name||""} ${row.last_name||""}`.trim())}</strong><div class="person-phone">${escapeHtml(row.employee_number||"")}</div></td><td><strong>${escapeHtml(row.order_number||"—")}</strong><div class="person-phone">${escapeHtml(row.title||"")}</div></td><td><span class="live-location-state live-location-state-${liveLocationState(row)}">${escapeHtml(liveLocationState(row))}</span></td><td>${escapeHtml(formatDate(row.last_updated_at))}</td><td>${row.accuracy_meters==null?"—":`${escapeHtml(row.accuracy_meters)} m`}</td><td>${escapeHtml(formatDate(row.expires_at))}</td></tr>`).join("");
+    const selected=rows.find(row=>Number(row.id)===Number(selectedLiveLocationId)) || positioned[0] || rows[0]; selectedLiveLocationId=selected?.id||null; renderLiveLocationDetails(selected);
+    document.querySelectorAll("[data-live-location-marker]").forEach(button=>button.addEventListener("click",()=>{selectedLiveLocationId=Number(button.dataset.liveLocationMarker);renderLiveLocationDetails(rows.find(row=>Number(row.id)===selectedLiveLocationId));}));
+}
+function stopLiveLocationAutoRefresh() { if (locationMapRefreshTimer) { window.clearInterval(locationMapRefreshTimer); locationMapRefreshTimer=null; } }
+function startLiveLocationAutoRefresh() { stopLiveLocationAutoRefresh(); locationMapRefreshTimer=window.setInterval(()=>{ if (currentType==="live-locations") loadLocationSimulations(); },30000); }
+async function loadLiveLocations() { byId("live-locations-message").hidden=true; const loaded=await loadLocationSimulations(); if (loaded !== false) renderLiveLocationMap(); }
 
 function updateViewHeading() {
-    const career = currentType === "career", finance = currentType === "finance", reporting = currentType === "reporting", actionCenter = currentType === "action-center", serviceReport = currentType === "service-report", materials = currentType === "materials", quality = currentType === "quality";
-    const quote = currentType === "quote", offer = currentType === "offer", contract = currentType === "contract", recurring = currentType === "recurring", invoice = currentType === "invoice", appointment = currentType === "appointment", customer = currentType === "customer", employee = currentType === "employee", order = currentType === "order", schedule = currentType === "schedule", document = currentType === "document", message = currentType === "message", notification = currentType === "notification", audit = currentType === "audit";
-    byId("page-title").textContent = actionCenter ? "Aktionscenter" : quality ? "Qualität & Vorfälle" : materials ? "Materialverwaltung" : serviceReport ? "Leistungsnachweise" : finance ? "Finanzen" : schedule ? "Einsatzplanung" : recurring ? "Wiederkehrende Aufträge" : invoice ? "Rechnungen" : contract ? "Verträge" : offer ? "Angebote" : order ? "Aufträge" : employee ? "Mitarbeiter" : customer ? "Kunden" : appointment ? "Termine" : quote ? "Angebotsanfragen" : career ? "Bewerbungen" : "Kontaktanfragen";
+    const home = currentType === "home";
+    byId("management-home").hidden = !home;
+    const career = currentType === "career", finance = currentType === "finance", reporting = currentType === "reporting", actionCenter = currentType === "action-center", serviceReport = currentType === "service-report", materials = currentType === "materials", quality = currentType === "quality", attendance = currentType === "attendance", liveLocations = currentType === "live-locations";
+    const quote = currentType === "quote", offer = currentType === "offer", contract = currentType === "contract", recurring = currentType === "recurring", invoice = currentType === "invoice", appointment = currentType === "appointment", customer = currentType === "customer", employee = currentType === "employee", order = currentType === "order", schedule = currentType === "schedule", documentView = currentType === "document", message = currentType === "message", notification = currentType === "notification", audit = currentType === "audit";
+    byId("page-title").textContent = home ? "Dashboard" : liveLocations ? "Mitarbeiter – Live-Standorte" : actionCenter ? "Aktionscenter" : quality ? "Qualität & Vorfälle" : materials ? "Materialverwaltung" : serviceReport ? "Leistungsnachweise" : finance ? "Finanzen" : schedule ? "Einsatzplanung" : recurring ? "Wiederkehrende Aufträge" : invoice ? "Rechnungen" : contract ? "Verträge" : offer ? "Angebote" : order ? "Aufträge" : employee ? "Mitarbeiter" : customer ? "Kunden" : appointment ? "Termine" : quote ? "Angebotsanfragen" : career ? "Bewerbungen" : "Kontaktanfragen";
     byId("records-title").textContent = recurring ? "Automatisierte Einsatzpläne & Protokolle" : invoice ? "Rechnungsverwaltung" : contract ? "Vertragsverwaltung" : offer ? "Angebotsverwaltung" : order ? "Auftragsverwaltung" : employee ? "Mitarbeiterverwaltung" : customer ? "Registrierte Kunden" : appointment ? "Gebuchte Termine" : quote ? "Aktuelle Angebotsanfragen" : career ? "Aktuelle Bewerbungen" : "Aktuelle Kontaktanfragen";
     byId("service-heading").textContent = recurring ? "INTERVALL / NÄCHSTER LAUF" : invoice || contract || offer || order ? "LEISTUNG / BETRAG" : employee ? "POSITION / ROLLE" : appointment || quote ? "DIENSTLEISTUNG / ORT" : career ? "BEREICH" : "LEISTUNG";
     byId("create-employee-button").hidden = !employee;
     byId("create-order-button").hidden = !order;
     byId("create-offer-button").hidden = !offer;
     byId("create-contract-button").hidden = !contract;
+    byId("create-customer-button").hidden = !customer;
+    byId("register-existing-contract").hidden = !contract;
+    byId("contract-filter-wrap").hidden = !contract;
+    byId("search-input").placeholder = contract ? "Kunde, Vertragsnummer oder Leistung suchen" : "Name, E-Mail oder Nachricht suchen";
     byId("create-recurring-button").hidden = !recurring;
     byId("generate-recurring-button").hidden = !recurring;
+    byId("recurring-operations-panel").hidden = !recurring;
     byId("create-invoice-button").hidden = !invoice;
-    byId("create-document-button").hidden = !document;
+    byId("create-document-button").hidden = !documentView;
     byId("create-message-button").hidden = !message;
     byId("create-material-button").hidden = !materials;
-    if (document) { byId("page-title").textContent = "Dokumente"; byId("records-title").textContent = "Private Dokumente"; byId("service-heading").textContent = "TYP / SICHTBARKEIT"; }
+    if (documentView) { byId("page-title").textContent = "Dokumente"; byId("records-title").textContent = "Private Dokumente"; byId("service-heading").textContent = "TYP / SICHTBARKEIT"; }
     if (message) { byId("page-title").textContent = "Nachrichten"; byId("records-title").textContent = "Kundennachrichten"; byId("service-heading").textContent = "ABSENDER / EMPFÄNGER"; }
     if (notification) { byId("page-title").textContent = "Benachrichtigungen"; byId("records-title").textContent = "Interne Benachrichtigungen"; byId("service-heading").textContent = "TYP / VERKNÜPFUNG"; }
     if (audit) { byId("page-title").textContent = "Audit-Protokoll"; byId("records-title").textContent = "Nachvollziehbare Systemereignisse"; byId("service-heading").textContent = "AKTION / OBJEKT"; }
+    byId("date-heading").textContent=contract?"VERTRAG":customer?"ERFASST":"EINGANG";
+    byId("person-heading").textContent=contract||customer?"KUNDE":"KONTAKT";
+    byId("operations-heading").textContent=contract?"EINSATZPLAN":customer?"TELEFON":"NACHRICHT";
+    if(customer) {
+        byId("service-heading").textContent="ORT";
+        byId("search-input").placeholder="Name, Kundennummer, E-Mail oder Ort suchen";
+    }
+    if (contract) byId("service-heading").textContent="LEISTUNG UND LAUFZEIT";
     if (reporting) { byId("page-title").textContent = "Reporting & Kennzahlen"; }
+    if (attendance) { byId("page-title").textContent = "Anwesenheit & Check-ins"; byId("records-title").textContent = "Anwesenheitsübersicht"; }
+    if (liveLocations) { byId("records-title").textContent = "Standort-Simulation"; }
     ["invoice-customer-filter", "invoice-order-filter", "invoice-due-filter"].forEach(id => { byId(id).hidden = !invoice; });
     byId("schedule-panel").hidden = !schedule;
     byId("finance-panel").hidden = !finance;
@@ -297,19 +401,26 @@ function updateViewHeading() {
     byId("service-reports-panel").hidden = !serviceReport;
     byId("materials-panel").hidden = !materials;
     byId("quality-panel").hidden = !quality;
-    document.querySelector(".stats-grid").hidden = reporting || actionCenter || quality;
-    document.querySelector(".records-panel").hidden = schedule || finance || reporting || actionCenter || serviceReport || materials || quality;
-    document.querySelector(".privacy-note").hidden = schedule || finance || reporting || actionCenter || serviceReport || materials || quality;
+    if (quality) loadComplaints();
+    byId("attendance-panel").hidden = !attendance;
+    byId("live-locations-panel").hidden = !liveLocations;
+    document.querySelector(".stats-grid").hidden = home || reporting || actionCenter || quality || attendance || liveLocations;
+    byId("admin-records").hidden = home || schedule || finance || reporting || actionCenter || serviceReport || materials || quality || attendance || liveLocations;
+    document.querySelector(".privacy-note").hidden = home || schedule || finance || reporting || actionCenter || serviceReport || materials || quality || attendance || liveLocations;
     document.querySelectorAll(".nav-item").forEach(button => button.classList.toggle("is-active", button.dataset.type === currentType));
+    window.adminDashboard?.updateNavigation(currentType);
+    window.adminManagement.show(currentType);
     const quoteOnlyStatuses = new Set(["offer_sent", "accepted", "declined", "completed"]);
     const commercialStatuses = new Set(["all", "ENTWURF", "GESENDET", "ANGENOMMEN", "ABGELEHNT", "ABGELAUFEN", "STORNIERT"]);
     const contractStatuses = new Set(["all", "ENTWURF", "AKTIV", "PAUSIERT", "GEKUENDIGT", "ABGELAUFEN", "BEENDET"]), invoiceStatuses = new Set(["all", "ENTWURF", "AUSGESTELLT", "GESENDET", "BEZAHLT", "TEILBEZAHLT", "ÜBERFÄLLIG", "STORNIERT"]);
     const employeeStatuses = new Set(["all", "ACTIVE", "INACTIVE"]);
+    const customerStatuses = new Set(["all", "active", "inactive", "blocked"]);
     const orderStatuses = new Set(["all", "NEU", "GEPLANT", "ZUGEWIESEN", "IN_BEARBEITUNG", "PAUSIERT", "ERLEDIGT", "STORNIERT"]);
     byId("status-filter").querySelectorAll("option").forEach(option => {
         option.hidden = recurring ? option.value !== "all" : invoice ? !invoiceStatuses.has(option.value) : offer ? !commercialStatuses.has(option.value) : contract ? !contractStatuses.has(option.value) : order ? !orderStatuses.has(option.value) : employee
             ? !employeeStatuses.has(option.value)
-            : quoteOnlyStatuses.has(option.value) ? !quote : option.value === "done" ? quote : ["ACTIVE", "INACTIVE"].includes(option.value);
+            : customer ? !customerStatuses.has(option.value)
+            : quoteOnlyStatuses.has(option.value) ? !quote : option.value === "done" ? quote : ["ACTIVE", "INACTIVE", "active", "inactive", "blocked"].includes(option.value);
     });
 }
 
@@ -373,8 +484,24 @@ async function loadOrderSelections() {
     ]);
     orderCustomers = customers.rows || [];
     orderEmployees = employees.rows || [];
-    byId("order-customer").innerHTML = `<option value="">Kunde wählen</option>${orderCustomers.map(customer => `<option value="${customer.id}">${escapeHtml(`${customer.first_name} ${customer.last_name}`)} · ${escapeHtml(customer.customer_number || customer.email)}</option>`).join("")}`;
+    byId("order-customer").innerHTML = `<option value="">Kunde wählen</option>${orderCustomers.map(customer => `<option value="${customer.id}">${escapeHtml(customer.company_name||[customer.first_name,customer.last_name].join(" "))} · ${escapeHtml(customer.customer_number || customer.email)}</option>`).join("")}`;
     byId("assignment-employee").innerHTML = `<option value="">Mitarbeiter wählen</option>${orderEmployees.map(employee => `<option value="${employee.id}">${escapeHtml(`${employee.first_name} ${employee.last_name}`)} · ${escapeHtml(employee.employee_number || employee.position || "")}</option>`).join("")}`;
+}
+
+const contractStatusLabels = {ENTWURF:"Entwurf", AKTIV:"Aktiv", PAUSIERT:"Pausiert", GEKUENDIGT:"Gekündigt", ABGELAUFEN:"Abgelaufen", BEENDET:"Beendet"};
+function contractRecordRow(row,index) {
+    const missing = [];
+    if (row.historical_registration && !row.external_contract_number) missing.push("Originalnummer");
+    if (!row.payment_interval) missing.push("Abrechnungsintervall");
+    if (!Number(row.has_documents)) missing.push("Dokumente");
+    const schedule = !row.schedule_id ? "Kein Einsatzplan" : Number(row.schedule_active) ? "Einsatzplan aktiv" : "Einsatzplan inaktiv";
+    return `<tr><td class="date-cell"><strong>${escapeHtml(row.contract_number)}</strong><div>${escapeHtml(row.external_contract_number || "")}</div></td>
+        <td class="person-cell"><strong>${escapeHtml(row.first_name+" "+row.last_name)}</strong><span class="person-phone">${escapeHtml(row.customer_number)}</span></td>
+        <td class="service-cell"><strong>${escapeHtml(row.service_type)}</strong><div>${escapeHtml(row.start_date)} bis ${escapeHtml(row.end_date || "offen")}</div>
+        ${row.termination_date?`<div>Wirksames Ende: ${escapeHtml(row.termination_date)}</div>`:""}</td>
+        <td class="message-cell"><strong>${schedule}</strong><div>${row.next_cleaning ? "Nächster Einsatz: "+escapeHtml(row.next_cleaning) : "Kein Auftrag eingeplant"}</div></td>
+        <td class="status-cell">${escapeHtml(contractStatusLabels[row.status] || row.status)}${missing.length ? `<div class="person-phone">Fehlt: ${escapeHtml(missing.join(", "))}</div>`:""}</td>
+        <td><button class="detail-button" type="button" data-record-index="${index}">Öffnen</button></td></tr>`;
 }
 
 function renderRecords(rows) {
@@ -390,14 +517,21 @@ function renderRecords(rows) {
         const empty = rows.length === 0; byId("empty-state").hidden = !empty; document.querySelector(".table-wrap table").hidden = empty; return;
     }
     if (currentType === "recurring") {
-        recordsBody.innerHTML = rows.map((row, index) => `<tr><td class="date-cell">${escapeHtml(row.contract_number)}</td><td class="person-cell"><strong>${escapeHtml(`${row.first_name} ${row.last_name}`)}</strong><span class="person-phone">${escapeHtml(row.customer_number || "—")}</span></td><td class="service-cell"><strong>${escapeHtml(row.service_type)}</strong><div class="person-phone">${escapeHtml(row.recurrence_type)} · ${escapeHtml(row.weekdays || "monatlich/einmalig")}</div></td><td class="message-cell"><span class="message-preview">${escapeHtml(row.next_run_date || "—")}</span><div class="person-phone">${escapeHtml(row.employee_first_name ? `${row.employee_first_name} ${row.employee_last_name}` : "Mitarbeiter wird vorgeschlagen")} · Log: ${escapeHtml(row.last_result || "—")}</div></td><td class="status-cell"><span class="status-pill" data-status="${Number(row.active) ? "done" : "new"}">${Number(row.active) ? "AKTIV" : "INAKTIV"}</span></td><td><button class="detail-button" type="button" data-record-index="${index}">Öffnen</button></td></tr>`).join("");
+        recordsBody.innerHTML = rows.map((row, index) => `<tr><td class="date-cell">${escapeHtml(row.contract_number)}</td><td class="person-cell"><strong>${escapeHtml(`${row.first_name} ${row.last_name}`)}</strong><span class="person-phone">${escapeHtml(row.customer_number || "—")}</span></td><td class="service-cell"><strong>${escapeHtml(row.service_type)}</strong><div class="person-phone">${escapeHtml(row.recurrence_type)} · ${escapeHtml(row.weekdays || "monatlich/einmalig")}</div></td><td class="message-cell"><span class="message-preview">${escapeHtml(row.next_run_date || "—")}</span><div class="person-phone">${escapeHtml(row.employee_first_name ? `${row.employee_first_name} ${row.employee_last_name}` : "Mitarbeiter wird vorgeschlagen")} · Log: ${escapeHtml(row.last_result || "—")}</div>${Number(row.lifecycle_conflict) ? '<div class="person-phone">Außerhalb der Vertragslaufzeit</div>' : ""}</td><td class="status-cell"><span class="status-pill" data-status="${Number(row.active) ? "done" : "new"}">${Number(row.active) ? "AKTIV" : "INAKTIV"}</span></td><td><button class="detail-button" type="button" data-record-index="${index}">Öffnen</button></td></tr>`).join("");
         const empty = rows.length === 0; byId("empty-state").hidden = !empty; document.querySelector(".table-wrap table").hidden = empty; return;
     }
     if (currentType === "invoice") {
         recordsBody.innerHTML = rows.map((row, index) => `<tr><td class="date-cell">${escapeHtml(row.invoice_number)}</td><td class="person-cell"><strong>${escapeHtml(row.customer_name_snapshot || `${row.first_name} ${row.last_name}`)}</strong><span class="person-phone">${escapeHtml(row.customer_number || "—")}</span></td><td class="service-cell"><strong>${escapeHtml(row.order_number || "Ohne Auftrag")}</strong><div class="person-phone">Fällig: ${escapeHtml(row.due_date)}</div></td><td class="message-cell"><span class="message-preview">${escapeHtml(euro(row.gross_amount))}</span><div class="person-phone">Offen: ${escapeHtml(euro(row.outstanding_amount))}</div></td><td class="status-cell"><span class="status-pill" data-status="${row.status === "BEZAHLT" ? "done" : "new"}">${escapeHtml(row.status)}</span></td><td><button class="detail-button" type="button" data-record-index="${index}">Öffnen</button></td></tr>`).join("");
         const empty = rows.length === 0; byId("empty-state").hidden = !empty; document.querySelector(".table-wrap table").hidden = empty; return;
     }
-    if (currentType === "offer" || currentType === "contract") {
+    if (currentType === "contract") {
+        recordsBody.innerHTML = rows.map((row,index)=>contractRecordRow(row,index)).join("");
+        const empty = rows.length===0;
+        byId("empty-state").hidden=!empty;
+        document.querySelector(".table-wrap table").hidden=empty;
+        return;
+    }
+    if (currentType === "offer") {
         const offer = currentType === "offer";
         recordsBody.innerHTML = rows.map((row, index) => `
             <tr><td class="date-cell">${escapeHtml(offer ? row.quote_number : row.contract_number)}</td>
@@ -413,7 +547,7 @@ function renderRecords(rows) {
             <tr><td class="date-cell">${escapeHtml(row.order_number)}</td>
             <td class="person-cell"><strong>${escapeHtml(`${row.first_name} ${row.last_name}`)}</strong><span class="person-phone">${escapeHtml(row.customer_number || "—")}</span></td>
             <td class="service-cell"><strong>${escapeHtml(row.service_type)}</strong><div class="person-phone">${escapeHtml([row.address, row.postal_code, row.city].filter(Boolean).join(", ") || "—")}</div></td>
-            <td class="message-cell"><span class="message-preview">${escapeHtml(row.title)}</span><div class="person-phone">${escapeHtml(row.preferred_date || "Termin offen")} · ${escapeHtml(String(row.assignment_count || 0))} Einsatz(e)</div></td>
+            <td class="message-cell"><span class="message-preview">${escapeHtml(row.title)}</span><div class="person-phone">${escapeHtml(row.preferred_date || "Termin offen")} · ${escapeHtml(String(row.assignment_count || 0))} Einsatz(e)</div>${Number(row.required_crew_size)>1?`<div class="person-phone">${Number(row.staffed_crew_count)<Number(row.required_crew_size)?"Unterbesetzt · ":""}${Number(row.staffed_crew_count)}/${Number(row.required_crew_size)} Einsatzkräfte</div>`:""}</td>
             <td class="status-cell"><span class="status-pill" data-status="${escapeHtml(row.status === "ERLEDIGT" ? "done" : "new")}">${escapeHtml(row.status)} · ${escapeHtml(row.priority)}</span></td>
             <td><button class="detail-button" type="button" data-record-index="${index}">Öffnen</button></td></tr>`).join("");
         const empty = rows.length === 0;
@@ -424,10 +558,10 @@ function renderRecords(rows) {
     if (currentType === "customer") {
         recordsBody.innerHTML = rows.map((row, index) => `
             <tr><td class="date-cell">${escapeHtml(formatDate(row.created_at))}</td>
-            <td class="person-cell"><strong>${escapeHtml(`${row.first_name} ${row.last_name}`)}</strong><a href="mailto:${escapeHtml(row.email)}">${escapeHtml(row.email)}</a><div class="person-phone">${escapeHtml(row.customer_number || "—")}</div></td>
+            <td class="person-cell"><strong>${escapeHtml(row.company_name || [row.first_name,row.last_name].filter(Boolean).join(" "))}</strong>${row.email ? `<a href="mailto:${escapeHtml(row.email)}">${escapeHtml(row.email)}</a>` : ""}<div class="person-phone">${escapeHtml(row.customer_number || "—")}</div></td>
             <td class="service-cell">${escapeHtml(row.city || "—")}</td>
             <td class="message-cell"><span class="message-preview">${escapeHtml(row.phone || "—")}</span></td>
-            <td class="status-cell"><span class="status-pill" data-status="${row.status === "active" ? "done" : "new"}">${escapeHtml(row.status)}</span></td>
+            <td class="status-cell"><span class="status-pill" data-status="${row.status === "active" ? "done" : "new"}">${escapeHtml(({active:"Aktiv",inactive:"Inaktiv",blocked:"Gesperrt"})[row.status]||row.status)}</span><br><span class="admin-record-type">${row.company_name?"Geschäftskunde":"Privatkunde"}</span></td>
             <td><button class="detail-button" type="button" data-record-index="${index}">Ansehen</button></td></tr>`).join("");
         const empty = rows.length === 0;
         byId("empty-state").hidden = !empty;
@@ -463,7 +597,7 @@ function renderRecords(rows) {
                 <td class="service-cell">${quote ? label : escapeHtml(label || "—")}</td>
                 <td class="message-cell"><span class="message-preview">${escapeHtml(quote ? (row.object_type || "") : (row.message || ""))}</span></td>
                 <td class="status-cell">
-                    ${(quote || appointment) ? `<select class="status-select" data-managed-status="${escapeHtml(row.id)}">${Object.entries(statusLabels).filter(([value]) => value !== "done" && (appointment ? ["pending","confirmed","in_progress","completed","cancelled"].includes(value) : !["pending","confirmed","cancelled"].includes(value))).map(([value, text]) => `<option value="${value}" ${value === status ? "selected" : ""}>${text}</option>`).join("")}</select>` : `<span class="status-pill" data-status="${status}">${statusLabels[status]}</span>`}
+                    ${(quote || appointment) ? `<select class="status-select" aria-label="Status ändern" data-managed-status="${escapeHtml(row.id)}">${Object.entries(statusLabels).filter(([value]) => value !== "done" && (appointment ? ["pending","confirmed","in_progress","completed","cancelled"].includes(value) : !["pending","confirmed","cancelled"].includes(value))).map(([value, text]) => `<option value="${value}" ${value === status ? "selected" : ""}>${text}</option>`).join("")}</select>` : `<span class="status-pill" data-status="${status}">${statusLabels[status]}</span>`}
                 </td>
                 <td><button class="detail-button" type="button" data-record-index="${index}">Ansehen</button></td>
             </tr>`;
@@ -474,10 +608,16 @@ function renderRecords(rows) {
     document.querySelector(".table-wrap table").hidden = isEmpty;
 }
 
+let recordsRequest = 0;
 async function loadSubmissions() {
+    if (currentType === "home") return window.adminDashboard.load();
     if (currentType === "schedule" || currentType === "service-report" || currentType === "reporting") return;
+    const request = ++recordsRequest;
+    const type = currentType;
+    const isCurrent = () => request === recordsRequest && type === currentType;
     const loading = byId("loading-state");
     loading.hidden = false;
+    window.adminManagement.clearError();
     byId("empty-state").hidden = true;
     document.querySelector(".table-wrap table").hidden = true;
     setNotice("");
@@ -488,6 +628,8 @@ async function loadSubmissions() {
         search: byId("search-input").value.trim(),
         page: String(currentPage)
     });
+    if (currentType === "document") params.delete("type");
+    if (currentType === "contract") params.set("schedule",byId("contract-schedule-filter").value);
     if (currentType === "invoice") {
         const customerId = byId("invoice-customer-filter").value, orderId = byId("invoice-order-filter").value, due = byId("invoice-due-filter").value;
         if (customerId) params.set("customer_id", customerId);
@@ -498,8 +640,12 @@ async function loadSubmissions() {
     try {
         const endpoint = currentType === "document" ? "/api/admin/documents" : currentType === "message" ? "/api/admin/messages" : currentType === "notification" ? "/api/admin/notifications" : currentType === "audit" ? "/api/admin/audit-logs" : currentType === "recurring" ? "/api/admin/recurring-orders" : currentType === "invoice" ? "/api/admin/invoices" : currentType === "order" ? "/api/admin/orders" : currentType === "employee" ? "/api/admin/employees" : currentType === "offer" ? "/api/admin/quotes" : currentType === "contract" ? "/api/admin/contracts" : currentType === "quote" ? "/api/admin/quote-requests" : currentType === "appointment" ? "/api/admin/appointments" : currentType === "customer" ? "/api/admin/customers" : "/api/admin/submissions";
         const result = await api(`${endpoint}?${params.toString()}`);
+        if (!isCurrent()) return;
         if (currentType === "quote") byId("nav-quote-count").textContent = result.rows.filter(row => row.status === "new").length;
         renderRecords(result.rows);
+        window.adminManagement.listCount(type,result.total);
+        if (currentType === "recurring") await loadRecurringOperations();
+        if (!isCurrent()) return;
         const resultPage = result.page || 1, pageSize = result.pageSize || result.rows.length || 1;
         const first = result.total === 0 ? 0 : (resultPage - 1) * pageSize + 1;
         const last = Math.min(resultPage * pageSize, result.total);
@@ -511,6 +657,7 @@ async function loadSubmissions() {
         byId("previous-page").disabled = resultPage <= 1 || currentType === "order";
         byId("next-page").disabled = last >= result.total || currentType === "order";
     } catch (error) {
+        if (!isCurrent()) return;
         currentRows = [];
         recordsBody.innerHTML = "";
         byId("empty-state").hidden = true;
@@ -520,14 +667,276 @@ async function loadSubmissions() {
         byId("previous-page").disabled = true;
         byId("next-page").disabled = true;
         setNotice(error.message);
+        window.adminManagement.listCount(type,null);
+        window.adminManagement.listFailed(type,error,loadSubmissions);
     } finally {
-        loading.hidden = true;
+        if (isCurrent()) loading.hidden = true;
     }
 }
+
+
+const recurringIssueLabels = {
+    UNSTAFFED:"Ohne Mitarbeiter",UNDERSTAFFED:"Unterbesetzt",ASSIGNMENT_CONFLICT:"Überschneidender Einsatz",
+    ABSENCE_CONFLICT:"Abwesenheitskonflikt",MANUAL_REVIEW:"Manuell prüfen",GENERATION_FAILED:"Generierung fehlgeschlagen"
+};
+let recurringExceptionPage=1, recurringOperationsLoad=0;
+async function loadRecurringOperations(page=1) {
+    const sequence=++recurringOperationsLoad;
+    const status=byId("recurring-operations-status");
+    status.textContent="Planungsdaten werden geladen …";
+    try {
+        const [result,settings]=await Promise.all([
+            api("/api/admin/recurring-orders/exceptions?page="+page),api("/api/admin/recurring-orders/automation")
+        ]);
+        if(sequence!==recurringOperationsLoad)return;
+        const form=byId("recurring-automation-form");
+        form.hidden=!settings.allowed;
+        form.elements.enabled.checked=settings.enabled;
+        form.elements.days.value=settings.days;
+        status.textContent=settings.allowed ? (settings.enabled ? "Automatische Generierung aktiv." : "Automatische Generierung aus.") : "Manuelle Generierung verfügbar.";
+        const issues=byId("recurring-exceptions-list");
+        issues.replaceChildren();
+        if(!result.rows.length)issues.textContent="Keine offenen Ausnahmen.";
+        for(const issue of result.rows){
+            const item=document.createElement("article"), text=document.createElement("span"), button=document.createElement("button");
+            item.className="assignment-row recurring-exception-card";
+            text.textContent=[recurringIssueLabels[issue.type],issue.order_number||issue.contract_number,issue.planned_start,issue.type==="UNDERSTAFFED"?issue.assigned_crew+"/"+issue.required_crew+" Einsatzkräfte":"",issue.title||issue.error_message].filter(Boolean).join(" · ");
+            button.type="button";
+            button.className="button button-light";
+            button.textContent=issue.order_id?"Auftrag öffnen":"Einsatzplan öffnen";
+            button.setAttribute("aria-label",button.textContent+": "+(issue.order_number||issue.contract_number));
+            button.onclick=()=> (issue.order_id
+                ? openOrderDialog({id:issue.order_id,order_number:issue.order_number})
+                : openRecurringDialog({id:issue.schedule_id,contract_number:issue.contract_number})).catch(error=>setNotice(error.message));
+            item.append(text,button);
+            issues.append(item);
+        }
+        recurringExceptionPage=page;
+        byId("recurring-exceptions-prev").disabled=page===1;
+        byId("recurring-exceptions-next").disabled=!result.hasMore;
+        const history=byId("recurring-runs-list");
+        history.replaceChildren();
+        if(!result.runs.length)history.textContent="Keine Läufe vorhanden.";
+        for(const run of result.runs){
+            const row=document.createElement("p");
+            const label={SUCCESS:"Erfolgreich",FAILED:"Fehlgeschlagen",SKIPPED:"Übersprungen"}[run.result];
+            row.textContent=[formatDate(run.created_at),run.action==="RUN_AUTOMATIC"?"Automatisch":"Manuell",label].join(" · ");
+            history.append(row);
+        }
+    }catch(error){if(sequence===recurringOperationsLoad)status.textContent=error.message;}
+}
+byId("recurring-operations-refresh").onclick=()=>loadRecurringOperations(recurringExceptionPage);
+byId("recurring-exceptions-prev").onclick=()=>loadRecurringOperations(recurringExceptionPage-1);
+byId("recurring-exceptions-next").onclick=()=>loadRecurringOperations(recurringExceptionPage+1);
+byId("recurring-automation-form").addEventListener("submit",async event=>{
+    event.preventDefault();
+    const form=event.currentTarget, button=event.submitter;
+    if(!button||button.disabled)return;
+    button.disabled=true;
+    try{
+        await api("/api/admin/recurring-orders/automation",{method:"PATCH",body:JSON.stringify({enabled:form.elements.enabled.checked,days:Number(form.elements.days.value)})});
+        await loadRecurringOperations(recurringExceptionPage);
+    }catch(error){byId("recurring-operations-status").textContent=error.message;}
+    finally{button.disabled=false;}
+});
+byId("recurring-daily-preset").onclick=()=>{
+    const form=byId("recurring-form");
+    form.elements.recurrence_type.value="INDIVIDUELL";
+    form.elements.weekdays.value="1,2,3,4,5,6,7";
+};
+
+
+const complaintStatusLabels={RECEIVED:"Eingegangen",IN_REVIEW:"In Prüfung",RESOLVED:"Gelöst",CLOSED:"Abgeschlossen"};
+let complaintsPage=1,complaintsSequence=0,activeComplaint=null,complaintBusy=false;
+async function loadComplaints(page=1){
+    const sequence=++complaintsSequence,mode=byId("complaints-filter").value;
+    const message=byId("complaints-status");
+    try{
+        const result=await api("/api/admin/complaints?status="+encodeURIComponent(mode)+"&page="+page);
+        if(sequence!==complaintsSequence)return;
+        complaintsPage=page;
+        const list=byId("complaints-list");
+        list.replaceChildren();
+        message.textContent=result.rows.length?"":"Keine Beschwerden gefunden.";
+        for(const record of result.rows){
+            const item=document.createElement("article"),text=document.createElement("span"),button=document.createElement("button");
+            item.className="assignment-row complaint-card";
+            text.textContent=["#"+record.id,record.first_name+" "+record.last_name,record.order_number,complaintStatusLabels[record.status]].filter(Boolean).join(" · ");
+            button.className="button button-light";button.type="button";button.dataset.complaintId=record.id;button.textContent="Prüfen";
+            item.append(text,button);list.append(item);
+        }
+        byId("complaints-prev").disabled=page===1;
+        byId("complaints-next").disabled=!result.hasMore;
+    }catch(error){if(sequence===complaintsSequence)message.textContent=error.message;}
+}
+async function showComplaint(id){
+    const {record,updates}=await api("/api/admin/complaints/"+id);
+    activeComplaint=record;
+    byId("complaint-summary").textContent=["#"+record.id,record.first_name+" "+record.last_name,record.order_number,complaintStatusLabels[record.status]].filter(Boolean).join(" · ");
+    byId("complaint-description").textContent=record.description;
+    byId("complaint-internal-status").textContent=record.incident_id?"Intern: "+record.incident_number+" · "+record.incident_status:"";
+    byId("complaint-incident-action").textContent=record.incident_id?"Qualitätsvorfall öffnen":"Qualitätsvorfall anlegen";
+    const history=byId("complaint-public-history");
+    history.replaceChildren();
+    for(const update of updates){
+        const paragraph=document.createElement("p");
+        paragraph.className="intake-description";
+        paragraph.textContent=[complaintStatusLabels[update.status],String(update.created_at).slice(0,10),update.response].filter(Boolean).join(" · ");
+        history.append(paragraph);
+    }
+    if(!updates.length)history.textContent="Noch keine öffentlichen Antworten.";
+    const form=byId("complaint-publish-form");
+    form.reset();form.elements.status.value=record.status;
+    form.dataset.publicationKey="";form.dataset.lastPayload="";
+    byId("complaint-action-status").textContent="";
+    const dialog=byId("complaint-dialog");
+    if(!dialog.open)dialog.showModal();
+}
+byId("complaints-filter").onchange=()=>loadComplaints();
+byId("complaints-prev").onclick=()=>loadComplaints(complaintsPage-1);
+byId("complaints-next").onclick=()=>loadComplaints(complaintsPage+1);
+byId("complaints-list").onclick=async event=>{
+    const button=event.target.closest("[data-complaint-id]");
+    if(!button||complaintBusy)return;
+    complaintBusy=true;
+    try{await showComplaint(button.dataset.complaintId);}
+    catch(error){byId("complaints-status").textContent=error.message;}
+    finally{complaintBusy=false;}
+};
+byId("complaint-incident-action").onclick=async ()=>{
+    if(!activeComplaint||complaintBusy)return;
+    complaintBusy=true;
+    const record=activeComplaint;
+    try{
+        let id=record.incident_id;
+        if(!id){
+            const result=await api("/api/admin/complaints/"+record.id+"/convert",{method:"POST",body:"{}"});
+            id=result.incidentId;
+        }
+        byId("complaint-dialog").close();
+        await window.openQualityIncident(id);
+        await loadComplaints(complaintsPage);
+    }catch(error){byId("complaint-action-status").textContent=error.message;}
+    finally{complaintBusy=false;}
+};
+byId("complaint-publish-form").onsubmit=async event=>{
+    event.preventDefault();
+    if(!activeComplaint||complaintBusy||!window.confirm("Diese Aktualisierung im Kundenportal veröffentlichen?"))return;
+    const form=event.currentTarget,payload=Object.fromEntries(new FormData(form)),encoded=JSON.stringify(payload);
+    if(form.dataset.lastPayload!==encoded||!form.dataset.publicationKey)form.dataset.publicationKey=crypto.randomUUID();
+    form.dataset.lastPayload=encoded;
+    complaintBusy=true;
+    const id=activeComplaint.id;
+    try{
+        await api("/api/admin/complaints/"+id+"/publish",{method:"POST",body:JSON.stringify({...payload,publication_key:form.dataset.publicationKey})});
+        await showComplaint(id);
+        byId("complaint-action-status").textContent="Aktualisierung veröffentlicht.";
+        await loadComplaints(complaintsPage);
+    }catch(error){byId("complaint-action-status").textContent=error.message;}
+    finally{complaintBusy=false;}
+};
 
 function isoToday(offset = 0) { const date = new Date(); date.setDate(date.getDate() + offset); return date.toISOString().slice(0, 10); }
 function scheduleDateText(value) { return new Intl.DateTimeFormat("de-DE", { weekday: "long", day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(`${value}T00:00:00`)); }
 function scheduleTime(value) { return String(value || "").slice(0, 5); }
+
+
+const absenceRequestLabels = {PENDING:"Offen",APPROVED:"Genehmigt",REJECTED:"Abgelehnt",WITHDRAWN:"Zurückgezogen"};
+let absenceRequestPage = 1, absenceRequestLoad = 0, absenceReview = null, absenceReviewBusy = false;
+async function loadAdminAbsenceRequests(page = 1) {
+    const sequence = ++absenceRequestLoad;
+    const status = byId("absence-request-filter").value;
+    const message = byId("absence-request-list-status");
+    message.textContent = "Anträge werden geladen …";
+    try {
+        const result = await api("/api/admin/absence-requests?status="+encodeURIComponent(status)+"&page="+page);
+        if (sequence !== absenceRequestLoad) return;
+        absenceRequestPage = page;
+        const list = byId("absence-request-list");
+        list.replaceChildren();
+        message.textContent = result.rows.length ? "" : "Keine Anträge vorhanden.";
+        for (const row of result.rows) {
+            const item = document.createElement("article");
+            item.className = "assignment-row absence-request-card";
+            const label = document.createElement("span");
+            label.textContent = [row.first_name+" "+row.last_name,row.absence_type,row.start_date+" – "+row.end_date,absenceRequestLabels[row.status]].join(" · ");
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "button button-light";
+            button.dataset.absenceRequestId = row.id;
+            button.textContent = row.status === "PENDING" ? "Prüfen" : "Details";
+            button.setAttribute("aria-label",button.textContent+": "+row.first_name+" "+row.last_name+", "+row.start_date);
+            item.append(label,button);
+            list.append(item);
+        }
+        byId("absence-request-prev").disabled = page === 1;
+        byId("absence-request-next").disabled = !result.hasMore;
+    } catch (error) {
+        if (sequence === absenceRequestLoad) message.textContent = error.message;
+    }
+}
+
+function showAbsenceConflicts(conflicts) {
+    absenceReview.conflicts = conflicts;
+    const list = byId("absence-request-conflict-list");
+    list.replaceChildren();
+    if (!conflicts.length) list.textContent = "Keine betroffenen Einsätze.";
+    for (const conflict of conflicts) {
+        const item = document.createElement("li");
+        item.textContent = [conflict.assignment_date,conflict.order_number,conflict.title,scheduleTime(conflict.start_time)+"–"+scheduleTime(conflict.end_time)].join(" · ");
+        list.append(item);
+    }
+    byId("absence-request-confirm-row").hidden = !conflicts.length;
+    byId("absence-request-confirm").checked = false;
+}
+byId("absence-request-filter").onchange = () => loadAdminAbsenceRequests();
+byId("absence-request-prev").onclick = () => loadAdminAbsenceRequests(absenceRequestPage-1);
+byId("absence-request-next").onclick = () => loadAdminAbsenceRequests(absenceRequestPage+1);
+byId("absence-request-list").addEventListener("click", async event => {
+    const button = event.target.closest("[data-absence-request-id]");
+    if (!button || absenceReviewBusy) return;
+    absenceReviewBusy = true;
+    try {
+        const result = await api("/api/admin/absence-requests/"+button.dataset.absenceRequestId);
+        const row = result.request;
+        absenceReview = {id:row.id,conflicts:[]};
+        byId("absence-request-summary").textContent = [row.first_name+" "+row.last_name,row.absence_type,row.start_date+" – "+row.end_date,absenceRequestLabels[row.status]].join(" · ");
+        byId("absence-request-note").textContent = row.note || "";
+        byId("absence-request-history").textContent = [row.decided_at ? scheduleDateText(String(row.decided_at).slice(0,10)) : "",row.decision_note || ""].filter(Boolean).join(" · ");
+        const form = byId("absence-request-review-form");
+        form.reset();
+        form.hidden = row.status !== "PENDING";
+        showAbsenceConflicts(result.conflicts);
+        byId("absence-request-review-status").textContent = "";
+        byId("absence-request-dialog").showModal();
+    } catch(error){ byId("absence-request-list-status").textContent = error.message; }
+    finally { absenceReviewBusy = false; }
+});
+byId("absence-request-review-form").addEventListener("submit",async event=>{
+    event.preventDefault();
+    if (!absenceReview || absenceReviewBusy || !event.submitter) return;
+    const status = event.submitter.value, conflicts = absenceReview.conflicts;
+    const message = byId("absence-request-review-status");
+    if (status==="APPROVED" && conflicts.length && !byId("absence-request-confirm").checked) {
+        message.textContent = "Bitte bestätigen Sie, dass Sie die betroffenen Einsätze geprüft haben.";
+        byId("absence-request-confirm").focus();
+        return;
+    }
+    absenceReviewBusy = true;
+    try {
+        await api("/api/admin/absence-requests/"+absenceReview.id,{method:"PATCH",body:JSON.stringify({
+            status,decision_note:event.currentTarget.elements.decision_note.value,conflict_ids:conflicts.map(conflict=>conflict.id)
+        })});
+        byId("absence-request-dialog").close();
+        await Promise.all([loadAdminAbsenceRequests(),loadSchedule()]);
+    } catch(error) {
+        message.textContent = error.message;
+        if (status==="APPROVED" && error.status===409) {
+            try { const fresh = await api("/api/admin/absence-requests/"+absenceReview.id); showAbsenceConflicts(fresh.conflicts); }
+            catch { /* Keep the original decision error visible. */ }
+        }
+    } finally { absenceReviewBusy = false; }
+});
 
 async function loadSchedule() {
     const date = byId("schedule-date").value || isoToday();
@@ -538,7 +947,7 @@ async function loadSchedule() {
     byId("schedule-week").textContent = scheduleWeek ? "Tagesansicht" : "Wochenansicht";
     const absenceRows = results.flatMap(result => result.employees.filter(employee => employee.absence).map(employee => ({ employee, date: result.date, absence: employee.absence })));
     byId("absence-list").innerHTML = absenceRows.map(row => `<article class="assignment-row"><div><strong>${escapeHtml(`${row.employee.first_name} ${row.employee.last_name}`)}</strong><br><span>${escapeHtml(row.absence.absence_type)} · ${escapeHtml(row.date)}</span></div></article>`).join("") || "<p class=\"empty-copy\">Keine Abwesenheiten im gewählten Zeitraum.</p>";
-    byId("schedule-grid").innerHTML = results.map(result => `<section class="schedule-day"><h3>${escapeHtml(scheduleDateText(result.date))}</h3>${result.employees.map(employee => { const assignments = employee.assignments.map(item => `<div class="schedule-block"><strong>${escapeHtml(item.order_number)}</strong><span>${scheduleTime(item.start_time)}–${scheduleTime(item.end_time)} · ${escapeHtml(item.title)}</span></div>`).join(""); const availability = employee.absence ? `<div class="schedule-absence">${escapeHtml(employee.absence.absence_type)}</div>` : employee.work_start ? `<small>${scheduleTime(employee.work_start)}–${scheduleTime(employee.work_end)}</small>` : "<small>Keine Arbeitszeit</small>"; return `<article class="schedule-employee"><header><strong>${escapeHtml(`${employee.first_name} ${employee.last_name}`)}</strong>${availability}</header><div class="schedule-lane">${assignments || `<span class="schedule-free">Frei</span>`}</div></article>`; }).join("")}</section>`).join("");
+    byId("schedule-grid").innerHTML = results.map(result => `<section class="schedule-day"><h3>${escapeHtml(scheduleDateText(result.date))}</h3>${result.employees.map(employee => { const assignments = employee.assignments.map(item => `<div class="schedule-block"><strong>${escapeHtml(item.order_number)}</strong>${item.absence_review_required ? '<span class="absence-review-flag">Abwesenheit · Einsatz prüfen</span>' : ""}<span>${scheduleTime(item.start_time)}–${scheduleTime(item.end_time)} · ${escapeHtml(item.title)}</span></div>`).join(""); const availability = employee.absence ? `<div class="schedule-absence">${escapeHtml(employee.absence.absence_type)}</div>` : employee.work_start ? `<small>${scheduleTime(employee.work_start)}–${scheduleTime(employee.work_end)}</small>` : "<small>Keine Arbeitszeit</small>"; return `<article class="schedule-employee"><header><strong>${escapeHtml(`${employee.first_name} ${employee.last_name}`)}</strong>${availability}</header><div class="schedule-lane">${assignments || `<span class="schedule-free">Frei</span>`}</div></article>`; }).join("")}</section>`).join("");
 }
 
 async function refreshAvailableEmployees() {
@@ -548,15 +957,111 @@ async function refreshAvailableEmployees() {
 }
 
 async function reloadDashboard() {
-    await Promise.all([loadSummary(), currentType === "reporting" ? Promise.all([loadReporting({force:true}),loadVisuals()]) : currentType === "service-report" ? loadServiceReports() : loadSubmissions(), loadQuoteNavCount(), loadCommercialNavCounts(), loadInvoiceNavCount(), loadRecurringNavCount(), loadEmployeeNavCount(), loadOrderNavCount()]);
+    await Promise.all([loadSummary(), currentType === "reporting" ? Promise.all([loadReporting({force:true}),loadVisuals()]) : currentType === "service-report" ? loadServiceReports() : currentType === "attendance" ? loadAttendance() : loadSubmissions(), loadQuoteNavCount(), loadCommercialNavCounts(), loadInvoiceNavCount(), loadRecurringNavCount(), loadEmployeeNavCount(), loadOrderNavCount()]);
 }
 
 function assignmentRow(assignment) {
-    return `<article class="assignment-row"><div><strong>${escapeHtml(`${assignment.first_name} ${assignment.last_name}`)}</strong><br><span>${escapeHtml(assignment.assignment_date)} · ${escapeHtml(String(assignment.start_time).slice(0, 5))}–${escapeHtml(String(assignment.end_time).slice(0, 5))} · ${escapeHtml(assignment.status)}</span></div><div class="assignment-actions"><button type="button" data-assignment-edit="${assignment.id}">Bearbeiten</button><button type="button" class="danger" data-assignment-delete="${assignment.id}">Entfernen</button></div></article>`;
+    return `<article class="assignment-row"><div><strong>${escapeHtml(`${assignment.first_name} ${assignment.last_name}`)}</strong><br><span>${escapeHtml(assignment.assignment_date)} · ${escapeHtml(String(assignment.start_time).slice(0, 5))}–${escapeHtml(String(assignment.end_time).slice(0, 5))} · ${escapeHtml(assignment.status)}</span>${assignment.absence_review_required ? '<span class="absence-review-flag">Abwesenheit · Einsatz prüfen</span>' : ""}</div><div class="assignment-actions"><button type="button" data-assignment-edit="${assignment.id}">Bearbeiten</button><button type="button" class="danger" data-assignment-delete="${assignment.id}">Entfernen</button></div></article>`;
 }
 
 function renderAssignments() {
     byId("order-assignment-list").innerHTML = orderAssignments.map(assignmentRow).join("") || "<p class=\"empty-copy\">Noch kein Mitarbeiter eingeplant.</p>";
+}
+
+let selectedOrderInvoice = null;
+
+function renderTeamBilling(billing) {
+    const list=byId("order-team-billing"), editable=!billing.invoice || billing.invoice.status==="ENTWURF";
+    list.replaceChildren();
+    for (const item of billing.team || []) {
+        const row=document.createElement("li"), name=document.createElement("span"), button=document.createElement("button");
+        row.className="assignment-row";
+        const state=item.exception_reason ? "Ausnahme dokumentiert" : item.complete ? "Anwesenheit und Bericht vollständig" :
+            (item.attendance_open?"Anwesenheit offen":item.attendance_needs_review?"Anwesenheit muss geprüft werden":item.attendance_complete?"Anwesenheit beendet":"Anwesenheit fehlt")+" · "+(item.report_reviewed?"Bericht geprüft":"Geprüfter Bericht fehlt");
+        name.textContent=item.first_name+" "+item.last_name+" · "+item.assignment_date+" · "+state+(item.exception_note?" · "+item.exception_note:"");
+        row.append(name);
+        if (editable && (item.exception_reason || (!item.complete && !item.attendance_open))) {
+            button.type="button";
+            button.className="button button-light";
+            button.textContent=item.exception_reason?"Ausnahme aufheben":"Ausnahme erfassen";
+            button.setAttribute("aria-label",button.textContent+" für "+item.first_name+" "+item.last_name);
+            button.addEventListener("click",()=>openBillingException(item));
+            row.append(button);
+        }
+        list.append(row);
+    }
+}
+
+async function openBillingException(item) {
+    const orderId=selectedOrder?.id;
+    if (!orderId) return;
+    const endpoint=`/api/admin/orders/${orderId}/assignments/${item.id}/billing-exception`;
+    if (item.exception_reason) {
+        if (!window.confirm("Ausnahme für diesen Einsatz aufheben?")) return;
+        try {
+            await api(endpoint,{method:"DELETE"});
+            renderOrderBilling((await api("/api/admin/orders/"+orderId)).billing);
+        } catch(error) {byId("order-billing-status").textContent=error.message;}
+        return;
+    }
+    const form=byId("billing-exception-form");
+    form.reset();
+    form.dataset.endpoint=endpoint;
+    form.dataset.orderId=orderId;
+    form.elements.reason.options[0].disabled=!item.absent;
+    form.elements.reason.value=item.absent?"ABSENT":"UNABLE_TO_COMPLETE";
+    byId("billing-exception-note").textContent="";
+    byId("billing-exception-dialog").showModal();
+}
+
+byId("billing-exception-form").addEventListener("submit",async event=>{
+    event.preventDefault();
+    const form=event.currentTarget,button=form.querySelector('[type="submit"]');
+    button.disabled=true;
+    try {
+        await api(form.dataset.endpoint,{method:"PUT",body:JSON.stringify(Object.fromEntries(new FormData(form)))});
+        renderOrderBilling((await api("/api/admin/orders/"+form.dataset.orderId)).billing);
+        byId("billing-exception-dialog").close();
+    } catch(error) {byId("billing-exception-note").textContent=error.message;}
+    finally {button.disabled=false;}
+});
+
+function renderOrderBilling(billing) {
+    selectedOrderInvoice = billing.invoice || null;
+    renderTeamBilling(billing);
+    const button = byId("order-billing-action");
+    button.hidden = !billing.eligible && !selectedOrderInvoice;
+    button.textContent = selectedOrderInvoice ? "Rechnung öffnen" : "Rechnungsentwurf erstellen";
+    byId("order-billing-status").textContent = selectedOrderInvoice
+        ? [selectedOrderInvoice.invoice_number, selectedOrderInvoice.status].join(" · ")
+        : billing.reason || "Geprüfter Leistungsnachweis vorhanden. Kundenbestätigung ist optional.";
+}
+
+byId("order-billing-action").addEventListener("click", async event => {
+    const button = event.currentTarget;
+    if (!selectedOrder || button.disabled) return;
+    button.disabled = true;
+    try {
+        let invoice = selectedOrderInvoice;
+        if (!invoice) {
+            const result = await api("/api/admin/orders/" + selectedOrder.id + "/create-invoice", { method: "POST", body: "{}" });
+            invoice = { id: result.id, invoice_number: result.invoiceNumber, status: "ENTWURF" };
+            renderOrderBilling({ invoice });
+        }
+        byId("order-dialog").close();
+        await openInvoiceDialog(invoice);
+    } catch (error) { byId("order-billing-status").textContent = error.message; }
+    finally { button.disabled = false; }
+});
+
+function commercialFormStatus(event, payload) {
+    const chosen = event.submitter?.dataset.publishStatus;
+    if (chosen) payload.status = chosen;
+    const savedStatus = event.currentTarget.dataset.savedStatus || "ENTWURF";
+    if (savedStatus === "ENTWURF" && !["ENTWURF", "STORNIERT"].includes(payload.status)) {
+        return window.confirm("Diesen Datensatz für den Kunden im Portal freigeben?");
+    }
+    return true;
 }
 
 async function openOrderDialog(order = null) {
@@ -572,9 +1077,11 @@ async function openOrderDialog(order = null) {
     byId("order-dialog-title").textContent = order ? `Auftrag ${order.order_number || "bearbeiten"}` : "Auftrag anlegen";
     byId("order-dialog-intro").textContent = order ? "Ändern Sie die Auftragsdaten oder planen Sie einen Einsatz." : "Erfassen Sie alle Angaben zum Auftrag. Pflichtfelder sind mit * markiert.";
     byId("order-assignment-section").hidden = !order;
+    byId("order-billing").hidden = !order;
     if (order) {
         const result = await api(`/api/admin/orders/${order.id}`);
         selectedOrder = result.order;
+        renderOrderBilling(result.billing);
         orderAssignments = result.assignments || [];
         Object.entries(result.order).forEach(([key, value]) => {
             const field = form.elements.namedItem(key);
@@ -652,19 +1159,30 @@ function renderQuoteItems() {
 
 async function fillCommercialCustomers() {
     const customers = await api("/api/admin/customers?page=1");
-    const options = `<option value="">Kunde wählen</option>${(customers.rows || []).map(customer => `<option value="${customer.id}">${escapeHtml(`${customer.first_name} ${customer.last_name}`)} · ${escapeHtml(customer.customer_number || customer.email)}</option>`).join("")}`;
+    const options = `<option value="">Kunde wählen</option>${(customers.rows || []).map(customer => `<option value="${customer.id}">${escapeHtml(customer.company_name||[customer.first_name,customer.last_name].join(" "))} · ${escapeHtml(customer.customer_number || customer.email)}</option>`).join("")}`;
     byId("offer-customer").innerHTML = options; byId("contract-customer").innerHTML = options;
 }
 async function fillPhase12Customers() {
     const result = await api("/api/admin/customers?page=1");
-    const options = `<option value="">Kunde wählen</option>${(result.rows || []).map(customer => `<option value="${customer.id}">${escapeHtml(`${customer.first_name} ${customer.last_name}`)} · ${escapeHtml(customer.customer_number || customer.email)}</option>`).join("")}`;
+    const options = `<option value="">Kunde wählen</option>${(result.rows || []).map(customer => `<option value="${customer.id}">${escapeHtml(customer.company_name||[customer.first_name,customer.last_name].join(" "))} · ${escapeHtml(customer.customer_number || customer.email)}</option>`).join("")}`;
     byId("document-customer").innerHTML = options;
     byId("message-customer").innerHTML = options;
 }
 
-async function openDocumentDialog() {
+async function openDocumentDialog(contract = null) {
     byId("document-form").reset(); byId("document-form-note").hidden = true;
-    await fillPhase12Customers(); byId("document-dialog").showModal();
+    await fillPhase12Customers();
+    if (contract) {
+        const fields=byId("document-form").elements;
+        const customer=fields.namedItem("customer_id");
+        if (![...customer.options].some(option=>option.value===String(contract.customer_id))) {
+            customer.add(new Option(contract.first_name+" "+contract.last_name+" · "+contract.customer_number,String(contract.customer_id)));
+        }
+        customer.value=contract.customer_id;
+        fields.namedItem("contract_id").value=contract.id;
+        fields.namedItem("document_type").value="VERTRAG";
+    }
+    byId("document-dialog").showModal();
 }
 
 async function openMessageDialog() {
@@ -672,41 +1190,142 @@ async function openMessageDialog() {
     await fillPhase12Customers(); byId("message-dialog").showModal();
 }
 async function openInvoiceDialog(invoice = null) {
-    const form=byId("invoice-form"); form.reset(); byId("invoice-form-note").hidden=true; invoiceItems=[blankInvoiceItem()];
+    const form=byId("invoice-form"); form.reset(); form.dataset.savedStatus = "ENTWURF"; form.querySelector("[data-publish-status]").hidden = false; byId("invoice-form-note").hidden=true; invoiceItems=[blankInvoiceItem()];
     const [customers,orders]=await Promise.all([api("/api/admin/customers?page=1"),api("/api/admin/orders")]);
-    byId("invoice-customer").innerHTML=`<option value="">Kunde wählen</option>${(customers.rows||[]).map(customer=>`<option value="${customer.id}">${escapeHtml(`${customer.first_name} ${customer.last_name}`)} · ${escapeHtml(customer.customer_number||customer.email)}</option>`).join("")}`;
+    byId("invoice-customer").innerHTML=`<option value="">Kunde wählen</option>${(customers.rows||[]).map(customer=>`<option value="${customer.id}">${escapeHtml(customer.company_name||[customer.first_name,customer.last_name].join(" "))} · ${escapeHtml(customer.customer_number||customer.email)}</option>`).join("")}`;
     byId("invoice-order").innerHTML=`<option value="">Ohne Auftrag</option>${(orders.rows||[]).map(order=>`<option value="${order.id}">${escapeHtml(order.order_number)} · ${escapeHtml(order.title)}</option>`).join("")}`;
     byId("invoice-dialog-title").textContent=invoice?`Rechnung ${invoice.invoice_number}`:"Rechnung anlegen"; byId("invoice-payments-panel").hidden=!invoice;
-    if(invoice){const result=await api(`/api/admin/invoices/${invoice.id}`);Object.entries(result.invoice).forEach(([key,value])=>{const field=form.elements.namedItem(key);if(field)field.value=/date|period/.test(key)&&value?String(value).slice(0,10):value??"";});invoiceItems=result.items||[blankInvoiceItem()];byId("invoice-payment-form").elements.namedItem("invoice_id").value=result.invoice.id;byId("invoice-payment-list").innerHTML=(result.payments||[]).map(payment=>`<article class="assignment-row"><div><strong>${escapeHtml(euro(payment.amount))}</strong><br><span>${escapeHtml(payment.payment_date)} · ${escapeHtml(payment.payment_method)} · ${escapeHtml(payment.payment_reference||"—")}</span></div></article>`).join("")||"<p class=\"empty-copy\">Noch keine Zahlungen.</p>";}
+    if(invoice){const result=await api("/api/admin/invoices/"+invoice.id);
+        const record = result.invoice;
+        for (const [id, value, label] of [["invoice-customer", record.customer_id, record.customer_name_snapshot], ["invoice-order", record.order_id, record.order_number]]) {
+            const select = byId(id);
+            if (value && !Array.from(select.options).some(option => option.value === String(value))) select.add(new Option(label || String(value), value));
+        }
+        Object.entries(result.invoice).forEach(([key,value])=>{const field=form.elements.namedItem(key);if(field)field.value=/date|period/.test(key)&&value?String(value).slice(0,10):value??"";});form.dataset.savedStatus = result.invoice.status; form.querySelector("[data-publish-status]").hidden = result.invoice.status !== "ENTWURF"; byId("invoice-payments-panel").hidden = result.invoice.status === "ENTWURF"; invoiceItems=result.items||[blankInvoiceItem()];byId("invoice-payment-form").elements.namedItem("invoice_id").value=result.invoice.id;byId("invoice-payment-list").innerHTML=(result.payments||[]).map(payment=>`<article class="assignment-row"><div><strong>${escapeHtml(euro(payment.amount))}</strong><br><span>${escapeHtml(payment.payment_date)} · ${escapeHtml(payment.payment_method)} · ${escapeHtml(payment.payment_reference||"—")}</span></div></article>`).join("")||"<p class=\"empty-copy\">Noch keine Zahlungen.</p>";}
     else { const today=new Date().toISOString().slice(0,10), due=new Date(Date.now()+12096e5).toISOString().slice(0,10); form.elements.namedItem("invoice_date").value=today;form.elements.namedItem("due_date").value=due; }
     renderInvoiceItems();byId("invoice-dialog").showModal();
 }
 
 async function openOfferDialog(offer = null, request = null) {
-    const form = byId("offer-form"); form.reset(); form.dataset.quoteRequestId = ""; byId("offer-form-note").hidden = true; byId("offer-actions").hidden = true;
+    const form = byId("offer-form"); form.reset(); form.dataset.savedStatus = "ENTWURF"; form.querySelector("[data-publish-status]").hidden = false; form.dataset.quoteRequestId = ""; byId("offer-form-note").hidden = true; byId("offer-actions").hidden = true;
     await fillCommercialCustomers(); quoteItems = [blankQuoteItem()];
     byId("offer-dialog-title").textContent = offer ? `Angebot ${offer.quote_number}` : "Angebot anlegen";
-    if (offer) { const result = await api(`/api/admin/quotes/${offer.id}`); Object.entries(result.quote).forEach(([key, value]) => { const field = form.elements.namedItem(key); if (field) field.value = /date/.test(key) && value ? String(value).slice(0, 10) : value ?? ""; }); quoteItems = result.items || [blankQuoteItem()]; byId("offer-actions").hidden = result.quote.status !== "ANGENOMMEN"; byId("create-order-from-offer").dataset.quoteId = result.quote.id; }
+    if (offer) { const result = await api(`/api/admin/quotes/${offer.id}`); Object.entries(result.quote).forEach(([key, value]) => { const field = form.elements.namedItem(key); if (field) field.value = /date/.test(key) && value ? String(value).slice(0, 10) : value ?? ""; }); form.dataset.savedStatus = result.quote.status; form.dataset.quoteRequestId = result.quote.quote_request_id || ""; form.querySelector("[data-publish-status]").hidden = result.quote.status !== "ENTWURF"; quoteItems = result.items || [blankQuoteItem()]; byId("offer-actions").hidden = result.quote.status !== "ANGENOMMEN"; byId("create-order-from-offer").dataset.quoteId = result.quote.id; }
     if (request) { const values = { customer_id: request.customer_id || "", contact_person: `${request.first_name || ""} ${request.last_name || ""}`.trim(), service_type: request.requested_service || "", service_description: request.message || request.additional_information || "", object_address: request.address || "", postal_code: request.postal_code || "", city: request.city || "", area_sqm: request.area_m2 || "", frequency: request.frequency || "" }; Object.entries(values).forEach(([key,value]) => { const field=form.elements.namedItem(key); if(field) field.value=value; }); form.dataset.quoteRequestId=String(request.id); }
     renderQuoteItems(); byId("offer-dialog").showModal();
 }
 
-async function openContractDialog(contract = null) {
-    const form = byId("contract-form"); form.reset(); byId("contract-form-note").hidden = true; await fillCommercialCustomers();
+const contractEmailLabels = {
+    NONE:"Kein E-Mail-Versand erfasst.",
+    ATTEMPTED:"Versandversuch erfasst. Ergebnis steht aus.",
+    ACCEPTED:"Vom Mailserver angenommen. Zustellung beim Kunden ist nicht bestätigt.",
+    FAILED:"Versand fehlgeschlagen.",
+    UNKNOWN:"Versandstatus unklar. Erneuter Versand ist gesperrt."
+};
+function renderContractEmail(email) {
+    byId("contract-email-panel").hidden = !email;
+    byId("contract-email-retry").hidden = !email?.canRetry;
+    byId("contract-email-status").textContent = email ? contractEmailLabels[email.status] : "";
+    byId("contract-email-history").hidden = !email?.attempts.length;
+    byId("contract-email-attempts").replaceChildren(...(email?.attempts || []).map(entry=>{
+        const row = document.createElement("li");
+        row.textContent = entry.recordedAt+" · "+contractEmailLabels[entry.status];
+        return row;
+    }));
+}
+byId("contract-email-retry").addEventListener("click", async event => {
+    const button = event.currentTarget;
+    const id = byId("contract-form").elements.namedItem("id").value;
+    button.disabled = true;
+    try {
+        await api(`/api/admin/contracts/${id}/email/retry`,{method:"POST",body:"{}"});
+        if (byId("contract-form").elements.namedItem("id").value===id) {
+            renderContractEmail((await api(`/api/admin/contracts/${id}`)).email);
+        }
+    } catch (error) {
+        byId("contract-email-status").textContent = error.message;
+    } finally { button.disabled = false; }
+});
+
+let editedContract = null;
+function renderContractLinks(result) {
+    editedContract = result;
+    byId("contract-links").hidden = !result;
+    const links = (result?.documents || []).map(file=> {
+        const item = document.createElement("li");
+        const link = document.createElement("a");
+        link.href = `/api/admin/documents/${file.id}`;
+        link.textContent = file.file_name;
+        item.append(link);
+        return item;
+    });
+    byId("contract-documents").replaceChildren(...links);
+    byId("contract-number-display").value = result?.contract.contract_number || "";
+    byId("contract-schedule-button").hidden = !result?.schedule && result?.contract.status!=="AKTIV";
+    byId("contract-schedule-button").textContent = result?.schedule ? "Einsatzplan bearbeiten" : "Einsatzplan anlegen";
+    const warnings = [];
+    if (result?.scheduleConflict) warnings.push("Einsatzplan liegt außerhalb der Vertragslaufzeit.");
+    if (result?.ordersBeyondEnd.length) warnings.push("Bereits geplante Aufträge nach Vertragsende: "+result.ordersBeyondEnd.map(order=>order.order_number).join(", "));
+    byId("contract-schedule-warning").textContent = warnings.join(" ");
+}
+byId("contract-add-document").addEventListener("click",()=>openDocumentDialog(editedContract.contract).catch(error=>setNotice(error.message)));
+byId("contract-schedule-button").addEventListener("click",()=>{
+    const {contract,schedule}=editedContract;
+    openRecurringDialog(schedule?{...schedule,contract_number:contract.contract_number}:null,contract).catch(error=>setNotice(error.message));
+});
+
+let contractCustomerSearchVersion=0;
+byId("contract-customer-search").addEventListener("input",async event=>{
+    const version=++contractCustomerSearchVersion, query=event.currentTarget.value.trim(), select=byId("contract-customer");
+    try {
+        const result=await api("/api/admin/customers?page=1&search="+encodeURIComponent(query));
+        if (version!==contractCustomerSearchVersion) return;
+        const selected=select.value ? select.selectedOptions[0] : null;
+        select.replaceChildren(new Option("Kunde wählen",""),...(result.rows||[]).map(customer=>new Option((customer.company_name||customer.first_name+" "+customer.last_name)+" · "+customer.customer_number,String(customer.id))));
+        if (selected && ![...select.options].some(option=>option.value===selected.value)) select.add(selected);
+        if (selected) select.value=selected.value;
+        byId("contract-customer-search-status").textContent=result.rows.length===1 ? "1 Ergebnis" : result.rows.length ? result.rows.length+" Ergebnisse" : "Keine passenden Kunden gefunden.";
+    } catch(error) { if (version===contractCustomerSearchVersion) byId("contract-customer-search-status").textContent=error.message; }
+});
+async function openContractDialog(contract = null, historical = false, newCustomer = null) {
+    contractCustomerSearchVersion++;
+    byId("contract-customer-search-status").textContent="";
+    const form = byId("contract-form"); form.reset(); renderContractEmail(null); renderContractLinks(null); form.dataset.registrationKey=crypto.randomUUID(); form.elements.namedItem("historical_registration").disabled=false; form.elements.namedItem("historical_registration").checked=historical;
+    byId("historical-contract-hint").hidden=!historical;
+    byId("save-contract-button").textContent=historical?"Angaben prüfen":"Vertrag speichern";
+    if (historical) form.elements.namedItem("status").value="AKTIV"; form.dataset.savedStatus = "ENTWURF"; form.querySelector("[data-publish-status]").hidden = true; byId("contract-form-note").hidden = true; await fillCommercialCustomers();
     const offers = await api("/api/admin/quotes"); byId("contract-quote").innerHTML = `<option value="">Ohne Angebot</option>${offers.rows.map(offer => `<option value="${offer.id}">${escapeHtml(offer.quote_number)} · ${escapeHtml(`${offer.first_name} ${offer.last_name}`)}</option>`).join("")}`;
-    byId("contract-dialog-title").textContent = contract ? `Vertrag ${contract.contract_number}` : "Vertrag anlegen";
-    if (contract) { const result = await api(`/api/admin/contracts/${contract.id}`); Object.entries(result.contract).forEach(([key,value]) => { const field=form.elements.namedItem(key); if(field) field.value=/date/.test(key)&&value?String(value).slice(0,10):value??""; }); }
+    byId("contract-dialog-title").textContent = contract ? `Vertrag ${contract.contract_number}` : historical ? "Bestehenden Vertrag erfassen" : "Vertrag anlegen";
+    if (contract) { const result = await api(`/api/admin/contracts/${contract.id}`); renderContractEmail(result.email); renderContractLinks(result); const customer=byId("contract-customer"); if (![...customer.options].some(option=>option.value===String(result.contract.customer_id))) customer.add(new Option(result.contract.first_name+" "+result.contract.last_name+" · "+result.contract.customer_number,String(result.contract.customer_id))); form.dataset.savedStatus = result.contract.status; form.querySelector("[data-publish-status]").hidden = result.contract.status !== "ENTWURF" || Boolean(result.contract.historical_registration); Object.entries(result.contract).forEach(([key,value]) => { const field=form.elements.namedItem(key); if(field) field.value=/date/.test(key)&&value?String(value).slice(0,10):value??""; }); }
+    if (editedContract?.contract.historical_registration) byId("historical-contract-hint").hidden=false;
+    if(newCustomer){const select=byId("contract-customer");if(![...select.options].some(o=>o.value===String(newCustomer.id)))select.add(new Option(newCustomer.label,String(newCustomer.id)));select.value=newCustomer.id;}
     byId("contract-dialog").showModal();
 }
 
-async function openRecurringDialog(schedule = null) {
+async function openRecurringDialog(schedule = null, contract = null) {
     const form = byId("recurring-form");
     const [contracts, employees] = await Promise.all([api("/api/admin/contracts?status=AKTIV"), api("/api/admin/employees?status=ACTIVE&page=1")]);
     byId("recurring-contract").innerHTML = `<option value="">Vertrag wählen</option>${(contracts.rows || []).map(contract => `<option value="${contract.id}">${escapeHtml(contract.contract_number)} · ${escapeHtml(`${contract.first_name} ${contract.last_name}`)}</option>`).join("")}`;
-    byId("recurring-employee").innerHTML = `<option value="">Automatisch vorschlagen</option>${(employees.rows || []).map(employee => `<option value="${employee.id}">${escapeHtml(`${employee.first_name} ${employee.last_name}`)}</option>`).join("")}`;
+    byId("recurring-employee").innerHTML = `${(employees.rows || []).map(employee => `<option value="${employee.id}">${escapeHtml(`${employee.first_name} ${employee.last_name}`)}</option>`).join("")}`;
     form.reset(); form.elements.namedItem("id").value = ""; byId("recurring-form-note").hidden = true;
     byId("recurring-dialog-title").textContent = schedule ? `Einsatzplan ${schedule.contract_number}` : "Wiederkehrenden Einsatzplan anlegen";
-    if (schedule) { const result = await api(`/api/admin/recurring-orders/${schedule.id}`); Object.entries(result.schedule).forEach(([key, value]) => { const field = form.elements.namedItem(key); if (field) field.value = /date/.test(key) && value ? String(value).slice(0, 10) : (value ?? ""); }); form.elements.namedItem("id").value = result.schedule.id; form.elements.namedItem("active").value = Number(result.schedule.active) ? "1" : "0"; }
+    if (schedule) { const result = await api(`/api/admin/recurring-orders/${schedule.id}`); Object.entries(result.schedule).forEach(([key, value]) => { const field = form.elements.namedItem(key); if (field && key!=="preferred_employee_ids") field.value = /date/.test(key) && value ? String(value).slice(0, 10) : (value ?? ""); }); const preferred=result.schedule.preferred_employee_ids || [result.schedule.preferred_employee_id]; for (const option of byId("recurring-employee").options) option.selected=preferred.map(String).includes(option.value); form.elements.namedItem("id").value = result.schedule.id; form.elements.namedItem("active").value = Number(result.schedule.active) ? "1" : "0"; }
+    if (contract) {
+        const fields=form.elements;
+        if (![...fields.namedItem("contract_id").options].some(option=>option.value===String(contract.id))) {
+            fields.namedItem("contract_id").add(new Option(contract.contract_number,String(contract.id)));
+        }
+        fields.namedItem("contract_id").value=contract.id;
+        if (!schedule) {
+            fields.namedItem("start_date").value=contract.start_date;
+            fields.namedItem("end_date").value=[contract.end_date,contract.termination_date].filter(Boolean).sort()[0]||"";
+        }
+    }
+    if (schedule) {
+        const start=form.elements.namedItem("preferred_start_time").value;
+        const end=contractScheduleMinutes(start)+Number(form.elements.namedItem("duration_minutes").value);
+        if (end<1440) form.elements.namedItem("planned_end_time").value=String(Math.floor(end/60)).padStart(2,"0")+":"+String(end%60).padStart(2,"0");
+    } else if (contract) form.elements.namedItem("recurrence_type").value=contract.interval_type;
     byId("recurring-dialog").showModal();
 }
 
@@ -781,11 +1400,34 @@ async function openDetails(index) {
             const result = await api(`/api/admin/customers/${row.id}`);
             const customer = result.customer;
             byId("detail-type").textContent = `KUNDE ${customer.customer_number || `#${customer.id}`}`;
-            byId("detail-name").textContent = `${customer.first_name} ${customer.last_name}`;
+            byId("detail-name").textContent=customer.company_name||(customer.first_name+" "+customer.last_name);
             byId("detail-date").textContent = formatDate(customer.created_at);
             byId("detail-service").textContent = customer.city || "—";
-            byId("detail-message").textContent = "Kundenkonto im Kundenportal.";
-            const email = byId("detail-email"); email.textContent = customer.email; email.href = `mailto:${customer.email}`;
+            const summary=byId("detail-message");
+            summary.textContent = customer.portal_enabled?"Portalzugang aktiviert.":"Kundendatensatz ohne Portalzugang.";
+            const details = byId("customer-detail-sections");
+            details.replaceChildren();
+            window.adminManagement.customerDetail(details,customer,(type,record)=>{
+                byId("detail-dialog").close();
+                byId("search-input").value = type==="invoice"?"":type==="appointment"?(record.email || record.last_name || ""):(record.customer_number || "");
+                if(type==="invoice")byId("invoice-customer-filter").value=record.id;
+                document.querySelector('.nav-item[data-type="'+type+'"]').click();
+            });
+            if(customer.status==="active"&&!customer.portal_enabled){
+                const button=document.createElement("button");
+                button.type="button";button.className="button button-light";button.textContent="Portal-Einladungslink erstellen";
+                button.onclick=()=>{
+                    const form=byId("customer-invite-form");
+                    form.dataset.customerId=customer.id;
+                    form.elements.email.value=customer.email||"";
+                    form.elements.email.readOnly=Boolean(customer.email);
+                    byId("customer-invite-note").textContent="";
+                    byId("customer-invite-link").value="";
+                    byId("customer-invite-dialog").showModal();
+                };
+                summary.append(document.createElement("br"),button);
+            }
+            const email = byId("detail-email"); email.textContent=customer.email||"—";if(customer.email)email.href="mailto:"+customer.email;else email.removeAttribute("href");
             byId("detail-phone-row").hidden = false; byId("detail-phone").textContent = customer.phone || "—";
             byId("detail-quote-extra").hidden = false;
             byId("detail-quote-values").textContent = `${customer.customer_number || "—"} · ${customer.status}${customer.address ? ` · ${customer.address}, ${customer.postal_code || ""} ${customer.city || ""}` : ""}`;
@@ -811,6 +1453,11 @@ async function openDetails(index) {
     byId("resend-employee-invite").hidden = true;
     byId("detail-dialog").showModal();
 }
+
+byId("detail-dialog").addEventListener("close",()=>{
+    const sections=byId("customer-detail-sections");
+    if (!byId("detail-dialog").open) { sections.hidden=true; sections.replaceChildren(); }
+});
 
 async function initialize() {
     try {
@@ -889,14 +1536,34 @@ byId("action-center-previous").addEventListener("click",()=>{if(actionCenterPage
 byId("action-center-next").addEventListener("click",()=>{actionCenterPage+=1;loadActionCenter();});
 byId("action-center-body").addEventListener("click",event=>{const button=event.target.closest("[data-action-target]");if(!button)return;const target=button.dataset.actionTarget;if(!document.querySelector(`.nav-item[data-type="${target}"]`))return;currentType=target;currentPage=1;updateViewHeading();if(target==="materials")loadMaterials().catch(error=>setNotice(error.message));else if(target==="service-report")loadServiceReports().catch(error=>setNotice(error.message));else if(target==="notification")loadSubmissions().catch(error=>setNotice(error.message));else loadSubmissions().catch(error=>setNotice(error.message));});
 
+
+async function loadManagementView() {
+    switch(currentType) {
+        case "schedule": return Promise.all([loadSchedule(),loadAdminAbsenceRequests()]);
+        case "attendance": return loadAttendance();
+        case "live-locations": {
+            try { await loadLiveLocations(); if (currentType === "live-locations") startLiveLocationAutoRefresh(); }
+            catch(error) { byId("live-locations-message").textContent=error.message; byId("live-locations-message").hidden=false; }
+            return;
+        }
+        case "finance": setFinanceFilterOptions(); return loadFinance();
+        case "action-center": return loadActionCenter();
+        case "reporting": return Promise.all([loadReporting(),loadVisuals()]);
+        case "service-report": return loadServiceReports();
+        case "quality": return window.loadQualityIncidents?.();
+        case "materials": return loadMaterials();
+        default: return loadSubmissions();
+    }
+}
 document.querySelectorAll(".nav-item").forEach(button => {
     button.addEventListener("click", async () => {
         if (currentType === button.dataset.type) return;
+        stopLiveLocationAutoRefresh();
         currentType = button.dataset.type;
         currentPage = 1;
         byId("status-filter").value = "all";
         updateViewHeading();
-        if (currentType === "schedule") { try { await loadSchedule(); } catch (error) { setNotice(error.message); } } else if (currentType === "finance") { try { setFinanceFilterOptions(); await loadFinance(); } catch (error) { setNotice(error.message); } } else if (currentType === "action-center") { await loadActionCenter(); } else if (currentType === "reporting") { await Promise.all([loadReporting(),loadVisuals()]); } else if (currentType === "service-report") { await loadServiceReports(); } else if (currentType === "quality") { await window.loadQualityIncidents?.(); } else if (currentType === "materials") { await loadMaterials(); } else loadSubmissions();
+        await window.adminManagement.load(currentType,loadManagementView);
     });
 });
 
@@ -926,6 +1593,7 @@ byId("next-page").addEventListener("click", () => {
 });
 
 byId("refresh-button").addEventListener("click", reloadDashboard);
+byId("live-locations-refresh").addEventListener("click", () => loadLiveLocations().catch(error => { byId("live-locations-message").textContent=error.message; byId("live-locations-message").hidden=false; }));
 
 byId("schedule-date").value = isoToday();
 byId("schedule-date").addEventListener("change", () => loadSchedule().catch(error => setNotice(error.message)));
@@ -1054,6 +1722,61 @@ byId("order-form").addEventListener("submit", async event => {
 });
 
 byId("create-offer-button").addEventListener("click", () => openOfferDialog().catch(error => setNotice(error.message)));
+byId("register-existing-contract").addEventListener("click",()=>openContractDialog(null,true).catch(error=>setNotice(error.message)));
+byId("contract-schedule-filter").addEventListener("change",()=>{ currentPage=1; loadSubmissions().catch(error=>setNotice(error.message)); });
+let newlyCreatedCustomer=null;
+const createCustomerForm=byId("customer-create-form");
+function setCustomerFormRequirements(){
+    const business=createCustomerForm.elements.customer_type.value==="BUSINESS";
+    createCustomerForm.elements.first_name.required=!business;
+    createCustomerForm.elements.last_name.required=!business;
+    createCustomerForm.elements.company_name.required=business;
+}
+createCustomerForm.elements.customer_type.onchange=setCustomerFormRequirements;
+byId("create-customer-button").onclick=()=>{
+    createCustomerForm.reset();
+    setCustomerFormRequirements();
+    createCustomerForm.dataset.registrationKey=crypto.randomUUID();
+    newlyCreatedCustomer=null;
+    createCustomerForm.querySelector('[type="submit"]').disabled=false;
+    byId("customer-create-note").textContent="";
+    byId("customer-create-contract").hidden=true;
+    byId("customer-create-dialog").showModal();
+};
+createCustomerForm.addEventListener("submit",async event=>{
+    event.preventDefault();
+    const button=createCustomerForm.querySelector('[type="submit"]'),note=byId("customer-create-note");
+    if(button.disabled)return;
+    button.disabled=true;
+    note.textContent="Kunde wird gespeichert …";
+    const payload=Object.fromEntries(new FormData(createCustomerForm));
+    try {
+        const result=await api("/api/admin/customers",{method:"POST",body:JSON.stringify({...payload,registration_key:createCustomerForm.dataset.registrationKey})});
+        newlyCreatedCustomer={id:result.id,label:payload.company_name||[payload.first_name,payload.last_name].join(" ")};
+        note.textContent=result.message+" "+result.customerNumber;
+        byId("customer-create-contract").hidden=false;
+        loadSubmissions();
+    }catch(error){note.textContent=error.message;button.disabled=false;}
+});
+byId("customer-create-contract").onclick=()=>{
+    if(!newlyCreatedCustomer)return;
+    byId("customer-create-dialog").close();
+    openContractDialog(null,true,newlyCreatedCustomer).catch(error=>setNotice(error.message));
+};
+byId("customer-invite-form").addEventListener("submit",async event=>{
+    event.preventDefault();
+    const form=event.currentTarget,button=form.querySelector('[type="submit"]'),note=byId("customer-invite-note");
+    button.disabled=true;
+    try{
+        const invite=await api("/api/admin/customers/"+form.dataset.customerId+"/invitation",{method:"POST",body:JSON.stringify({email:form.elements.email.value})});
+        const field=byId("customer-invite-link");
+        field.value=new URL(invite.invitationPath,location.origin).href;
+        form.elements.email.readOnly=true;
+        note.textContent=invite.message;
+        field.select();
+    }catch(error){note.textContent=error.message;}finally{button.disabled=false;}
+});
+byId("customer-invite-dialog").addEventListener("close",()=>{byId("customer-invite-link").value="";});
 byId("create-contract-button").addEventListener("click", () => openContractDialog().catch(error => setNotice(error.message)));
 byId("create-recurring-button").addEventListener("click", () => openRecurringDialog().catch(error => setNotice(error.message)));
 byId("generate-recurring-button").addEventListener("click", () => { byId("generator-form").reset(); byId("generator-form-note").hidden = true; byId("generator-dialog").showModal(); });
@@ -1062,31 +1785,126 @@ byId("create-document-button").addEventListener("click", () => openDocumentDialo
 byId("create-message-button").addEventListener("click", () => openMessageDialog().catch(error => setNotice(error.message)));
 byId("document-form").addEventListener("submit", async event => {
     event.preventDefault(); const form = event.currentTarget, note = byId("document-form-note"), data = new FormData(form);
-    try { const result = await api("/api/admin/documents", { method: "POST", body: data }); form.reset(); byId("document-dialog").close(); setNotice(result.message, "success"); await loadSubmissions(); } catch (error) { note.textContent = error.message; note.hidden = false; }
+    try { const result = await api("/api/admin/documents", { method: "POST", body: data }); form.reset(); byId("document-dialog").close(); setNotice(result.message, "success"); if(editedContract && byId("contract-dialog").open)renderContractLinks(await api(`/api/admin/contracts/${editedContract.contract.id}`)); await loadSubmissions(); } catch (error) { note.textContent = error.message; note.hidden = false; }
 });
 byId("admin-message-form").addEventListener("submit", async event => {
     event.preventDefault(); const form = event.currentTarget, note = byId("admin-message-form-note");
     try { const result = await api("/api/admin/messages", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(form))) }); form.reset(); byId("message-dialog").close(); setNotice(result.message, "success"); await loadSubmissions(); } catch (error) { note.textContent = error.message; note.hidden = false; }
 });
-byId("recurring-form").addEventListener("submit", async event => { event.preventDefault(); const form = event.currentTarget, id = form.elements.namedItem("id").value, note = byId("recurring-form-note"); try { const payload = Object.fromEntries(new FormData(form)); delete payload.id; const result = await api(id ? `/api/admin/recurring-orders/${id}` : "/api/admin/recurring-orders", { method: id ? "PATCH" : "POST", body: JSON.stringify(payload) }); byId("recurring-dialog").close(); setNotice(result.message, "success"); await reloadDashboard(); } catch (error) { note.textContent = error.message; note.hidden = false; } });
-byId("generator-form").addEventListener("submit", async event => { event.preventDefault(); const note = byId("generator-form-note"); try { const result = await api("/api/admin/recurring-orders/generate", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget))) }); const summary = result.summary; note.textContent = `Geprüft: ${summary.checkedContracts} · Neu: ${summary.created} · Bereits vorhanden: ${summary.existing} · Ohne Mitarbeiter: ${summary.noAvailability} · Fehler: ${summary.failed}`; note.hidden = false; note.classList.remove("is-error"); await reloadDashboard(); } catch (error) { note.textContent = error.message; note.hidden = false; } });
+function contractScheduleMinutes(time) {
+    const [hours,minutes]=time.split(":").map(Number);
+    return hours*60+minutes;
+}
+byId("recurring-form").addEventListener("submit",async event=>{
+    event.preventDefault();
+    const form=event.currentTarget,note=byId("recurring-form-note"),id=form.elements.namedItem("id").value;
+    if (form.dataset.saving==="true") return;
+    const data=new FormData(form),payload=Object.fromEntries(data);
+    delete payload.id;
+    payload.preferred_employee_ids=data.getAll("preferred_employee_ids").map(Number);
+    payload.duration_minutes=contractScheduleMinutes(payload.planned_end_time)-contractScheduleMinutes(payload.preferred_start_time);
+    if (payload.duration_minutes<15 || !Number.isFinite(payload.duration_minutes)) {
+        note.textContent="Das geplante Ende muss am selben Tag mindestens 15 Minuten nach Beginn liegen.";
+        note.hidden=false;
+        return;
+    }
+    if (!window.confirm("Einsatzplan speichern? Bereits geplante Aufträge bleiben bestehen.")) return;
+    payload.confirm_schedule_change=true;
+    form.dataset.saving="true";
+    try {
+        const result=await api(id?`/api/admin/recurring-orders/${id}`:"/api/admin/recurring-orders",{method:id?"PATCH":"POST",body:JSON.stringify(payload)});
+        byId("recurring-dialog").close();
+        setNotice(result.message,"success");
+        if (editedContract && byId("contract-dialog").open) renderContractLinks(await api(`/api/admin/contracts/${editedContract.contract.id}`));
+        await reloadDashboard();
+    } catch (error) {
+        note.textContent=error.message;
+        note.hidden=false;
+    } finally { delete form.dataset.saving; }
+});
+byId("generator-form").addEventListener("submit", async event => { event.preventDefault(); const note = byId("generator-form-note"); try { const result = await api("/api/admin/recurring-orders/generate", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget))) }); const summary = result.summary; if(summary.busy){note.textContent="Eine Generierung läuft bereits.";note.hidden=false;return;} note.textContent = `Geprüft: ${summary.checkedContracts} · Neu: ${summary.created} · Bereits vorhanden: ${summary.existing} · Ohne Mitarbeiter: ${summary.noAvailability} · Unterbesetzt: ${summary.understaffed || 0} · Fehler: ${summary.failed}`; note.hidden = false; note.classList.remove("is-error"); await reloadDashboard(); } catch (error) { note.textContent = error.message; note.hidden = false; } });
 byId("add-invoice-item").addEventListener("click", () => { invoiceItems.push(blankInvoiceItem()); renderInvoiceItems(); });
 byId("invoice-items").addEventListener("change", event => { const row=event.target.closest("[data-invoice-item]"); if(!row||!event.target.dataset.field)return; invoiceItems[Number(row.dataset.invoiceItem)][event.target.dataset.field]=event.target.value; renderInvoiceItems(); });
 byId("invoice-items").addEventListener("click", event => { const button=event.target.closest("[data-remove-invoice-item]"); if(!button)return; invoiceItems.splice(Number(button.dataset.removeInvoiceItem),1); if(!invoiceItems.length)invoiceItems.push(blankInvoiceItem()); renderInvoiceItems(); });
-byId("invoice-form").addEventListener("submit", async event => { event.preventDefault(); const form=event.currentTarget,note=byId("invoice-form-note"),id=form.elements.namedItem("id").value; try { const payload=Object.fromEntries(new FormData(form));delete payload.id;if(!id || payload.status === "ENTWURF") payload.items=invoiceItems;const result=await api(id?`/api/admin/invoices/${id}`:"/api/admin/invoices",{method:id?"PATCH":"POST",body:JSON.stringify(payload)});note.textContent=result.message;note.hidden=false;note.classList.remove("is-error");if(!id){form.elements.namedItem("id").value=result.id;byId("invoice-dialog-title").textContent=`Rechnung ${result.invoiceNumber}`;byId("invoice-payments-panel").hidden=false;byId("invoice-payment-form").elements.namedItem("invoice_id").value=result.id;}await reloadDashboard(); }catch(error){note.textContent=error.message;note.hidden=false;} });
+byId("invoice-form").addEventListener("submit", async event => { event.preventDefault(); const form=event.currentTarget,note=byId("invoice-form-note"),id=form.elements.namedItem("id").value; try { const payload=Object.fromEntries(new FormData(form));delete payload.id;if(!commercialFormStatus(event,payload))return;if(!id || form.dataset.savedStatus === "ENTWURF") payload.items=invoiceItems;const result=await api(id?`/api/admin/invoices/${id}`:"/api/admin/invoices",{method:id?"PATCH":"POST",body:JSON.stringify(payload)});note.textContent=result.message;note.hidden=false;note.classList.remove("is-error");form.dataset.savedStatus=result.totals.status;form.elements.namedItem("status").value=payload.status;form.querySelector("[data-publish-status]").hidden=result.totals.status!=="ENTWURF";byId("invoice-payments-panel").hidden=result.totals.status==="ENTWURF";if(!id){form.elements.namedItem("id").value=result.id;byId("invoice-dialog-title").textContent=`Rechnung ${result.invoiceNumber}`;byId("invoice-payment-form").elements.namedItem("invoice_id").value=result.id;}await reloadDashboard(); }catch(error){note.textContent=error.message;note.hidden=false;} });
 byId("invoice-payment-form").addEventListener("submit", async event => { event.preventDefault(); const form=event.currentTarget,id=form.elements.namedItem("invoice_id").value; if(!id)return; try { await api(`/api/admin/invoices/${id}/payments`,{method:"POST",body:JSON.stringify(Object.fromEntries(new FormData(form)))}); const result=await api(`/api/admin/invoices/${id}`); byId("invoice-payment-list").innerHTML=(result.payments||[]).map(payment=>`<article class="assignment-row"><div><strong>${escapeHtml(euro(payment.amount))}</strong><br><span>${escapeHtml(payment.payment_date)} · ${escapeHtml(payment.payment_method)}</span></div></article>`).join(""); form.reset();form.elements.namedItem("invoice_id").value=id;await reloadDashboard(); }catch(error){byId("invoice-form-note").textContent=error.message;byId("invoice-form-note").hidden=false;} });
 byId("add-quote-item").addEventListener("click", () => { quoteItems.push(blankQuoteItem()); renderQuoteItems(); });
 byId("quote-items").addEventListener("change", event => { const row = event.target.closest("[data-quote-item]"); if (!row || !event.target.dataset.field) return; quoteItems[Number(row.dataset.quoteItem)][event.target.dataset.field] = event.target.value; renderQuoteItems(); });
 byId("quote-items").addEventListener("click", event => { const button = event.target.closest("[data-remove-quote-item]"); if (!button) return; quoteItems.splice(Number(button.dataset.removeQuoteItem), 1); if (!quoteItems.length) quoteItems.push(blankQuoteItem()); renderQuoteItems(); });
 byId("offer-form").addEventListener("submit", async event => {
     event.preventDefault(); const form = event.currentTarget, note = byId("offer-form-note"), id = form.elements.namedItem("id").value;
-    try { const payload = Object.fromEntries(new FormData(form)); delete payload.id; payload.quote_request_id = form.dataset.quoteRequestId || ""; payload.items = quoteItems; const result = await api(id ? `/api/admin/quotes/${id}` : "/api/admin/quotes", { method: id ? "PATCH" : "POST", body: JSON.stringify(payload) }); form.dataset.quoteRequestId = ""; note.textContent = result.message; note.hidden = false; note.classList.remove("is-error"); if (!id) { form.elements.namedItem("id").value = result.id; byId("offer-dialog-title").textContent = `Angebot ${result.quoteNumber}`; } await reloadDashboard(); } catch (error) { note.textContent = error.message; note.hidden = false; }
+    try { const payload = Object.fromEntries(new FormData(form)); delete payload.id; payload.quote_request_id = form.dataset.quoteRequestId || ""; payload.items = quoteItems; if(!commercialFormStatus(event,payload))return; const result = await api(id ? `/api/admin/quotes/${id}` : "/api/admin/quotes", { method: id ? "PATCH" : "POST", body: JSON.stringify(payload) }); form.dataset.savedStatus = payload.status; form.elements.namedItem("status").value=payload.status; form.querySelector("[data-publish-status]").hidden=payload.status!=="ENTWURF"; note.textContent = result.message; note.hidden = false; note.classList.remove("is-error"); if (!id) { form.elements.namedItem("id").value = result.id; byId("offer-dialog-title").textContent = `Angebot ${result.quoteNumber}`; } await reloadDashboard(); } catch (error) { note.textContent = error.message; note.hidden = false; }
 });
 byId("create-order-from-offer").addEventListener("click", async event => { const quoteId = event.currentTarget.dataset.quoteId; if (!quoteId) return; try { const result = await api(`/api/admin/quotes/${quoteId}/create-order`, { method: "POST", body: "{}" }); setNotice(`${result.message} ${result.orderNumber}`, "success"); byId("offer-dialog").close(); currentType = "order"; updateViewHeading(); await reloadDashboard(); } catch (error) { byId("offer-form-note").textContent = error.message; byId("offer-form-note").hidden = false; } });
 byId("create-offer-from-request").addEventListener("click", () => { if (!selectedQuoteRequest) return; byId("detail-dialog").close(); openOfferDialog(null, selectedQuoteRequest).catch(error => setNotice(error.message)); });
+function reviewHistoricalContract(form,payload) {
+    const dialog=byId("contract-review-dialog");
+    const reviewFields=[
+        ["customer_id","Kunde"],["quote_id","Angebot"],["external_contract_number","Originale Vertragsnummer"],["status","Status"],
+        ["start_date","Vertragsbeginn"],["end_date","Vertragliches Enddatum"],["service_type","Leistungsart"],
+        ["service_description","Leistung"],["net_amount","Netto (€)"],["tax_rate","MwSt. (%)"],["payment_interval","Abrechnung"],
+        ["interval_type","Reinigungsintervall"],["interval_details","Frequenzdetails"],["cancellation_notice_days","Kündigungsfrist (Tage)"],
+        ["cancellation_date","Kündigungseingang"],["termination_date","Wirksames Vertragsende"],["termination_note","Interne Kündigungsnotiz"],
+        ["internal_notes","Interne Notiz"]
+    ];
+    byId("contract-review-details").replaceChildren(...reviewFields.map(([name,label])=>{
+        const row=document.createElement("div"),term=document.createElement("dt"),value=document.createElement("dd");
+        const control=form.elements.namedItem(name);
+        term.textContent=label;
+        value.textContent=payload[name] ? (control.tagName==="SELECT" ? control.selectedOptions[0]?.textContent : payload[name]) : "—";
+        row.append(term,value);
+        return row;
+    }));
+    dialog.returnValue="";
+    return new Promise(resolve=>{
+        dialog.addEventListener("close",()=>resolve(dialog.returnValue==="save"),{once:true});
+        dialog.showModal();
+    });
+}
 byId("contract-form").addEventListener("submit", async event => {
-    event.preventDefault(); const form = event.currentTarget, note = byId("contract-form-note"), id = form.elements.namedItem("id").value;
-    try { const payload=Object.fromEntries(new FormData(form)); delete payload.id; const result=await api(id ? `/api/admin/contracts/${id}` : "/api/admin/contracts", { method:id ? "PATCH":"POST", body:JSON.stringify(payload) }); note.textContent=result.message; note.hidden=false; note.classList.remove("is-error"); if(!id){form.elements.namedItem("id").value=result.id;byId("contract-dialog-title").textContent=`Vertrag ${result.contractNumber}`;}await reloadDashboard(); } catch(error){note.textContent=error.message;note.hidden=false;}
+    event.preventDefault();
+    const form=event.currentTarget, note=byId("contract-form-note"), saveButton=byId("save-contract-button");
+    if (form.dataset.saving==="true") return;
+    const id=form.elements.namedItem("id").value;
+    const payload=Object.fromEntries(new FormData(form));
+    delete payload.id;
+    payload.historical_registration=form.elements.namedItem("historical_registration").checked;
+    form.dataset.saving="true";
+    try {
+        if (payload.historical_registration && !id) {
+            if (!await reviewHistoricalContract(form,payload)) return;
+        } else if (!commercialFormStatus(event,payload)) return;
+        if (!id) payload.registration_key=form.dataset.registrationKey;
+        if (editedContract?.schedule?.active && ["start_date","end_date","termination_date","status"].some(key=>String(payload[key]||"")!==String(editedContract.contract[key]||""))) {
+            if (!window.confirm("Änderungen können künftige Einsätze betreffen. Bereits geplante Aufträge bleiben bestehen. Fortfahren?")) return;
+            payload.confirm_schedule_change=true;
+        }
+        payload.notify_on_activation=!payload.historical_registration && event.submitter?.dataset.publishStatus==="AKTIV";
+        saveButton.disabled=true;
+        const result=await api(id ? `/api/admin/contracts/${id}` : "/api/admin/contracts",{method:id?"PATCH":"POST",body:JSON.stringify(payload)});
+        form.dataset.savedStatus=payload.status;
+        form.elements.namedItem("status").value=payload.status;
+        form.querySelector("[data-publish-status]").hidden=payload.status!=="ENTWURF" || payload.historical_registration;
+        saveButton.textContent="Vertrag speichern";
+        note.textContent=result.message;
+        note.hidden=false;
+        note.classList.remove("is-error");
+        if (!id) {
+            form.elements.namedItem("id").value=result.id;
+            byId("contract-dialog-title").textContent=`Vertrag ${result.contractNumber}`;
+        }
+        const saved=await api(`/api/admin/contracts/${result.id}`);
+        renderContractEmail(saved.email);
+        renderContractLinks(saved);
+        await reloadDashboard();
+    } catch (error) {
+        note.textContent=error.message;
+        note.hidden=false;
+        note.classList.add("is-error");
+    } finally {
+        saveButton.disabled=false;
+        delete form.dataset.saving;
+    }
 });
 
 byId("assignment-form").addEventListener("submit", async event => {
@@ -1135,7 +1953,7 @@ recordsBody.addEventListener("click", event => {
     const message = event.target.closest("[data-message-read]");
     const notification = event.target.closest("[data-notification-read]");
     if (message) { api(`/api/admin/messages/${message.dataset.messageRead}/read`, { method: "PATCH", body: "{}" }).then(() => loadSubmissions()).catch(error => setNotice(error.message)); return; }
-    if (notification) { api(`/api/admin/notifications/${notification.dataset.notificationRead}/read`, { method: "PATCH", body: "{}" }).then(() => loadSubmissions()).catch(error => setNotice(error.message)); return; }
+    if (notification) { api(`/api/admin/notifications/${notification.dataset.notificationRead}/read`, { method: "PATCH", body: "{}" }).then(() => { window.adminDashboard.updateUnread(true); return loadSubmissions(); }).catch(error => setNotice(error.message)); return; }
     const button = event.target.closest("[data-record-index]");
     if (button?.classList.contains("detail-button")) openDetails(Number(button.dataset.recordIndex));
 });
@@ -1165,7 +1983,7 @@ byId("reporting-period").addEventListener("change",event=>{const custom=event.ta
 let performancePage=1;let performanceLoading=false;
 function performanceState(message){const node=byId("performance-content");node.innerHTML=`<p class="reporting-chart-loading" role="status">${escapeHtml(message)}</p>`;}
 function performanceChart(title,labels,values,formatter){if(!values.length||values.every(value=>Number(value||0)===0))return `<article class="reporting-section"><h3>${escapeHtml(title)}</h3><p>Keine Daten für den ausgewählten Zeitraum vorhanden.</p></article>`;const max=Math.max(1,...values.map(Number));const width=420,height=210,bar=width/values.length-12;return `<article class="reporting-section"><h3>${escapeHtml(title)}</h3><svg class="performance-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}">${values.map((value,index)=>{const h=Math.max(2,Number(value)/max*130),x=12+index*(bar+12),y=160-h;return `<rect x="${x}" y="${y}" width="${bar}" height="${h}" fill="#176d9d"><title>${escapeHtml(`${labels[index]}: ${formatter(value)}`)}</title></rect><text x="${x+bar/2}" y="178" text-anchor="middle" font-size="9">${escapeHtml(String(labels[index]).slice(0,14))}</text><text x="${x+bar/2}" y="${y-5}" text-anchor="middle" font-size="8">${escapeHtml(formatter(value))}</text>`}).join("")}</svg></article>`;}
-function performanceOrderTable(data){let section=document.querySelector(".performance-order-section");if(!section){section=document.createElement("section");section.className="performance-order-section";section.innerHTML='<h3>Order Efficiency</h3><div class="table-scroll"><table><thead><tr><th>Auftrag</th><th>Kunde</th><th>Status</th><th>Geplant</th><th>Tatsächlich</th><th>Materialkosten</th><th>Umsatz</th><th>Contribution vor Personalkosten</th></tr></thead><tbody></tbody></table></div><div class="finance-pagination"><button type="button" class="button button-light" data-performance-prev aria-label="Vorherige Seite">← Zurück</button><span data-performance-page></span><button type="button" class="button button-light" data-performance-next aria-label="Nächste Seite">Weiter →</button></div>';byId("performance-content").after(section);section.addEventListener("click",event=>{if(event.target.closest("[data-performance-prev]")&&performancePage>1){performancePage--;loadPerformance()}if(event.target.closest("[data-performance-next]")&&performancePage<data.total_pages){performancePage++;loadPerformance()}})}const body=section.querySelector("tbody");body.innerHTML=(data.items||[]).length?(data.items||[]).map(row=>`<tr><td>${escapeHtml(row.order_number)}</td><td>${escapeHtml(row.customer_name)}</td><td>${escapeHtml(row.status)}</td><td>${escapeHtml(`${Number(row.planned_hours||0).toFixed(1)} h`)}</td><td>${escapeHtml(`${Number(row.actual_hours||0).toFixed(1)} h`)}</td><td>${escapeHtml(reportEuro(row.material_cost))}</td><td>${escapeHtml(reportEuro(row.price_gross_snapshot))}</td><td>${escapeHtml(reportEuro(row.contribution_before_personnel_costs))}</td></tr>`).join(""):'<tr><td colspan="8">Keine Daten für den ausgewählten Zeitraum vorhanden.</td></tr>';section.querySelector("[data-performance-page]").textContent=`Seite ${data.page} / ${data.total_pages} · ${data.total} Einträge`;section.querySelector("[data-performance-prev]").disabled=data.page<=1;section.querySelector("[data-performance-next]").disabled=data.page>=data.total_pages;}
+function performanceOrderTable(data){let section=document.querySelector(".performance-order-section");if(!section){section=document.createElement("section");section.className="performance-order-section";section.innerHTML='<h3>Order Efficiency</h3><div class="table-scroll"><table><thead><tr><th>Auftrag</th><th>Kunde</th><th>Status</th><th>Geplant</th><th>Tatsächlich</th><th>Materialkosten</th><th>Umsatz</th><th>Contribution vor Personalkosten</th></tr></thead><tbody></tbody></table></div><div class="finance-pagination"><button type="button" class="button button-light" data-performance-prev aria-label="Zurück zur vorherigen Seite">← Zurück</button><span data-performance-page></span><button type="button" class="button button-light" data-performance-next aria-label="Weiter zur nächsten Seite">Weiter →</button></div>';byId("performance-content").after(section);section.addEventListener("click",event=>{if(event.target.closest("[data-performance-prev]")&&performancePage>1){performancePage--;loadPerformance()}if(event.target.closest("[data-performance-next]")&&performancePage<data.total_pages){performancePage++;loadPerformance()}})}const body=section.querySelector("tbody");body.innerHTML=(data.items||[]).length?(data.items||[]).map(row=>`<tr><td>${escapeHtml(row.order_number)}</td><td>${escapeHtml(row.customer_name)}</td><td>${escapeHtml(row.status)}</td><td>${escapeHtml(`${Number(row.planned_hours||0).toFixed(1)} h`)}</td><td>${escapeHtml(`${Number(row.actual_hours||0).toFixed(1)} h`)}</td><td>${escapeHtml(reportEuro(row.material_cost))}</td><td>${escapeHtml(reportEuro(row.price_gross_snapshot))}</td><td>${escapeHtml(reportEuro(row.contribution_before_personnel_costs))}</td></tr>`).join(""):'<tr><td colspan="8">Keine Daten für den ausgewählten Zeitraum vorhanden.</td></tr>';section.querySelector("[data-performance-page]").textContent=`Seite ${data.page} / ${data.total_pages} · ${data.total} Einträge`;section.querySelector("[data-performance-prev]").disabled=data.page<=1;section.querySelector("[data-performance-next]").disabled=data.page>=data.total_pages;}
 async function loadPerformance(){if(performanceLoading)return;performanceLoading=true;performanceState("Leistungsanalyse wird geladen…");try{const params=reportParams(),query=new URLSearchParams({period:params.period,compare:String(params.compare),page:String(performancePage),page_size:"10"});if(params.period==="custom"){query.set("from",params.from);query.set("to",params.to)}const endpoints=["operations","services","receivables","recurring"].map(name=>api(`/api/admin/reports/performance/${name}?${query}`));const [operations,services,receivables,recurring,orders]=await Promise.all([...endpoints,api(`/api/admin/reports/performance/orders?${query}`)]);const op=operations.data,svc=services.data,rec=receivables.data,rng=recurring.data;byId("performance-cards").innerHTML=[["Auftragsabschlussrate",`${Number(op.completion_rate||0).toFixed(1)}%`],["Stornierungsrate",`${Number(op.cancellation_rate||0).toFixed(1)}%`],["Geplante Stunden",`${Number(op.planned_hours||0).toFixed(1)} h`],["Tatsächliche Stunden",`${Number(op.actual_hours||0).toFixed(1)} h`],["Service-Report-Abschlussrate",`${Number(op.service_report_completion_rate||0).toFixed(1)}%`],["Contribution vor Personalkosten",reportEuro((svc.items||[]).reduce((sum,row)=>sum+Number(row.contribution_before_personnel_costs||0),0))],["Überfällige Forderungen",reportEuro(rec.overdue_invoice_amount)]].map(([label,value])=>`<article class="finance-card"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`).join("");byId("performance-content").innerHTML=`<section class="reporting-chart-grid">${performanceChart("Umsatz nach Leistung",(svc.items||[]).map(row=>row.service_type),(svc.items||[]).map(row=>row.revenue),reportEuro)}${performanceChart("Geplante vs tatsächliche Stunden",["Geplant","Tatsächlich"],[op.planned_hours,op.actual_hours],value=>`${Number(value||0).toFixed(1)} h`)}${performanceChart("Forderungsalterung",["Aktuell","1–30","31–60","61–90",">90"],[rec.buckets?.current,rec.buckets?.days_1_30,rec.buckets?.days_31_60,rec.buckets?.days_61_90,rec.buckets?.days_90_plus],reportEuro)}</section><article class="reporting-section"><h3>Service Performance</h3>${(svc.items||[]).length?`<div class="table-scroll"><table><thead><tr><th>Leistung</th><th>Umsatz</th><th>Aufträge</th><th>Abgeschlossen</th><th>Storniert</th><th>Contribution vor Personalkosten</th></tr></thead><tbody>${svc.items.map(row=>`<tr><td>${escapeHtml(row.service_type)}</td><td>${escapeHtml(reportEuro(row.revenue))}</td><td>${escapeHtml(reportNumber(row.order_count))}</td><td>${escapeHtml(reportNumber(row.completed_orders))}</td><td>${escapeHtml(reportNumber(row.cancelled_orders))}</td><td>${escapeHtml(reportEuro(row.contribution_before_personnel_costs))}</td></tr>`).join("")}</tbody></table></div>`:"<p>Keine Daten für den ausgewählten Zeitraum vorhanden.</p>"}</article><article class="reporting-section"><h3>Wiederkehrende Aufträge</h3><p>Aktive Verträge: ${escapeHtml(reportNumber(rng.recurring_contracts))}<br>Generiert: ${escapeHtml(reportNumber(rng.generated_orders))}<br>Erfolgreich: ${escapeHtml(reportNumber(rng.successful_generation))}<br>Duplikate: ${escapeHtml(reportNumber(rng.duplicate_outcomes))}<br>Fehler: ${escapeHtml(reportNumber(rng.error_outcomes))}</p></article>`;performanceOrderTable(orders.data)}catch(error){byId("performance-cards").innerHTML="";performanceState("Die Leistungsanalyse konnte nicht geladen werden.")}finally{performanceLoading=false}}
 byId("reporting-refresh").addEventListener("click",()=>{performancePage=1;reportingCache.clear();Promise.all([loadReporting({force:true}),loadVisuals(),loadPerformance()]).catch(error=>reportingMessage(error.message||"Der Bericht konnte nicht geladen werden."));});
 document.querySelector('[data-type="reporting"]')?.addEventListener("click",()=>setTimeout(()=>loadPerformance().catch(error=>reportingMessage(error.message||"Die Leistungsanalyse konnte nicht geladen werden.")),0));
@@ -1300,6 +2118,11 @@ byId("expense-form").addEventListener("submit",async event=>{event.preventDefaul
 document.querySelector("[data-close-expense]").addEventListener("click",()=>byId("expense-dialog").close());
 
 byId("service-reports-refresh").addEventListener("click", () => { serviceReportPage = 1; loadServiceReports(); });
+byId("attendance-refresh").addEventListener("click", () => { attendancePage = 1; loadAttendance(); });
+byId("attendance-apply").addEventListener("click", () => { attendancePage = 1; loadAttendance(); });
+byId("attendance-clear").addEventListener("click", () => { document.querySelectorAll("#attendance-panel input, #attendance-panel select").forEach(field => { field.value = ""; }); attendancePage = 1; loadAttendance(); });
+byId("attendance-previous").addEventListener("click", () => { if (attendancePage > 1) { attendancePage -= 1; loadAttendance(); } });
+byId("attendance-next").addEventListener("click", () => { attendancePage += 1; loadAttendance(); });
 byId("service-report-apply").addEventListener("click", () => { serviceReportPage = 1; loadServiceReports(); });
 byId("service-report-clear").addEventListener("click", () => { document.querySelectorAll("#service-reports-panel input, #service-reports-panel select").forEach(field => { field.value = ""; }); serviceReportPage = 1; loadServiceReports(); });
 byId("service-report-search").addEventListener("input", () => { window.clearTimeout(searchTimer); searchTimer = window.setTimeout(() => { serviceReportPage = 1; renderServiceReports(); }, 250); });

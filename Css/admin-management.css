@@ -1,0 +1,134 @@
+/* Management views share the shell tokens from admin-dashboard.css. */
+.admin-portal {
+    --manage-space:clamp(14px,2.35vw,34px);
+    --manage-table-head:#edf3fa;
+    --manage-hover:#f4f8ff;
+    --manage-positive:#e3f8ef;
+    --manage-warning:#fff0d9;
+    --manage-muted:#eff3f7;
+}
+[data-admin-theme=dark] .admin-portal {
+    --manage-table-head:#172d47;
+    --manage-hover:#172c47;
+    --manage-positive:#123a33;
+    --manage-warning:#493719;
+    --manage-muted:#22364d;
+}
+.admin-portal #dashboard-view[data-management] .main-panel { padding:0 0 30px; }
+.admin-portal .admin-skip {
+    position:fixed;z-index:20;top:10px;left:10px;padding:10px 14px;border-radius:8px;
+    color:var(--desk-text);background:var(--desk-surface);transform:translateY(-180%);
+}
+.admin-portal .admin-skip:focus { transform:none; }
+.admin-portal #dashboard-view[data-management] .topbar { padding-inline:var(--manage-space); }
+.admin-portal .admin-page-intro {
+    display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:14px;
+    margin:22px var(--manage-space) 16px;
+}
+.admin-portal .admin-page-intro p { margin:0;color:var(--desk-muted);line-height:1.55; }
+.admin-portal .admin-view-summary { display:flex;flex-wrap:wrap;gap:8px;margin:0; }
+.admin-portal .admin-view-summary div {
+    display:flex;gap:8px;align-items:baseline;padding:8px 11px;background:var(--desk-surface);
+    border:1px solid var(--desk-line);border-radius:9px;
+}
+.admin-portal .admin-view-summary dt { color:var(--desk-muted);font-size:.78rem; }
+.admin-portal .admin-view-summary dd { margin:0;color:var(--desk-text);font-weight:750;font-variant-numeric:tabular-nums; }
+.admin-portal #dashboard-view[data-management]:not([data-management=contact], [data-management=career]) .stats-grid { display:none; }
+.admin-portal #dashboard-view[data-management] .main-panel > :is(section:not(#management-home),.stats-grid,.privacy-note) {
+    margin-inline:var(--manage-space);
+}
+.admin-portal #dashboard-view[data-management] .main-panel > :is(.records-panel,.schedule-panel,.finance-panel,.service-reports-panel,.materials-panel) {
+    min-width:0;max-width:100%;background:var(--desk-surface);color:var(--desk-text);
+    border:1px solid var(--desk-line);border-radius:var(--desk-radius);box-shadow:var(--desk-shadow);margin-block-end:16px;
+}
+.admin-portal #dashboard-view[data-management] :is(.records-heading,.toolbar,.table-footer) { gap:10px; }
+.admin-portal #dashboard-view[data-management] :is(.records-heading,.toolbar) { flex-wrap:wrap; }
+.admin-portal #dashboard-view[data-management] :is(.records-heading h2,.records-heading h3) {
+    font-family:var(--desk-font);font-size:clamp(18px,1.75vw,24px);letter-spacing:-.025em;color:var(--desk-text);
+}
+.admin-portal #dashboard-view[data-management] :is(.eyebrow,.result-count,.filter-label,.form-note,.privacy-note,.person-phone,.message-preview,.table-footer,.date-cell,.empty-state) {
+    color:var(--desk-muted);
+}
+.admin-portal #dashboard-view[data-management] :is(.toolbar,.table-footer,.table-wrap,.table-scroll,.records-heading) { border-color:var(--desk-line); }
+.admin-portal #dashboard-view[data-management] .result-count { color:var(--desk-muted);background:var(--manage-muted); }
+.admin-portal #dashboard-view[data-management] :is(.empty-state strong,.schedule-employee > header > strong) { color:var(--desk-text); }
+.admin-portal #dashboard-view[data-management] .person-cell > a { color:var(--desk-accent); }
+.admin-portal #dashboard-view[data-management] .schedule-employee > header { background:var(--desk-surface); }
+.admin-portal #dashboard-view[data-management] :is(.schedule-employee > header > small,.schedule-free,.field-hint,.reporting-chart-loading,.reporting-legend > span,.reporting-section > ol > li > span,.performance-filter-panel .finance-filter-grid > label) { color:var(--desk-muted); }
+.admin-portal #dashboard-view[data-management] :is(.schedule-free,.performance-filter-panel) { background:var(--manage-muted); }
+.admin-portal #dashboard-view[data-management] .status-CANCELLED { color:var(--desk-error);background:var(--desk-error-bg); }
+.admin-portal #dashboard-view[data-management] :is(.table-wrap,.table-scroll) {
+    width:100%;max-width:100%;overflow:auto;overscroll-behavior-inline:contain;
+    background:var(--desk-surface);color:var(--desk-text);
+}
+.admin-portal #dashboard-view[data-management] table { color:var(--desk-text); }
+.admin-portal #dashboard-view[data-management] th {
+    color:var(--desk-muted);background:var(--manage-table-head);border-color:var(--desk-line);font-weight:750;
+}
+.admin-portal #dashboard-view[data-management] td { color:var(--desk-text);border-color:var(--desk-line); }
+.admin-portal #dashboard-view[data-management] tbody tr:hover :is(td,th) { background:var(--manage-hover); }
+.admin-portal #dashboard-view[data-management] :is(.detail-button,.page-button,.record-detail) {
+    color:var(--desk-accent);background:var(--desk-tint);border:1px solid var(--desk-line);border-radius:8px;
+}
+.admin-portal #dashboard-view[data-management] .page-button:disabled { opacity:.55; }
+.admin-portal #dashboard-view[data-management] .status-pill {
+    color:var(--desk-accent);background:var(--desk-tint);border:0;
+    border-radius:999px;padding:4px 9px;line-height:1.4;min-width:0;
+}
+.admin-portal #dashboard-view[data-management] .status-pill[data-status=done] { color:var(--desk-good);background:var(--manage-positive); }
+.admin-portal #dashboard-view[data-management] .status-pill[data-status=in_progress] { color:var(--desk-warn);background:var(--manage-warning); }
+.admin-portal #dashboard-view[data-management] :is(.finance-card,.stat-card,.reporting-section,.reporting-export,.reporting-chart-card,.service-report-filters,.finance-list-filters,.absence-summary,.complaints-panel,.assignment-card,.schedule-day,.schedule-employee,.material-order-control) {
+    background:var(--desk-surface);color:var(--desk-text);border-color:var(--desk-line);border-radius:var(--desk-radius);min-width:0;
+}
+.admin-portal #dashboard-view[data-management] :is(.finance-card,.stat-card,.reporting-section,.assignment-card) { box-shadow:var(--desk-shadow); }
+.admin-portal #dashboard-view[data-management] :is(.finance-card strong,.stat-card strong,.assignment-card strong,.schedule-panel h3,.reporting-section h3,.finance-list-filters summary,.service-report-filters summary,.performance-filter-panel > summary,.reporting-export h3) {
+    color:var(--desk-text);
+}
+.admin-portal #dashboard-view[data-management] :is(.finance-card span,.finance-card small,.stat-card span,.reporting-section p,.reporting-export label,.stat-caption,.reporting-period-label) { color:var(--desk-muted); }
+.admin-portal #dashboard-view[data-management] :is(.finance-tabs,.schedule-controls,.material-actions,.dialog-actions) { flex-wrap:wrap;gap:8px; }
+.admin-portal #dashboard-view[data-management] :is(.finance-tabs [aria-pressed=true],.finance-tabs .is-active) {
+    color:var(--desk-ink);background:var(--desk-accent);border-color:var(--desk-accent);
+}
+.admin-portal :is(#dashboard-view[data-management],dialog.detail-dialog) :is(input:not([type=checkbox],[type=radio]),select,textarea,.search-box) {
+    background-color:var(--desk-surface);color:var(--desk-text);border-color:var(--desk-line);border-radius:8px;max-width:100%;
+}
+.admin-portal :is(#dashboard-view[data-management],dialog.detail-dialog) :is(input,textarea)::placeholder { color:var(--desk-muted);opacity:1; }
+.admin-portal :is(#dashboard-view[data-management],dialog.detail-dialog) :is(label,.search-box) { color:var(--desk-muted); }
+.admin-portal #dashboard-view[data-management] .search-box { min-width:0; }
+.admin-portal dialog.detail-dialog {
+    max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);color:var(--desk-text);
+    background:var(--desk-surface);border:1px solid var(--desk-line);border-radius:var(--desk-radius);box-shadow:var(--desk-shadow);
+}
+.admin-portal dialog.detail-dialog :is(h2,h3,legend) { color:var(--desk-text);font-family:var(--desk-font); }
+.admin-portal dialog.detail-dialog :is(fieldset,.detail-meta,.detail-copy,.commercial-items,.contract-summary-card,.assignment-card,.dialog-close) {
+    color:var(--desk-text);background:var(--desk-surface);border-color:var(--desk-line);
+}
+.admin-portal dialog.detail-dialog :is(.form-note,.eyebrow,dt,small) { color:var(--desk-muted); }
+.admin-portal dialog.detail-dialog a { color:var(--desk-accent); }
+.admin-portal .management-progress,.admin-queue-error { margin:12px var(--manage-space); }
+.admin-portal .management-progress { max-width:420px;color:var(--desk-muted); }
+.admin-portal .management-progress span { max-width:300px; }
+.admin-portal .admin-row-detail { display:grid;gap:11px;margin-top:14px; }
+.admin-portal .admin-row-detail section {
+    padding:11px;border:1px solid var(--desk-line);border-radius:10px;background:var(--desk-surface);
+}
+.admin-portal .admin-row-detail h3 { margin:0 0 8px;font-size:.92rem; }
+.admin-portal .admin-row-detail dl { margin:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(126px,1fr));gap:9px; }
+.admin-portal .admin-row-detail dd { margin:2px 0 0;overflow-wrap:anywhere; }
+.admin-portal .admin-row-detail .private-note { white-space:pre-wrap;overflow-wrap:anywhere; }
+.admin-portal .admin-row-detail .related-actions { display:flex;gap:7px;flex-wrap:wrap; }
+.admin-portal .admin-record-type { display:inline-flex;margin-top:3px;border-radius:999px;background:var(--desk-tint);color:var(--desk-accent);padding:2px 8px;font-size:.72rem;font-weight:700; }
+@media(max-width:760px) {
+    .admin-portal #dashboard-view[data-management] .topbar-right { justify-content:flex-start;align-items:flex-start;flex-direction:row; }
+    .admin-portal #dashboard-view[data-management] :is(.toolbar,.schedule-controls,.finance-filter-grid,.service-report-filter-grid) { min-width:0; }
+    .admin-portal #dashboard-view[data-management] .toolbar .search-box { flex:1 1 100%;width:auto; }
+    .admin-portal #dashboard-view[data-management] .admin-page-intro { margin-block:15px 12px; }
+    .admin-portal #dashboard-view[data-management] .admin-view-summary { width:100%; }
+    .admin-portal #dashboard-view[data-management] .table-wrap table { min-width:570px; }
+    .admin-portal dialog.detail-dialog .admin-employee-form { grid-template-columns:minmax(0,1fr); }
+    .admin-portal dialog.detail-dialog .dialog-actions { flex-wrap:wrap;gap:7px; }
+}
+@media print {
+    .admin-portal #dashboard-view[data-management] .main-panel { margin:0;padding:0; }
+    .admin-portal :is(.admin-page-intro,.management-progress,.admin-queue-error) { display:none!important; }
+}

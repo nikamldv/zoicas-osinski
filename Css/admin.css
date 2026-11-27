@@ -1,4 +1,3 @@
-@import url("https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap");
 
 :root {
     color-scheme: light;
@@ -11,7 +10,7 @@
     --admin-white: #fff;
     --admin-green: #258264;
     --admin-gold: #bd8732;
-    font-family: "DM Sans", sans-serif;
+    font-family: var(--portal-font,"Segoe UI",sans-serif);
     font-synthesis: none;
     text-rendering: optimizeLegibility;
 }
@@ -70,7 +69,7 @@ button { color: inherit; }
     border-radius: 15px;
     color: #fff;
     background: linear-gradient(145deg, #2386c8, #0c345b);
-    font: 800 1rem "Manrope", sans-serif;
+    font: 800 1rem var(--portal-font,"Segoe UI",sans-serif);
     letter-spacing: -.06em;
 }
 
@@ -84,7 +83,7 @@ button { color: inherit; }
 
 .login-card h1, .topbar h1, .records-heading h2, .detail-dialog h2 {
     margin: 0;
-    font-family: "Manrope", sans-serif;
+    font-family: var(--portal-font,"Segoe UI",sans-serif);
     letter-spacing: -.045em;
 }
 
@@ -208,7 +207,7 @@ button { color: inherit; }
 .stat-icon-blue { color: #397dad; background: #e6f3fc; }
 .stat-icon-gold { color: #a77a2f; background: #fbf3e4; }
 .stat-icon-green { color: #328166; background: #e6f5ef; }
-.stat-value { display: block; margin-top: 12px; font: 700 1.9rem "Manrope", sans-serif; letter-spacing: -.05em; }
+.stat-value { display: block; margin-top: 12px; font: 700 1.9rem var(--portal-font,"Segoe UI",sans-serif); letter-spacing: -.05em; }
 .stat-caption { display: block; margin-top: 1px; color: #5f768d; font-size: .68rem; }
 .stat-card-dark .stat-caption { color: #adc3d8; }
 
@@ -297,7 +296,7 @@ tbody tr:hover { background: #fbfdff; }
 .employee-task-summary a:hover { text-decoration: underline; }
 
 .order-dialog { width: min(94vw, 840px); }
-.order-dialog h3 { margin: 28px 0 14px; font: 700 1rem "Manrope", sans-serif; }
+.order-dialog h3 { margin: 28px 0 14px; font: 700 1rem var(--portal-font,"Segoe UI",sans-serif); }
 .order-assignment-section { margin-top: 28px; padding-top: 4px; border-top: 1px solid var(--admin-line); }
 .assignment-list { display: grid; gap: 8px; margin-bottom: 16px; }
 .assignment-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid #e2eaf1; border-radius: 9px; background: #f9fbfd; color: #405b76; font-size: .78rem; }
@@ -526,3 +525,49 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .performance-filter-panel{margin:18px 0;padding:14px 16px;border:1px solid #dce7ee;border-radius:12px;background:#f9fcfe}.performance-filter-panel summary{cursor:pointer;color:#173b5a;font-weight:800}.performance-filter-panel[open] summary{margin-bottom:14px}.performance-filter-panel .finance-filter-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.performance-filter-panel .dialog-actions{margin-top:14px}.field-hint{display:block;margin-top:3px;color:#668198;font-size:.68rem;font-weight:600}@media(max-width:900px){.performance-filter-panel .finance-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:560px){.performance-filter-panel{padding:13px}.performance-filter-panel .finance-filter-grid{grid-template-columns:1fr}.performance-filter-panel .dialog-actions{display:grid;grid-template-columns:1fr}.performance-filter-panel .button{width:100%}}
 .action-center-panel .records-heading{align-items:flex-start}.action-center-panel .finance-cards{margin:18px 0}.action-priority{display:inline-flex;align-items:center;min-height:27px;padding:0 9px;border-radius:999px;font-size:.7rem;font-weight:800}.action-priority-critical{background:#fee7e5;color:#9b2923}.action-priority-high{background:#fff2d9;color:#8b5a10}.action-priority-normal{background:#e9f2fb;color:#245d8a}.action-card-critical{border-color:#f2b3ad!important}.action-card-high{border-color:#f2d49e!important}@media(max-width:600px){.action-center-panel .records-heading{gap:12px;align-items:stretch;flex-direction:column}.action-center-panel .records-heading .button{width:100%}}
 .quality-badge{display:inline-flex;align-items:center;min-height:27px;padding:0 9px;border-radius:999px;font-size:.68rem;font-weight:800;white-space:nowrap}.severity-LOW{background:#edf5ea;color:#47733e}.severity-NORMAL{background:#e9f2fb;color:#245d8a}.severity-HIGH{background:#fff2d9;color:#8b5a10}.severity-CRITICAL{background:#fee7e5;color:#9b2923}.status-OPEN,.status-IN_REVIEW{background:#e9f2fb;color:#245d8a}.status-IN_PROGRESS,.status-WAITING_CUSTOMER{background:#fff2d9;color:#8b5a10}.status-RESOLVED,.status-CLOSED{background:#edf5ea;color:#47733e}.status-CANCELLED{background:#edf0f3;color:#657584}.quality-overdue{color:#a62f27;font-weight:800}.quality-panel .records-heading{gap:16px}.quality-panel .dialog-actions{flex-wrap:wrap}@media(max-width:600px){.quality-panel .records-heading{align-items:stretch;flex-direction:column}.quality-panel .records-heading .button{width:100%}.quality-panel .finance-cards{grid-template-columns:1fr}}
+.simulation-banner{display:flex;align-items:center;gap:10px;margin:18px 0;padding:12px 14px;border:1px solid #b8df91;border-radius:12px;background:#f3faeb;color:#315c28;font-size:.82rem}.simulation-banner strong{padding:3px 7px;border-radius:999px;background:#a6d936;color:#183413;font-size:.67rem;letter-spacing:.08em}.simulation-map-layout{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(250px,.7fr);gap:18px;margin:18px 0}.simulation-map-layout h3,.simulation-accessible-list h3{margin:0 0 10px;color:#193c5f;font-size:1rem}.simulation-map{position:relative;min-height:390px;overflow:hidden;border:1px solid #cbdde9;border-radius:16px;background:radial-gradient(circle at 20% 20%,rgba(108,191,235,.28),transparent 30%),linear-gradient(135deg,#eaf6fb 0%,#dceef8 52%,#eef8e8 100%);box-shadow:inset 0 0 0 1px rgba(255,255,255,.68)}.simulation-map:before,.simulation-map:after{position:absolute;inset:0;pointer-events:none;content:""}.simulation-map:before{background:linear-gradient(90deg,rgba(45,107,147,.12) 1px,transparent 1px),linear-gradient(rgba(45,107,147,.12) 1px,transparent 1px);background-size:12.5% 12.5%}.simulation-map:after{background:radial-gradient(circle at center,transparent 0 38%,rgba(255,255,255,.3) 39% 40%,transparent 41%)}.simulation-marker{position:absolute;z-index:2;display:grid;place-items:center;width:38px;height:38px;transform:translate(-50%,-50%);border:3px solid #fff;border-radius:50%;box-shadow:0 5px 14px rgba(20,67,101,.28);color:#fff;font:800 .72rem/1 inherit;cursor:pointer}.simulation-marker:hover,.simulation-marker:focus-visible{outline:3px solid #143d5d;outline-offset:3px}.simulation-marker-ACTIVE{background:#268c63}.simulation-marker-STALE{background:#d88a1f}.simulation-marker-OFFLINE{background:#66798b}.simulation-map-detail{min-height:180px;padding:18px;border:1px solid #d5e4ed;border-radius:14px;background:#f8fbfd}.simulation-map-detail p{margin:6px 0;color:#59758c;line-height:1.55}.simulation-map-detail strong{display:block;color:#163c5b}.simulation-accessible-list{margin-top:24px;padding-top:18px;border-top:1px solid #dce7ee}.simulation-accessible-list .person-phone{color:#47657c}.simulation-accessible-list .table-wrap:focus-visible{outline:3px solid #176d9d;outline-offset:3px}.live-location-state{display:inline-flex;min-height:25px;align-items:center;padding:0 8px;border-radius:999px;font-size:.68rem;font-weight:800}.live-location-state-ACTIVE{background:#e4f5e8;color:#267247}.live-location-state-STALE{background:#fff2d9;color:#8b5a10}.live-location-state-OFFLINE{background:#edf1f4;color:#42586a}@media(max-width:820px){.simulation-map-layout{grid-template-columns:1fr}.simulation-map{min-height:340px}}@media(max-width:600px){.simulation-banner{align-items:flex-start;flex-direction:column}.simulation-map{min-height:300px}.live-locations-panel{padding:18px 14px}.simulation-accessible-list .table-wrap{margin-inline:-2px}}
+
+/* Attendance overview keeps dense tables inside the panel. */
+.attendance-admin-panel, .attendance-admin-panel .table-wrap,
+.attendance-admin-panel .service-report-filter-grid label { min-width: 0; }
+.attendance-admin-panel .table-wrap { max-width: 100%; }
+.attendance-admin-panel .table-wrap:focus-visible { outline: 2px solid #17618d; outline-offset: -2px; }
+.attendance-admin-panel .person-phone, .attendance-admin-panel .eyebrow,
+.attendance-admin-panel .form-note, .attendance-admin-panel .empty-state { color: #486278; }
+
+.absence-request-heading, .absence-request-pagination { display:flex; flex-wrap:wrap; gap:8px; }
+.absence-request-pagination { margin-top:12px; }
+.absence-request-card { flex-wrap:wrap; overflow-wrap:anywhere; }
+.absence-note { white-space:pre-wrap; overflow-wrap:anywhere; }
+.absence-review-flag { display:block; font-weight:700; color:#633600; background:#fff4d8; padding:3px 6px; border-radius:5px; }
+
+.recurring-operations { padding:clamp(14px,3vw,24px); min-width:0; }
+.recurring-operations .records-heading,.recurring-automation-form,.recurring-exception-card { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+.recurring-automation-form > label { max-width:100%; }
+.recurring-automation-form input[type=number] { max-width:6rem; }
+.recurring-exception-card > span { min-width:0; overflow-wrap:anywhere; }
+.recurring-operations [hidden] { display:none; }
+
+@media (max-width: 900px) {
+    .topbar:has(#generate-recurring-button:not([hidden])) { flex-wrap:wrap; }
+    .topbar:has(#generate-recurring-button:not([hidden])) .topbar-right {
+        width:100%; min-width:0; flex-flow:row wrap; justify-content:flex-start;
+    }
+}
+
+.complaints-panel { margin-bottom:22px; }
+.complaints-panel .records-heading,.complaint-card { flex-wrap:wrap; gap:8px; }
+.complaint-card > span,#complaint-dialog .intake-description { overflow-wrap:anywhere; }
+#complaint-dialog .intake-description { white-space:pre-wrap; }
+#complaint-publish-form { margin-top:16px; }
+
+.contract-fields { min-width:0; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; margin:0; padding:16px; border:1px solid #b9cbd9; border-radius:12px; }
+.contract-fields legend { color:#173b5a; font-weight:700; padding:0 6px; }
+.contract-review-details { display:grid; gap:10px; margin:18px 0; overflow-wrap:anywhere; }
+.contract-review-details div { display:grid; grid-template-columns:minmax(7rem,1fr) minmax(0,2fr); gap:12px; }
+.contract-review-details dt { font-weight:700; }
+.contract-review-details dd { margin:0; white-space:pre-wrap; }
+@media (max-width:700px) { .contract-fields { grid-template-columns:1fr; } }
+
+#order-team-billing .assignment-row { flex-wrap:wrap; }
+#order-team-billing .assignment-row span { min-width:0; overflow-wrap:anywhere; }

@@ -1,0 +1,54 @@
+/* Shared portal polish. Token aliases preserve each portal's semantic colors. */
+:where(.admin-portal,.employee-app,.customer-app) {
+    --portal-motion:180ms;
+    --portal-focus:var(--desk-focus,var(--employee-action,var(--cust-action,#1d4ed8)));
+    --portal-font:"Segoe UI Variable","Segoe UI",system-ui,sans-serif;
+    font-family:var(--portal-font);
+}
+:where(.admin-portal,.employee-app,.customer-app) :is(button,a,input,select,textarea,summary):focus-visible {
+    outline:3px solid var(--portal-focus);
+    outline-offset:3px;
+}
+:where(.admin-portal,.employee-app,.customer-app) :is(.button,.detail-button,.page-button,summary) {
+    transition:background-color var(--portal-motion),color var(--portal-motion),border-color var(--portal-motion);
+}
+:where(.admin-portal,.employee-app,.customer-app) :is(button,summary):not(:disabled) { touch-action:manipulation; }
+:where(.admin-portal,.employee-app,.customer-app) dialog[open] { animation:portal-enter var(--portal-motion) ease-out; }
+@keyframes portal-enter { from { opacity:.65; } to { opacity:1; } }
+.admin-portal .admin-trend strong { white-space:nowrap; }
+.customer-app .portal-data dd,.employee-app .employee-day-totals dd { font-variant-numeric:tabular-nums; }
+@media(max-width:480px) {
+    .admin-portal .topbar-right { justify-content:flex-start; }
+    .admin-portal .admin-metric strong { font-size:clamp(17px,5vw,22px); }
+    .admin-portal .admin-metric { overflow-wrap:anywhere; }
+    .customer-app .customer-quick-list { display:grid;grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .customer-app .customer-quick-list .button { min-width:0;width:100%;text-align:center; }
+    .employee-app .employee-content .employee-schedule-head { display:flex;flex-wrap:wrap;gap:8px; }
+    .employee-app .employee-content .employee-schedule-head input { width:auto; }
+}
+@media(prefers-reduced-motion:reduce) {
+    :where(.admin-portal,.employee-app,.customer-app) { --portal-motion:0ms; }
+    :where(.admin-portal,.employee-app,.customer-app) dialog[open] { animation:none; }
+}
+
+
+/* Reserve dashboard space across loading, error and populated states. */
+.admin-portal .admin-overview-slot { min-height:312px; }
+.admin-portal .admin-overview-slot > .admin-state { min-height:120px; }
+.admin-portal .admin-overview-slot + .admin-home-grid { min-height:428px; }
+.admin-portal .topbar #admin-unread { min-width:3ch;text-align:center; }
+.employee-app #employee-next-assignment { min-height:176px;align-content:start; }
+.employee-app #employee-home { min-height:420px; }
+.employee-app #employee-home .portal-home-grid > article { min-height:186px; }
+.employee-app #employee-home .portal-home-grid > article > div { max-height:142px;overflow:auto; }
+.employee-app .employee-brandbar { height:66px; }
+.employee-app .employee-brand img { height:48px; }
+@media(max-width:1070px) {
+    .admin-portal .admin-overview-slot { min-height:390px; }
+}
+@media(max-width:760px) {
+    .admin-portal .admin-overview-slot { min-height:735px; }
+    .employee-app #employee-home { min-height:960px; }
+    .employee-app #employee-home .portal-home-grid > article { min-height:150px; }
+}
+

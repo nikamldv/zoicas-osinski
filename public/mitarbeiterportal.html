@@ -2,17 +2,20 @@
 <html lang="de">
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
     <meta name="robots" content="noindex,nofollow">
-    <title>Mitarbeiterportal | Zoicas &amp; Osinski</title>
+    <title>Mitarbeiterportal | Zoicas &amp; Osinski</title><script src="../js/portal-theme-init.js" data-portal-theme="employee"></script>
     <link rel="stylesheet" href="../Css/cinematic.css">
-    <script src="../js/employee-portal.js" defer></script>
-</head>
-<body class="service-page">
-    <header class="employee-brandbar"><a href="../index.html#home" class="employee-brand"><img src="../assets/images/Logo/zoicas-osinski.svg" alt="Zoicas &amp; Osinski"></a></header>
+     <script src="../js/dashboard-home.js" defer></script><script src="../js/employee-portal.js" defer></script>
+<link rel="stylesheet" href="../Css/dashboard-home.css"><link rel="stylesheet" href="../Css/employee-premium.css"><script src="../js/employee-shell.js" defer></script><link rel="stylesheet" href="../Css/portal-polish.css"></head>
+<body class="service-page employee-app">
+    <header class="employee-brandbar"><a href="../index.html#home" class="employee-brand"><img src="../assets/images/Logo/zoicas-osinski.png" alt="Zoicas &amp; Osinski"></a><button id="employee-theme" class="employee-theme" type="button" aria-label="Dunkles Design" aria-pressed="false"><span aria-hidden="true">◐</span></button></header>
     <main class="employee-portal-shell">
+        <section id="employee-boot" class="employee-state" aria-label="Mitarbeiterportal laden"><p id="employee-boot-message" role="status">Mitarbeiterportal wird geladen …</p><button id="employee-boot-retry" class="button button-light" type="button" hidden>Erneut versuchen</button></section>
         <section id="employee-dashboard" class="employee-dashboard" hidden>
-            <aside class="employee-sidebar">
+            <nav class="employee-bottom" aria-label="Mobile Navigation"><button type="button" data-worker-tab="overview" aria-current="page"><span class="employee-tab-icon" aria-hidden="true">⌂</span>Übersicht</button><button type="button" data-worker-tab="orders"><span class="employee-tab-icon" aria-hidden="true">▤</span>Einsätze</button><button type="button" data-worker-tab="work"><span class="employee-tab-icon" aria-hidden="true">◷</span>Zeiterfassung</button><button id="employee-more" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="employee-more-menu"><span class="employee-tab-icon" aria-hidden="true">⋯</span>Mehr</button></nav>
+            <dialog id="employee-more-menu" class="employee-menu" aria-label="Weitere Bereiche"><button id="employee-navigation-close" class="employee-navigation-close" type="button">Menü schließen</button></dialog>
+            <aside class="employee-sidebar" id="employee-menu-items" aria-label="Mitarbeiternavigation">
                 <strong> Mitarbeiterportal <small>ZOICAS &amp; OSINSKI</small></strong>
                 <button class="is-active" data-employee-view="overview" type="button">Übersicht</button>
                 <button data-employee-view="tasks" type="button">Meine Aufgaben</button>
@@ -21,6 +24,7 @@
                 <button data-employee-view="service-reports" type="button">Meine Leistungsnachweise</button>
                 <button data-employee-view="quality-actions" type="button">Meine Qualitätsmaßnahmen</button>
                 <button data-employee-view="schedule" type="button">Mein Zeitplan</button>
+                <button data-employee-view="absence" type="button">Urlaub &amp; Abwesenheit</button>
                 <button data-employee-view="work" type="button">Arbeitszeit</button>
                 <button data-employee-view="documents" type="button">Dokumentation</button>
                 <button data-employee-view="notifications" type="button">Meine Benachrichtigungen <span id="employee-notification-count" class="employee-nav-count" hidden></span></button>
@@ -29,17 +33,15 @@
                 <button data-employee-view="profile" type="button">Mein Profil</button>
                 <button id="employee-logout" type="button">Abmelden</button>
             </aside>
-            <section class="employee-content">
-                <header><p class="section-kicker">MITARBEITERBEREICH</p><h1 id="employee-title">Willkommen</h1><p id="employee-subtitle">Ihre heutigen Aufgaben und Arbeitszeiten im Überblick.</p></header>
+            <section class="employee-content" id="employee-content">
+                <header><p class="section-kicker">MITARBEITERBEREICH</p><h1 id="employee-title" tabindex="-1">Willkommen</h1><p id="employee-subtitle">Ihre heutigen Aufgaben und Arbeitszeiten im Überblick.</p></header>
                 <p id="employee-notice" class="dashboard-message" role="status" aria-live="polite" hidden></p>
 
+                <section id="employee-view-state" class="employee-state" hidden><p id="employee-view-message" role="status"></p><span id="employee-view-skeleton" class="employee-loading-line" aria-hidden="true"></span><button id="employee-view-retry" class="button button-light" type="button" hidden>Erneut versuchen</button></section>
                 <div id="employee-overview" class="employee-view">
-                    <div class="portal-data">
-                        <article><strong id="overview-open">—</strong><p>Offene Aufgaben</p></article>
-                        <article><strong id="overview-today">—</strong><p>Aufgaben für heute</p></article>
-                        <article><strong id="overview-hours">—</strong><p>Erfasste Stunden heute</p></article>
-                    </div>
-                    <section class="employee-panel"><h2>Heutige Aufgaben</h2><div id="overview-tasks" class="employee-list"></div></section>
+                    <section id="employee-next-assignment" class="employee-panel employee-next" hidden aria-label="Nächster Einsatz"></section>
+                    <section id="employee-home" class="portal-home" aria-label="Tagesübersicht"></section>
+                    <section class="employee-panel"><h2>Heutige Aufgaben</h2><dl class="employee-day-totals"><div><dt>Erfasste Arbeitszeit heute</dt><dd id="overview-hours">—</dd></div><div><dt>Erledigte Einsätze heute</dt><dd id="overview-completed">—</dd></div></dl><div id="overview-tasks" class="employee-list"></div></section>
                 </div>
 
                 <div id="employee-tasks" class="employee-view" hidden>
@@ -80,13 +82,61 @@
                 </div>
 
                 <div id="employee-schedule" class="employee-view" hidden>
-                    <section class="employee-panel"><div class="employee-schedule-head"><h2>Mein Zeitplan</h2><div><button id="employee-schedule-previous" class="button button-light" type="button">←</button><input id="employee-schedule-date" type="date"><button id="employee-schedule-next" class="button button-light" type="button">→</button><button id="employee-schedule-week" class="button button-light" type="button">Woche</button></div></div><div id="employee-schedule-list" class="employee-schedule-list"></div></section>
+                    <section class="employee-panel"><div class="employee-schedule-head"><h2>Mein Zeitplan</h2><div><button id="employee-schedule-previous" class="button button-light" type="button">←</button><input id="employee-schedule-date" type="date" aria-label="Kalenderdatum"><button id="employee-schedule-next" class="button button-light" type="button">→</button><button id="employee-schedule-week" class="button button-light" type="button">Woche</button></div></div><div id="employee-schedule-list" class="employee-schedule-list"></div></section>
                 </div>
 
                 <div id="employee-work" class="employee-view" hidden>
+                    <section class="employee-panel attendance-panel" aria-labelledby="attendance-heading">
+                        <div class="employee-panel-head"><div><p class="section-kicker">ANWESENHEIT</p><h2 id="attendance-heading">Arbeitsbeginn &amp; Arbeitsende</h2><p>Bestätigen Sie Ihre Anwesenheit manuell für einen eigenen Einsatz. Es werden keine Standortdaten abgefragt oder gespeichert.</p></div><span id="attendance-status" class="attendance-status" role="status" aria-live="polite">Status wird geladen …</span></div>
+                        <form id="attendance-checkin-form" class="employee-form" novalidate>
+                            <label class="wide">Eigener Einsatz<select id="attendance-assignment" name="assignment_id" required><option value="">Einsatz wählen</option></select><small>Es werden nur Ihre heutigen, aktiven Einsätze angezeigt.</small></label>
+                            <label class="wide">Hinweis (optional)<textarea name="check_in_note" maxlength="1000" placeholder="Optionale manuelle Bestätigung"></textarea></label>
+                            <p id="attendance-checkin-note" class="form-note wide" role="status" aria-live="polite"></p>
+                            <button id="attendance-checkin-submit" class="button button-primary" type="submit">Arbeit starten</button>
+                        </form>
+                        <form id="attendance-checkout-form" class="employee-form" hidden novalidate>
+                            <p id="attendance-elapsed" class="wide" hidden></p>
+                            <label class="wide">Hinweis zum Arbeitsende (optional)<textarea name="check_out_note" maxlength="1000" placeholder="Optionaler Hinweis"></textarea></label>
+                            <p id="attendance-checkout-note" class="form-note wide" role="status" aria-live="polite"></p>
+                            <button id="attendance-checkout-submit" class="button button-primary" type="submit">Arbeit beenden</button>
+                        </form>
+                        <section class="attendance-visit-summary" aria-labelledby="attendance-visit-title"><div><p class="section-kicker">HEUTIGER EINSATZ</p><h3 id="attendance-visit-title">Kundenbesuch &amp; Leistungsnachweis</h3><p>Check-in und Check-out erfassen nur die Anwesenheit. Ein Auftrag gilt erst über den Leistungsnachweis als fachlich dokumentiert; eine Kundenbestätigung ist optional.</p></div><div id="attendance-visit-details" class="attendance-visit-details" aria-live="polite">Einsatzdaten werden geladen …</div></section>
+                    </section>
+                    <section class="employee-panel attendance-panel location-simulation-panel" aria-labelledby="location-simulation-heading">
+                        <div class="employee-panel-head"><div><p class="section-kicker">NUR TESTMODUS</p><h2 id="location-simulation-heading">Standortfreigabe simulieren</h2><p>Diese technische Simulation verwendet ausschließlich manuell eingegebene Testkoordinaten. Es wird kein Gerätestandort abgefragt, übertragen oder gespeichert.</p></div><span id="location-simulation-status" class="attendance-status" role="status" aria-live="polite">Simulation wird geladen …</span></div>
+                        <div class="simulation-warning" role="note"><strong>Simulation:</strong> Nur mit offenem Check-in verfügbar. Die Testkoordinaten werden beim Stoppen oder Ablauf automatisch gelöscht.</div>
+                        <div class="location-simulation-actions"><button id="location-simulation-start" class="button button-light" type="button">Simulation starten</button><button id="location-simulation-stop" class="button button-light" type="button" hidden>Simulation stoppen</button></div>
+                        <form id="location-simulation-update-form" class="employee-form" hidden novalidate>
+                            <label>Synthetische Breite<input name="latitude" type="number" min="-90" max="90" step="0.000001" inputmode="decimal" value="50.110924" required></label>
+                            <label>Synthetische Länge<input name="longitude" type="number" min="-180" max="180" step="0.000001" inputmode="decimal" value="8.682127" required></label>
+                            <label>Genauigkeit (m, optional)<input name="accuracy_meters" type="number" min="0" max="100000" step="0.01" inputmode="decimal"></label>
+                            <p id="location-simulation-note" class="form-note wide" role="status" aria-live="polite"></p>
+                            <button id="location-simulation-update" class="button button-primary" type="submit">Testkoordinaten aktualisieren</button>
+                        </form>
+                    </section>
+                    <section class="employee-panel"><h2>Abgeschlossene Anwesenheit</h2><div id="attendance-history" class="employee-list" aria-live="polite"></div></section>
                     <section class="employee-panel"><h2>Arbeitszeit erfassen</h2><form id="work-log-form" class="employee-form"><label>Datum<input name="work_date" type="date" required></label><label>Beginn<input name="start_time" type="time" required></label><label>Ende<input name="end_time" type="time" required></label><label>Pause (Min.)<input name="break_minutes" type="number" min="0" max="720" value="0" required></label><label>Aufgabe<select id="work-task" name="task_id"><option value="">Ohne Zuordnung</option></select></label><label>Auftrag<select id="work-order" name="order_id"><option value="">Ohne Zuordnung</option></select></label><label class="wide">Notiz<textarea name="notes" maxlength="4000"></textarea></label><button class="button button-primary" type="submit">Arbeitszeit speichern</button></form></section><section class="employee-panel"><h2>Meine Einträge</h2><div id="work-log-list" class="employee-list"></div></section>
                 </div>
 
+                <div id="employee-absence" class="employee-view" hidden>
+                    <section class="employee-panel" aria-labelledby="employee-absence-title">
+                        <h2 id="employee-absence-title">Urlaub &amp; Abwesenheit</h2>
+                        <form id="employee-absence-form" class="employee-form">
+                            <label class="wide">Art<select name="absence_type" required><option value="URLAUB">Urlaub</option><option value="KRANK">Krank</option><option value="FREI">Frei</option><option value="SONSTIGE">Sonstige</option></select></label>
+                            <label>Von<input type="date" name="start_date" required></label>
+                            <label>Bis<input type="date" name="end_date" required></label>
+                            <label class="wide">Notiz (optional)<textarea name="note" maxlength="1000"></textarea></label>
+                            <button class="button button-primary" type="submit">Antrag einreichen</button>
+                        </form>
+                        <p id="employee-absence-message" role="status"></p>
+                        <h3>Meine Anträge</h3>
+                        <div id="employee-absence-list" class="employee-list"></div>
+                        <div class="absence-request-pagination">
+                            <button id="employee-absence-prev" class="button button-light" type="button" disabled>Zurück</button>
+                            <button id="employee-absence-next" class="button button-light" type="button" disabled>Weiter</button>
+                        </div>
+                    </section>
+                </div>
                 <div id="employee-documents" class="employee-view" hidden>
                     <section class="employee-panel"><h2>Dokumentation hochladen</h2><form id="document-form" class="employee-form" enctype="multipart/form-data"><label>Aufgabe<select id="document-task" name="task_id" required><option value="">Aufgabe wählen</option></select></label><label>Auftrag<select id="document-order" name="order_id"><option value="">Ohne Auftragsbezug</option></select></label><label>Datei<input name="document" type="file" accept="image/jpeg,image/png,application/pdf" required></label><label class="wide">Beschreibung<textarea name="description" maxlength="1000"></textarea></label><button class="button button-primary" type="submit">Dokument hochladen</button></form><p class="form-note">Erlaubt: JPG, PNG oder PDF, maximal 5 MB. Dateien bleiben privat und sind nur berechtigten Mitarbeitenden zugänglich.</p></section><section class="employee-panel"><h2>Meine Dokumente</h2><div id="document-list" class="employee-list"></div></section>
                 </div>

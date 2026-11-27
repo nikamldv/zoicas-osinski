@@ -7,6 +7,7 @@ const crypto = require("node:crypto");
 const net = require("node:net");
 const tls = require("node:tls");
 const PDFDocument = require("pdfkit");
+const { berlinWallTime, possibleInstants, punctualityStatus } = require("./attendance-punctuality");
 
 const ROOT = __dirname;
 const STATIC_ROOTS = ["public", "assets", "Css", "js"]
@@ -36,6 +37,7 @@ const BOOKING_SLOT_TIMES = String(process.env.BOOKING_SLOT_TIMES || "").split(",
 const RATE_WINDOW_MS = 15 * 60 * 1000;
 const RATE_LIMIT = 6;
 const rateBuckets = new Map();
+const locationSimulationRateBuckets = new Map();
 const ADMIN_SESSION_COOKIE = "zo_admin_session";
 const CUSTOMER_SESSION_COOKIE = "zo_customer_session";
 const EMPLOYEE_SESSION_COOKIE = "zo_employee_session";
@@ -52,6 +54,12 @@ const EMPLOYEE_SESSION_TTL_MS = Math.min(Math.max(Number(process.env.EMPLOYEE_SE
 const EMPLOYEE_INVITE_TTL_HOURS = Math.min(Math.max(Number(process.env.EMPLOYEE_INVITE_TTL_HOURS || 72), 1), 168);
 const NODE_ENV = String(process.env.NODE_ENV || "development").trim().toLowerCase();
 const IS_PRODUCTION = NODE_ENV === "production";
+// Phase 16.17B must never accept location data outside the isolated test system.
+// Keeping this derived (rather than client-configurable) makes the simulation
+// endpoints unavailable on the production process even if a browser knows them.
+const LOCATION_SIMULATION_TEST_MODE = ENV_FILE === ".env.test"
+    && process.env.MYSQL_DATABASE === "zoicas_osinski_test"
+    && PORT === 3001;
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || `http://${HOST}:${PORT}`).replace(/\/+$/, "");
 const TRUST_PROXY = process.env.TRUST_PROXY === "true";
 const TRUSTED_ORIGINS = new Set(
@@ -273,10 +281,56 @@ function readCustomerSession(request) {
     return { token, ...session };
 }
 
-function customerSessionOrRespond(request, response) {
-    const session = readCustomerSession(request);
-    if (!session) { sendJson(response, 401, { message: "Bitte melden Sie sich an." }); return null; }
-    return session;
+
+
+async function currentPortalSession(request,role) {
+    const customer=role==="customer";
+    const session=customer?readCustomerSession(request):readEmployeeSession(request);
+    if(!session)return null;
+    const [rows]=await pool.execute(customer?"SELECT status,session_version FROM customers WHERE id=?":"SELECT status,session_version,role FROM employees WHERE id=?",[customer?session.customerId:session.employeeId]);
+    const account=rows[0],sessions=customer?customerSessions:employeeSessions;
+    if(!account || account.status!==(customer?"active":"ACTIVE") || Number(account.session_version)!==Number(session.version)) {
+        sessions.delete(session.token);
+        return null;
+    }
+    return sessions.has(session.token)?(customer?session:{...session,role:account.role}):null;
+}
+
+async function portalSessionOrRespond(request,response,role) {
+    try {
+        const session=await currentPortalSession(request,role);
+        if(session)return session;
+        const cookie=role==="customer"?CUSTOMER_SESSION_COOKIE:EMPLOYEE_SESSION_COOKIE;
+        response.setHeader("Set-Cookie",cookie+"=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"+(secureAdminCookie?"; Secure":""));
+        sendJson(response,401,{message:"Bitte melden Sie sich an."});
+    } catch(error) {
+        console.error("[portal-session] account check failed:",error.code||"database_error");
+        sendJson(response,503,{message:"Die Sitzung kann derzeit nicht geprüft werden."});
+    }
+    return null;
+}
+
+async function changePortalStatus(role,id,status) {
+    const customer=role==="customer",table=customer?"customers":"employees",connection=await adminPool.getConnection();
+    try {
+        await connection.beginTransaction();
+        const [[old]]=await connection.execute("SELECT status,session_version FROM "+table+" WHERE id=? FOR UPDATE",[id]);
+        if(!old)return false;
+        const changed=old.status!==status || status!==(customer?"active":"ACTIVE");
+        if(changed){
+            await connection.execute("UPDATE "+table+" SET status=?,session_version=session_version+1 WHERE id=?",[status,id]);
+            if(!customer&&status!=="ACTIVE")await connection.execute("UPDATE employee_invitations SET revoked_at=NOW() WHERE employee_id=? AND accepted_at IS NULL AND revoked_at IS NULL",[id]);
+            await auditEvent(connection,"ADMIN",null,"ACCOUNT_STATUS_CHANGED",role.toUpperCase(),id,{previous:old.status,status});
+        }
+        await connection.commit();
+        if(changed)revokePortalSessions(role,id,old.session_version);
+        return true;
+    } finally {try{await connection.rollback();}finally{connection.release();}}
+}
+
+function revokePortalSessions(role,id,version) {
+    const customer=role==="customer",sessions=customer?customerSessions:employeeSessions;
+    for(const [key,session] of sessions)if(Number(customer?session.customerId:session.employeeId)===Number(id)&&Number(session.version)<=Number(version))sessions.delete(key);
 }
 
 function setEmployeeCookie(response, token, maxAge) {
@@ -294,11 +348,7 @@ function readEmployeeSession(request) {
     return { token, ...session };
 }
 
-function employeeSessionOrRespond(request, response) {
-    const session = readEmployeeSession(request);
-    if (!session) { sendJson(response, 401, { message: "Bitte melden Sie sich an." }); return null; }
-    return session;
-}
+
 
 function takeEmployeeLoginRateLimit(request) {
     const key = request.socket.remoteAddress || "unknown";
@@ -333,6 +383,7 @@ function waitForSmtpResponse(socket) {
         let buffer = "";
         const onData = chunk => {
             buffer += chunk.toString("utf8");
+            if (!buffer.endsWith("\r\n")) return;
             const lines = buffer.split("\r\n").filter(Boolean);
             const last = lines.at(-1);
             if (last && /^\d{3} /.test(last)) finish(null, { code: Number(last.slice(0, 3)), lines });
@@ -351,7 +402,7 @@ async function smtpCommand(socket, command, expected = [250]) {
     const response = waitForSmtpResponse(socket);
     socket.write(`${command}\r\n`);
     const result = await response;
-    if (!expected.includes(result.code)) throw new Error(`SMTP command failed (${result.code}).`);
+    if (!expected.includes(result.code)) throw Object.assign(new Error("SMTP command rejected."), {smtpStatus:result.code});
     return result;
 }
 
@@ -361,31 +412,61 @@ function escapeEmailHtml(value) {
     })[character]);
 }
 
-function employeeInvitationEmail({ firstName, invitationUrl }) {
-    const safeName = escapeEmailHtml(firstName || "");
-    const safeUrl = escapeEmailHtml(invitationUrl);
+function brandedEmail({name, heading, preview, content}) {
     const logo = `<img src="cid:zoicas-logo" width="210" alt="Zoicas &amp; Osinski" style="display:block;width:210px;max-width:100%;height:auto;border:0;">`;
+    return `<!doctype html><html lang="de"><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>@media(max-width:480px){.brand-outer{padding:16px 8px!important}.brand-header,.brand-body{padding:20px 16px!important}.brand-header td{display:block!important;text-align:left!important}.brand-header td+td{padding-top:10px!important}}</style></head><body style="margin:0;padding:0;background:#f5f2ed;"><div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">${escapeEmailHtml(preview)}</div><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;margin:0;padding:0;background:#f5f2ed;"><tr><td class="brand-outer" align="center" style="padding:38px 16px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:650px;border-collapse:separate;overflow:hidden;background:#ffffff;border:1px solid #e2ddd6;border-radius:22px;box-shadow:0 9px 28px rgba(28,42,52,.10);"><tr><td class="brand-header" style="padding:28px 38px;background:#102f50;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr><td style="vertical-align:middle;">${logo}</td><td align="right" style="vertical-align:middle;color:#a6d936;font-family:Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:1.6px;">${escapeEmailHtml(heading)}</td></tr></table></td></tr><tr><td class="brand-body" style="padding:48px 42px 40px;font-family:Arial,sans-serif;color:#2a3440;"><h1 style="margin:0 0 28px;font-size:30px;line-height:1.25;font-weight:500;color:#27333f;">Guten Tag ${escapeEmailHtml(name)},</h1>${content}</td></tr></table></td></tr></table></body></html>`;
+}
+
+function employeeInvitationEmail({ firstName, invitationUrl }) {
+    const safeUrl = escapeEmailHtml(invitationUrl);
     const text = [
         `Hallo ${firstName || ""},`, "", "willkommen bei Zoicas & Osinski.", "",
         "Bitte legen Sie über den folgenden persönlichen Einladungslink Ihr Passwort für das Mitarbeiterportal fest:", invitationUrl, "",
         `Der Link ist aus Sicherheitsgründen ${EMPLOYEE_INVITE_TTL_HOURS} Stunden gültig und kann nur einmal verwendet werden.`, "",
         "Wenn Sie diese Einladung nicht erwartet haben, müssen Sie nichts unternehmen.", "", "Freundliche Grüße", "Zoicas & Osinski"
     ].join("\r\n");
-    const html = `<!doctype html><html lang="de"><body style="margin:0;padding:0;background:#f5f2ed;"><div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">Ihr persönlicher Zugang zum Mitarbeiterportal von Zoicas &amp; Osinski.</div><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;margin:0;padding:0;background:#f5f2ed;"><tr><td align="center" style="padding:38px 16px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:650px;border-collapse:separate;overflow:hidden;background:#ffffff;border:1px solid #e2ddd6;border-radius:22px;box-shadow:0 9px 28px rgba(28,42,52,.10);"><tr><td style="padding:28px 38px;background:#102f50;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr><td style="vertical-align:middle;">${logo}</td><td align="right" style="vertical-align:middle;color:#a6d936;font-family:Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:1.6px;">MITARBEITERPORTAL</td></tr></table></td></tr><tr><td style="padding:48px 42px 40px;font-family:Arial,sans-serif;color:#2a3440;"><h1 style="margin:0 0 28px;font-size:30px;line-height:1.25;font-weight:500;color:#27333f;">Guten Tag ${safeName},</h1><p style="margin:0 0 23px;font-size:18px;line-height:1.65;color:#3f4b57;">wir freuen uns, Sie bei Zoicas &amp; Osinski willkommen zu heißen.</p><p style="margin:0 0 28px;font-size:18px;line-height:1.65;color:#3f4b57;">Mit dieser Einladung können Sie Ihren persönlichen Zugang zum Mitarbeiterportal aktivieren und Ihr Passwort festlegen.</p><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin:0 0 30px;"><tr><td style="padding:24px 26px;border-left:4px solid #a6d936;border-radius:12px;background:#f6f8fa;"><p style="margin:0 0 11px;font-size:17px;line-height:1.5;color:#263747;"><strong>Ihr persönlicher Zugang</strong></p><p style="margin:0 0 19px;font-size:15px;line-height:1.55;color:#52616e;">Der Einladungslink ist nur für Sie bestimmt und aus Sicherheitsgründen <strong>${EMPLOYEE_INVITE_TTL_HOURS} Stunden</strong> gültig.</p><table role="presentation" cellspacing="0" cellpadding="0" border="0"><tr><td style="border-radius:8px;background:#176eae;"><a href="${safeUrl}" style="display:inline-block;padding:15px 23px;border-radius:8px;color:#ffffff;font-family:Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none;">Zugang aktivieren &rarr;</a></td></tr></table></td></tr></table><p style="margin:0 0 11px;font-size:16px;line-height:1.65;color:#46535f;">Falls Sie diese Einladung nicht erwartet haben, müssen Sie nichts unternehmen.</p><p style="margin:30px 0 0;font-size:18px;line-height:1.55;color:#2d3945;">Freundliche Grüße<br><strong>Ihr Zoicas &amp; Osinski Team</strong></p><p style="margin:30px 0 0;padding-top:20px;border-top:1px solid #e9e4de;color:#7e8992;font-size:12px;line-height:1.55;">Falls die Schaltfläche nicht funktioniert, kopieren Sie diesen Link in Ihren Browser:<br><a href="${safeUrl}" style="color:#176eae;word-break:break-all;">${safeUrl}</a></p></td></tr></table></td></tr></table></body></html>`;
+    const html = brandedEmail({name:firstName,heading:"MITARBEITERPORTAL",preview:"Ihr persönlicher Zugang zum Mitarbeiterportal von Zoicas & Osinski.",content:`<p style="margin:0 0 23px;font-size:18px;line-height:1.65;color:#3f4b57;">wir freuen uns, Sie bei Zoicas &amp; Osinski willkommen zu heißen.</p><p style="margin:0 0 28px;font-size:18px;line-height:1.65;color:#3f4b57;">Mit dieser Einladung können Sie Ihren persönlichen Zugang zum Mitarbeiterportal aktivieren und Ihr Passwort festlegen.</p><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin:0 0 30px;"><tr><td style="padding:24px 26px;border-left:4px solid #a6d936;border-radius:12px;background:#f6f8fa;"><p style="margin:0 0 11px;font-size:17px;line-height:1.5;color:#263747;"><strong>Ihr persönlicher Zugang</strong></p><p style="margin:0 0 19px;font-size:15px;line-height:1.55;color:#52616e;">Der Einladungslink ist nur für Sie bestimmt und aus Sicherheitsgründen <strong>${EMPLOYEE_INVITE_TTL_HOURS} Stunden</strong> gültig.</p><table role="presentation" cellspacing="0" cellpadding="0" border="0"><tr><td style="border-radius:8px;background:#176eae;"><a href="${safeUrl}" style="display:inline-block;padding:15px 23px;border-radius:8px;color:#ffffff;font-family:Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none;">Zugang aktivieren &rarr;</a></td></tr></table></td></tr></table><p style="margin:0 0 11px;font-size:16px;line-height:1.65;color:#46535f;">Falls Sie diese Einladung nicht erwartet haben, müssen Sie nichts unternehmen.</p><p style="margin:30px 0 0;font-size:18px;line-height:1.55;color:#2d3945;">Freundliche Grüße<br><strong>Ihr Zoicas &amp; Osinski Team</strong></p><p style="margin:30px 0 0;padding-top:20px;border-top:1px solid #e9e4de;color:#7e8992;font-size:12px;line-height:1.55;">Falls die Schaltfläche nicht funktioniert, kopieren Sie diesen Link in Ihren Browser:<br><a href="${safeUrl}" style="color:#176eae;word-break:break-all;">${safeUrl}</a></p>`});
     return { text, html };
 }
 
-async function sendEmployeeInviteEmail({ email, firstName, invitationUrl }) {
+const contractEmailSubject = "Ihr Vertrag bei Zoicas & Osinski";
+function customerContractEmail({name, number, startDate}) {
+    const intro = "wir möchten Sie darüber informieren, dass Ihr Vertrag bei Zoicas & Osinski – Reinigungsservice in unserem System hinterlegt und aktiviert wurde.";
+    const portal = "Sie können Ihre freigegebenen Vertragsinformationen in Ihrem Kundenportal einsehen.";
+    const help = "Bei Fragen stehen wir Ihnen gerne zur Verfügung.";
+    const date = startDate.split("-").reverse().join(".");
+    const text = [`Guten Tag ${name},`,"",intro,"",`Vertragsnummer: ${number}`,`Vertragsbeginn: ${date}`,"",
+        portal,"",help,"","Mit freundlichen Grüßen","","Ihr Team von Zoicas & Osinski"].join("\r\n");
+    const content = `<p style="margin:0 0 28px;font-size:18px;line-height:1.65;color:#3f4b57;">${escapeEmailHtml(intro)}</p>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin:0 0 30px;"><tr><td style="padding:24px 26px;border-left:4px solid #a6d936;border-radius:12px;background:#f6f8fa;">
+        <p style="margin:0;font-size:17px;line-height:1.5;color:#263747;"><strong>Vertragsnummer:</strong> ${escapeEmailHtml(number)}<br><strong>Vertragsbeginn:</strong> ${escapeEmailHtml(date)}</p></td></tr></table>
+        <p style="margin:0 0 23px;font-size:18px;line-height:1.65;color:#3f4b57;">${portal}</p>
+        <p style="margin:0 0 11px;font-size:16px;line-height:1.65;color:#46535f;">${help}</p>
+        <p style="margin:30px 0 0;font-size:18px;line-height:1.55;color:#2d3945;">Mit freundlichen Grüßen<br><strong>Ihr Team von Zoicas &amp; Osinski</strong></p>`;
+    return {text,html:brandedEmail({name,heading:"KUNDENPORTAL",preview:contractEmailSubject,content})};
+}
+
+async function sendEmployeeInviteEmail({email,firstName,invitationUrl}) {
+    const result = await sendBrandedEmail(email,"Ihr Zugang zum Mitarbeiterportal",employeeInvitationEmail({firstName,invitationUrl}));
+    if (!result.delivered && !["smtp_not_configured","invalid_recipient"].includes(result.reason)) throw new Error("Employee invitation SMTP delivery failed.");
+    return result;
+}
+
+async function sendBrandedEmail(email, subject, {text, html}) {
     if (!smtpConfigured) return { delivered: false, reason: "smtp_not_configured" };
+    if (!validateEmail(email) || /[<>\r\n]/.test(email)) return {delivered:false,reason:"invalid_recipient"};
     const host = process.env.SMTP_HOST;
     const port = Number(process.env.SMTP_PORT || 587);
     const implicitTls = process.env.SMTP_IMPLICIT_TLS === "true" || port === 465;
     const connect = implicitTls
         ? tls.connect({ host, port, servername: host, rejectUnauthorized: true })
         : net.connect({ host, port });
-    await new Promise((resolve, reject) => { connect.once(implicitTls ? "secureConnect" : "connect", resolve); connect.once("error", reject); });
     let socket = connect;
+    let submitting = false;
+    const timeout = () => socket.destroy(new Error("SMTP timeout"));
+    socket.setTimeout(10000,timeout);
     try {
+        await new Promise((resolve, reject) => { connect.once(implicitTls ? "secureConnect" : "connect", resolve); connect.once("error", reject); });
         let greeting = await waitForSmtpResponse(socket);
         if (greeting.code !== 220) throw new Error("SMTP greeting failed.");
         let hello = await smtpCommand(socket, `EHLO ${HOST}`, [250]);
@@ -393,6 +474,7 @@ async function sendEmployeeInviteEmail({ email, firstName, invitationUrl }) {
             if (!hello.lines.some(line => /STARTTLS/i.test(line))) throw new Error("SMTP server does not offer STARTTLS.");
             await smtpCommand(socket, "STARTTLS", [220]);
             socket = tls.connect({ socket, servername: host, rejectUnauthorized: true });
+            socket.setTimeout(10000,timeout);
             await new Promise((resolve, reject) => { socket.once("secureConnect", resolve); socket.once("error", reject); });
             hello = await smtpCommand(socket, `EHLO ${HOST}`, [250]);
         }
@@ -403,18 +485,21 @@ async function sendEmployeeInviteEmail({ email, firstName, invitationUrl }) {
         await smtpCommand(socket, `MAIL FROM:<${from}>`, [250]);
         await smtpCommand(socket, `RCPT TO:<${email}>`, [250, 251]);
         await smtpCommand(socket, "DATA", [354]);
-        const subject = "Ihr Zugang zum Mitarbeiterportal";
-        const { text, html } = employeeInvitationEmail({ firstName, invitationUrl });
+        const mimeBase64 = value => Buffer.from(value).toString("base64").match(/.{1,76}/g)?.join("\r\n") || "";
         const relatedBoundary = `zoicas-related-${crypto.randomBytes(12).toString("hex")}`;
         const alternativeBoundary = `zoicas-alt-${crypto.randomBytes(12).toString("hex")}`;
-        const alternativeBody = `--${alternativeBoundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n${text}\r\n\r\n--${alternativeBoundary}\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n${html}\r\n\r\n--${alternativeBoundary}--`;
+        const alternativeBody = `--${alternativeBoundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n${mimeBase64(text)}\r\n\r\n--${alternativeBoundary}\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n${mimeBase64(html)}\r\n\r\n--${alternativeBoundary}--`;
         const logoPath = path.join(ROOT, "assets", "images", "Logo", "zoicas-osinski.png");
-        const logoBase64 = fs.readFileSync(logoPath).toString("base64").match(/.{1,76}/g)?.join("\r\n") || "";
+        const logoBase64 = mimeBase64(fs.readFileSync(logoPath));
         const messageBody = `--${relatedBoundary}\r\nContent-Type: multipart/alternative; boundary="${alternativeBoundary}"\r\n\r\n${alternativeBody}\r\n\r\n--${relatedBoundary}\r\nContent-Type: image/png; name="zoicas-osinski.png"\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <zoicas-logo>\r\nContent-Disposition: inline; filename="zoicas-osinski.png"\r\n\r\n${logoBase64}\r\n--${relatedBoundary}--`;
         const data = `From: ${from}\r\nTo: ${email}\r\nSubject: ${subject}\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary="${relatedBoundary}"\r\n\r\n${messageBody.replace(/^\./gm, "..")}\r\n.`;
+        submitting = true;
         await smtpCommand(socket, data, [250]);
-        await smtpCommand(socket, "QUIT", [221]);
+        socket.end("QUIT\r\n");
         return { delivered: true };
+    } catch (error) {
+        if (error.smtpStatus >= 400 && error.smtpStatus < 600) return {delivered:false,reason:"smtp_rejected"};
+        return submitting ? {delivered:false,reason:"smtp_outcome_unknown",uncertain:true} : {delivered:false,reason:"smtp_connection_failed"};
     } finally { socket.destroy(); }
 }
 
@@ -536,12 +621,92 @@ async function handleAdminAppointments(request, response, pathname, searchParams
     response.setHeader("Allow", "GET, PATCH"); return sendJson(response, 405, { message: "Methode nicht erlaubt." });
 }
 
+async function registerAdminCustomer(request,response) {
+    if(!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+    let body;try{body=await readJson(request);}catch{return sendJson(response,400,{message:"Ungültige Kundendaten."});}
+    const {customer_type:type="PRIVATE",status="active",registration_key:key}=body||{};
+    const limits={first_name:80,last_name:80,company_name:180,contact_name:160,phone:40,address:180,postal_code:16,city:120,
+        billing_address:180,billing_postal_code:16,billing_city:120,customer_number:40,internal_notes:4000};
+    const d=Object.fromEntries(Object.entries(limits).map(([name,max])=>[name,readText(body?.[name],max,{optional:true,multiline:name==="internal_notes"})]));
+    const email=body?.email?validateEmail(body.email):null;
+    if(!["PRIVATE","BUSINESS"].includes(type)||!["active","inactive","blocked"].includes(status)||
+       (key!=null&&!submissionKey(key))||(!key&&!email&&!d.customer_number)||Object.values(d).includes(null)||(body?.email&&!email)||
+       (type==="PRIVATE"&&(!d.first_name||!d.last_name))||(type==="BUSINESS"&&!d.company_name)||
+       ([d.billing_address,d.billing_postal_code,d.billing_city].some(Boolean)&&![d.billing_address,d.billing_postal_code,d.billing_city].every(Boolean))) {
+        return sendJson(response,400,{message:"Bitte prüfen Sie die Kundendaten und die Rechnungsadresse."});
+    }
+    const connection=await adminPool.getConnection();
+    try {
+        await connection.beginTransaction();
+        const number=d.customer_number||"KU-"+reportBerlinDate().slice(0,4)+"-"+crypto.randomBytes(5).toString("hex").toUpperCase();
+        const [result]=await connection.execute("INSERT INTO customers(customer_number,customer_type,first_name,last_name,company_name,contact_name,email,phone,address,postal_code,city,billing_address,billing_postal_code,billing_city,internal_notes,status,registration_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [number,type,d.first_name,d.last_name,d.company_name||null,d.contact_name||null,email,d.phone,d.address||null,d.postal_code||null,d.city||null,
+                d.billing_address||null,d.billing_postal_code||null,d.billing_city||null,d.internal_notes||null,status,key||null]);
+        await auditEvent(connection,"ADMIN",null,"CUSTOMER_CREATED","CUSTOMER",result.insertId,{portalEnabled:false});
+        await connection.commit();
+        return sendJson(response,201,{id:result.insertId,customerNumber:number,message:"Kunde angelegt."});
+    }catch(error){
+        if(error.code==="ER_DUP_ENTRY")return sendJson(response,409,{message:"E-Mail-Adresse, Kundennummer oder Einreichung ist bereits erfasst."});
+        throw error;
+    }finally{try{await connection.rollback();}finally{connection.release();}}
+}
+
+async function createCustomerPortalInvitation(request,response,id) {
+    if(request.method!=="POST")return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    if(!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+    let body;try{body=await readJson(request);}catch{return sendJson(response,400,{message:"Ungültige Einladung."});}
+    const supplied=body?.email ? validateEmail(body.email) : null;
+    if(body?.email&&!supplied)return sendJson(response,400,{message:"Bitte prüfen Sie die E-Mail-Adresse."});
+    const connection=await adminPool.getConnection();
+    try {
+        await connection.beginTransaction();
+        const [[record]]=await connection.execute("SELECT status,email,password_hash,session_version FROM customers WHERE id=? FOR UPDATE",[id]);
+        if(!record)return sendJson(response,404,{message:"Kunde nicht gefunden."});
+        if(record.status!=="active"||!(record.email||supplied)||record.password_hash||(record.email&&supplied&&record.email!==supplied))return sendJson(response,409,{message:"Einladungen sind für aktive Kunden mit E-Mail-Adresse und ohne Portalzugang möglich."});
+        if(!record.email)await connection.execute("UPDATE customers SET email=? WHERE id=?",[supplied,id]);
+        const token=crypto.randomBytes(32).toString("base64url");
+        await connection.execute("INSERT INTO customer_portal_invitations(customer_id,token_hash,expires_at,session_version) VALUES(?,?,DATE_ADD(NOW(),INTERVAL 24 HOUR),?) ON DUPLICATE KEY UPDATE token_hash=?,expires_at=DATE_ADD(NOW(),INTERVAL 24 HOUR),session_version=?",[id,invitationTokenHash(token),record.session_version,invitationTokenHash(token),record.session_version]);
+        await auditEvent(connection,"ADMIN",null,"CUSTOMER_PORTAL_INVITED","CUSTOMER",id);
+        await connection.commit();
+        response.setHeader("Cache-Control","no-store");
+        return sendJson(response,201,{invitationPath:"/public/kunden-registrieren.html#einladung="+token,message:"Einladungslink erstellt. Er gilt 24 Stunden."});
+    }catch(error){
+        if(error.code==="ER_DUP_ENTRY")return sendJson(response,409,{message:"Diese E-Mail-Adresse ist bereits vergeben."});
+        throw error;
+    }finally{try{await connection.rollback();}finally{connection.release();}}
+}
+
+async function acceptCustomerPortalInvitation(request,response) {
+    if(request.method!=="POST")return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    if(!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+    if(takeRateLimit(request))return sendJson(response,429,{message:"Zu viele Anfragen."});
+    let body;try{body=await readJson(request);}catch{return sendJson(response,400,{message:"Ungültige Daten."});}
+    if(!/^[A-Za-z0-9_-]{43}$/.test(body?.token||"")||!validCustomerPassword(body?.password)||body.password!==body.password_confirmation)return sendJson(response,400,{message:"Bitte prüfen Sie Einladungslink und Passwort."});
+    const connection=await pool.getConnection();
+    try {
+        const hash=await makePasswordHash(body.password), tokenHash=invitationTokenHash(body.token);
+        await connection.beginTransaction();
+        const [[invite]]=await connection.execute("SELECT customer_id FROM customer_portal_invitations WHERE token_hash=?",[tokenHash]);
+        const [[customer]]=invite?await connection.execute("SELECT id,status,email,password_hash,session_version FROM customers WHERE id=? FOR UPDATE",[invite.customer_id]):[[]];
+        const [[valid]]=customer?await connection.execute("SELECT customer_id FROM customer_portal_invitations WHERE customer_id=? AND token_hash=? AND expires_at>NOW() AND session_version=? FOR UPDATE",[customer.id,tokenHash,customer.session_version]):[[]];
+        if(!valid||customer.status!=="active"||!customer.email||customer.password_hash)return sendJson(response,400,{message:"Diese Einladung ist ungültig oder abgelaufen."});
+        await connection.execute("UPDATE customers SET password_hash=? WHERE id=?",[hash,customer.id]);
+        await connection.execute("DELETE FROM customer_portal_invitations WHERE customer_id=?",[customer.id]);
+        await auditEvent(connection,"CUSTOMER",customer.id,"CUSTOMER_PORTAL_ACTIVATED","CUSTOMER",customer.id);
+        await connection.commit();
+        return sendJson(response,200,{message:"Portalzugang aktiviert. Bitte melden Sie sich an."});
+    }finally{try{await connection.rollback();}finally{connection.release();}}
+}
+
 async function handleAdminCustomers(request, response, pathname, searchParams) {
     if (!adminPool) return sendJson(response,503,{message:"Die Datenbankrechte für das Dashboard sind noch nicht eingerichtet."});
+    if(pathname==="/api/admin/customers"&&request.method==="POST")return registerAdminCustomer(request,response);
+    const invite=pathname.match(/^\/api\/admin\/customers\/(\d+)\/invitation$/);
+    if(invite)return createCustomerPortalInvitation(request,response,Number(invite[1]));
     const match=pathname.match(/^\/api\/admin\/customers(?:\/(\d+))?$/),id=match?.[1]?Number(match[1]):null;
-    if(id&&request.method==="GET"){const [r]=await adminPool.execute("SELECT id,customer_number,first_name,last_name,email,phone,address,postal_code,city,status,created_at,last_login_at FROM customers WHERE id=?",[id]);return r[0]?sendJson(response,200,{customer:r[0]}):sendJson(response,404,{message:"Kunde nicht gefunden."});}
-    if(id&&request.method==="PATCH"){if(!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});let b;try{b=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Daten."})};if(!["active","inactive","blocked"].includes(readText(b.status,20)))return sendJson(response,400,{message:"Ungültiger Status."});await adminPool.execute("UPDATE customers SET status=? WHERE id=?",[b.status,id]);return sendJson(response,200,{id,status:b.status});}
-    if(!id&&request.method==="GET"){const search=(searchParams.get("search")||"").trim().slice(0,100),status=searchParams.get("status")||"all";if(status!=="all"&&!["active","inactive","blocked"].includes(status))return sendJson(response,400,{message:"Ungültige Filter."});const c=[],v=[];if(status!=="all"){c.push("status=?");v.push(status)}if(search){c.push("(customer_number LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR email LIKE ? OR phone LIKE ? OR city LIKE ?)");for(let i=0;i<6;i++)v.push(`%${search}%`)}const w=c.length?` WHERE ${c.join(" AND ")}`:"";const [rows]=await adminPool.execute(`SELECT id,customer_number,first_name,last_name,email,phone,city,status,created_at,last_login_at FROM customers${w} ORDER BY created_at DESC LIMIT 100`,v);return sendJson(response,200,{rows,total:rows.length});}
+    if(id&&request.method==="GET"){const [r]=await adminPool.execute("SELECT id,customer_number,first_name,last_name,email,phone,address,postal_code,city,status,created_at,last_login_at,customer_type,company_name,contact_name,billing_address,billing_postal_code,billing_city,internal_notes,(password_hash IS NOT NULL) AS portal_enabled FROM customers WHERE id=?",[id]);return r[0]?sendJson(response,200,{customer:r[0]}):sendJson(response,404,{message:"Kunde nicht gefunden."});}
+    if(id&&request.method==="PATCH"){if(!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});let b;try{b=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Daten."})};if(!["active","inactive","blocked"].includes(readText(b.status,20)))return sendJson(response,400,{message:"Ungültiger Status."});return await changePortalStatus("customer",id,b.status)?sendJson(response,200,{id,status:b.status}):sendJson(response,404,{message:"Kunde nicht gefunden."});}
+    if(!id&&request.method==="GET"){const search=(searchParams.get("search")||"").trim().slice(0,100),status=searchParams.get("status")||"all";if(status!=="all"&&!["active","inactive","blocked"].includes(status))return sendJson(response,400,{message:"Ungültige Filter."});const c=[],v=[];if(status!=="all"){c.push("status=?");v.push(status)}if(search){c.push("(customer_number LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR email LIKE ? OR phone LIKE ? OR city LIKE ? OR CONCAT(first_name,' ',last_name) LIKE ? OR company_name LIKE ?)");for(let i=0;i<8;i++)v.push(`%${search}%`)}const w=c.length?` WHERE ${c.join(" AND ")}`:"";const [rows]=await adminPool.execute(`SELECT id,customer_number,first_name,last_name,email,phone,city,status,created_at,last_login_at,company_name FROM customers${w} ORDER BY created_at DESC LIMIT 100`,v);return sendJson(response,200,{rows,total:rows.length});}
     return sendJson(response,405,{message:"Methode nicht erlaubt."});
 }
 
@@ -593,15 +758,21 @@ async function handleAdminQuotes(request, response, pathname, searchParams) {
         if (!isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
         let body;
         try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "Die Statusdaten konnten nicht gelesen werden." }); }
-        const status = readText(body.status, 20);
+        const status = readText(body?.status, 20);
         if (!quoteStatuses.has(status)) return sendJson(response, 400, { message: "Ungültiger Status." });
+        const connection=await adminPool.getConnection();
         try {
-            const [result] = await adminPool.execute("UPDATE quote_requests SET status = ? WHERE id = ?", [status, quoteId]);
+            await connection.beginTransaction();
+            const [result] = await connection.execute("UPDATE quote_requests SET status = ? WHERE id = ?", [status, quoteId]);
             if (!result.affectedRows) return sendJson(response, 404, { message: "Anfrage nicht gefunden." });
+            await auditEvent(connection,"ADMIN",null,"SERVICE_REQUEST_STATUS_CHANGED","SERVICE_REQUEST",quoteId,{status});
+            await connection.commit();
             return sendJson(response, 200, { id: quoteId, status, statusLabel: quoteStatusLabels[status] });
         } catch (error) {
             console.error("[admin] quote status update failed:", error.code || "database_error");
             return sendJson(response, 503, { message: adminDatabaseErrorMessage(error, "Der Status konnte nicht gespeichert werden.") });
+        } finally {
+            try { await connection.rollback(); } finally { connection.release(); }
         }
     }
 
@@ -657,6 +828,20 @@ function takeRateLimit(request) {
         }
     }
 
+    return 0;
+}
+
+function takeLocationSimulationRateLimit(request, employeeId) {
+    const key = `${request.socket.remoteAddress || "unknown"}:${employeeId}`;
+    const now = Date.now();
+    let bucket = locationSimulationRateBuckets.get(key);
+    if (!bucket || now >= bucket.expiresAt) {
+        bucket = { count: 0, expiresAt: now + RATE_WINDOW_MS };
+        locationSimulationRateBuckets.set(key, bucket);
+    }
+    if (bucket.count >= 30) return Math.max(1, Math.ceil((bucket.expiresAt - now) / 1000));
+    bucket.count += 1;
+    if (locationSimulationRateBuckets.size > 2000) for (const [entry, oldBucket] of locationSimulationRateBuckets) if (now >= oldBucket.expiresAt) locationSimulationRateBuckets.delete(entry);
     return 0;
 }
 
@@ -866,8 +1051,7 @@ function validateCareer(body) {
 function isIsoDate(value) { return /^\d{4}-\d{2}-\d{2}$/.test(String(value || "")) && !Number.isNaN(new Date(`${value}T00:00:00Z`).getTime()); }
 function isClockTime(value) { return /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value || "")); }
 
-// Phase 16 reporting helpers intentionally return only aggregate values. They
-// are not HTTP handlers and will be used exclusively by protected admin APIs.
+// Reports filter timestamp-backed records at Berlin calendar boundaries.
 function reportBerlinDate(now = new Date()) {
     const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Berlin", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(now);
     const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
@@ -876,6 +1060,9 @@ function reportBerlinDate(now = new Date()) {
 function reportIsIsoDate(value) { if (!isIsoDate(value)) return false; return new Date(`${value}T12:00:00Z`).toISOString().slice(0, 10) === value; }
 function reportAddDays(isoDate, days) { const value = new Date(`${isoDate}T12:00:00Z`); value.setUTCDate(value.getUTCDate() + days); return value.toISOString().slice(0, 10); }
 function reportDaySpan(from, to) { return Math.round((new Date(`${to}T12:00:00Z`) - new Date(`${from}T12:00:00Z`)) / 86400000) + 1; }
+function reportTimestampRange({from,to}) {
+    return [from,reportAddDays(to,1)].map(day=>possibleInstants(day+"T00:00:00")[0]/1000);
+}
 function reportNumber(value) { return Number(value || 0); }
 function normalizeReportDateRange(input = {}, now = new Date()) {
     const period = String(input.period || "month").toLowerCase(); const today = reportBerlinDate(now); let from, to;
@@ -895,28 +1082,125 @@ function buildPreviousComparisonRange(range) {
     return { period: "previous", from: reportAddDays(to, -(span - 1)), to };
 }
 function reportComparison(current, previous) { const difference = reportNumber(current) - reportNumber(previous); return { current: reportNumber(current), previous: reportNumber(previous), difference, percent: reportNumber(previous) === 0 ? null : Number(((difference / reportNumber(previous)) * 100).toFixed(2)) }; }
+async function getRecordedInvoicePayments(connection, range) {
+    const [[invoicePayments]] = await connection.execute("SELECT COALESCE(SUM(p.amount),0) amount FROM invoice_payments p JOIN invoices i ON i.id=p.invoice_id WHERE p.payment_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT')", [range.from, range.to]);
+    return reportNumber(invoicePayments.amount);
+}
 async function getRevenueReport(connection, range) {
     const [[invoices]] = await connection.execute("SELECT COALESCE(SUM(net_amount),0) net,COALESCE(SUM(tax_amount),0) tax,COALESCE(SUM(gross_amount),0) gross,COUNT(*) invoice_count FROM invoices WHERE invoice_date BETWEEN ? AND ? AND status NOT IN ('ENTWURF','STORNIERT')", [range.from, range.to]);
-    const [[invoicePayments]] = await connection.execute("SELECT COALESCE(SUM(p.amount),0) amount FROM invoice_payments p JOIN invoices i ON i.id=p.invoice_id WHERE p.payment_date BETWEEN ? AND ? AND i.status<>'STORNIERT'", [range.from, range.to]);
+    const invoicePayments = await getRecordedInvoicePayments(connection, range);
     const [[income]] = await connection.execute("SELECT COALESCE(SUM(amount),0) amount FROM financial_transactions WHERE transaction_date BETWEEN ? AND ? AND transaction_type='INCOME' AND status<>'STORNIERT'", [range.from, range.to]);
     const [[expenses]] = await connection.execute("SELECT COALESCE(SUM(amount),0) amount FROM financial_transactions WHERE transaction_date BETWEEN ? AND ? AND transaction_type='EXPENSE' AND status<>'STORNIERT'", [range.from, range.to]);
     const [[material]] = await connection.execute("SELECT COALESCE(SUM(quantity * COALESCE(unit_cost_snapshot,0)),0) amount FROM material_stock_movements WHERE movement_date BETWEEN ? AND ? AND status='APPROVED' AND movement_type='CONSUMPTION'", [range.from, range.to]);
     const net = reportNumber(invoices.net), expenseAmount = reportNumber(expenses.amount), materialAmount = reportNumber(material.amount);
-    return { invoiced: { net, tax: reportNumber(invoices.tax), gross: reportNumber(invoices.gross), count: reportNumber(invoices.invoice_count) }, invoice_payments: reportNumber(invoicePayments.amount), financial_income: reportNumber(income.amount), expenses: expenseAmount, material_consumption_costs: materialAmount, partial_result_incomplete: net - expenseAmount - materialAmount };
+    return { invoiced: { net, tax: reportNumber(invoices.tax), gross: reportNumber(invoices.gross), count: reportNumber(invoices.invoice_count) }, invoice_payments: invoicePayments, financial_income: reportNumber(income.amount), expenses: expenseAmount, material_consumption_costs: materialAmount, partial_result_incomplete: net - expenseAmount - materialAmount };
 }
-async function getInvoiceReport(connection, range) {
-    const [rows] = await connection.execute("SELECT i.id,i.gross_amount,i.due_date,i.status,COALESCE(SUM(p.amount),0) paid_amount FROM invoices i LEFT JOIN invoice_payments p ON p.invoice_id=i.id WHERE i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT') GROUP BY i.id,i.gross_amount,i.due_date,i.status", [range.from, range.to]);
-    const today = reportBerlinDate(); let outstanding = 0, overdue = 0, partial = 0;
-    for (const row of rows) { const open = Math.max(0, reportNumber(row.gross_amount) - reportNumber(row.paid_amount)); outstanding += open; if (open > 0 && String(row.due_date).slice(0, 10) < today) overdue += open; if (reportNumber(row.paid_amount) > 0 && open > 0) partial += 1; }
-    return { invoice_count: rows.length, outstanding_amount: outstanding, overdue_amount: overdue, partially_paid_count: partial };
+const reportInvoiceLedger = "SELECT i.id,i.customer_id,i.invoice_date,i.due_date,i.gross_amount,COALESCE((SELECT SUM(p.amount) FROM invoice_payments p WHERE p.invoice_id=i.id),0) AS paid FROM invoices i WHERE i.status NOT IN ('ENTWURF','STORNIERT')";
+async function getInvoiceReport(connection, range = null, today = reportBerlinDate()) {
+    const period = range ? " AND i.invoice_date BETWEEN ? AND ?" : "";
+    const [[row]] = await connection.execute(`
+        SELECT COUNT(*) AS invoice_count,COALESCE(SUM(gross_amount),0) AS issued_amount,COALESCE(SUM(paid),0) AS paid_amount,
+            COALESCE(SUM(GREATEST(0,gross_amount-paid)),0) AS outstanding_amount,
+            COALESCE(SUM(IF(due_date<? AND gross_amount>paid,gross_amount-paid,0)),0) AS overdue_amount,
+            COALESCE(SUM(due_date<? AND gross_amount>paid),0) AS overdue_count,
+            COALESCE(SUM(gross_amount>paid),0) AS unpaid_count,
+            COALESCE(SUM(paid>0 AND gross_amount>paid),0) AS partially_paid_count
+        FROM (${reportInvoiceLedger}${period}) ledger`, [today,today,...(range?[range.from,range.to]:[])]);
+    return Object.fromEntries(Object.entries(row).map(([key,value])=>[key,reportNumber(value)]));
 }
+const customerNotificationPublicationFilter = "(n.entity_type IS NULL OR n.entity_type<>'QUOTE' OR EXISTS(SELECT 1 FROM quotes q WHERE q.id=n.entity_id AND q.customer_id=n.recipient_id AND q.status NOT IN ('ENTWURF','STORNIERT'))) AND (n.entity_type IS NULL OR n.entity_type<>'INVOICE' OR EXISTS(SELECT 1 FROM invoices i WHERE i.id=n.entity_id AND i.customer_id=n.recipient_id AND i.status NOT IN ('ENTWURF','STORNIERT'))) AND (n.entity_type IS NULL OR n.entity_type<>'CONTRACT' OR EXISTS(SELECT 1 FROM contracts c WHERE c.id=n.entity_id AND c.customer_id=n.recipient_id AND c.status<>'ENTWURF'))";
+async function managementHome(day) {
+    const active = "o.status NOT IN ('ERLEDIGT','STORNIERT')";
+    const assignments = "a.status NOT IN ('ERLEDIGT','STORNIERT')";
+    const [[operations], finance, monthlyPayments] = await Promise.all([
+        adminPool.execute(`
+            SELECT (SELECT COUNT(*) FROM orders o WHERE o.status<>'STORNIERT' AND
+                (DATE(o.planned_start)=dates.today OR EXISTS(SELECT 1 FROM order_assignments a WHERE a.order_id=o.id AND a.assignment_date=dates.today AND a.status<>'STORNIERT'))) AS scheduled,
+                (SELECT COUNT(*) FROM orders o WHERE o.status='ERLEDIGT' AND
+                (DATE(o.planned_start)=dates.today OR EXISTS(SELECT 1 FROM order_assignments a WHERE a.order_id=o.id AND a.assignment_date=dates.today AND a.status<>'STORNIERT'))) AS completed,
+                (SELECT COUNT(*) FROM orders o WHERE ${active} AND NOT EXISTS(SELECT 1 FROM order_assignments a WHERE a.order_id=o.id AND a.status<>'STORNIERT')) AS unassigned,
+                (SELECT COUNT(*) FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE ${active} AND ${assignments} AND a.assignment_date>=dates.today AND
+                    EXISTS(SELECT 1 FROM employee_absences e WHERE e.employee_id=a.employee_id AND a.assignment_date BETWEEN e.start_date AND e.end_date)) AS absence_conflicts,
+                (SELECT COUNT(*) FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE ${active} AND ${assignments} AND a.assignment_date>=dates.today AND
+                    EXISTS(SELECT 1 FROM order_assignments b JOIN orders bo ON bo.id=b.order_id WHERE b.employee_id=a.employee_id AND b.assignment_date=a.assignment_date AND b.id<>a.id AND b.status NOT IN ('ERLEDIGT','STORNIERT') AND bo.status NOT IN ('ERLEDIGT','STORNIERT') AND b.start_time<a.end_time AND b.end_time>a.start_time)) AS overlaps,
+                (SELECT COUNT(DISTINCT employee_id) FROM employee_attendance_sessions WHERE status='OPEN' AND check_out_at IS NULL) AS checked_in,
+                (SELECT COUNT(*) FROM orders o WHERE o.is_automated=1 AND o.required_crew_size>1 AND o.status NOT IN ('ERLEDIGT','STORNIERT') AND DATE(o.planned_start)>=dates.today AND (SELECT COUNT(DISTINCT a.employee_id) FROM order_assignments a WHERE a.order_id=o.id AND a.status<>'STORNIERT' AND ${crewAssignmentCoversOccurrence} AND NOT EXISTS(SELECT 1 FROM employee_absences e WHERE e.employee_id=a.employee_id AND a.assignment_date BETWEEN e.start_date AND e.end_date))<o.required_crew_size) AS understaffed,
+                (SELECT COUNT(*) FROM employee_absence_requests WHERE status='PENDING') AS vacation_requests,
+                (SELECT COUNT(*) FROM quote_requests WHERE status='new') AS service_requests,
+                (SELECT COUNT(*) FROM customer_complaints WHERE status IN ('RECEIVED','IN_REVIEW')) AS complaints,
+                (SELECT COUNT(*) FROM quotes q WHERE q.status='ENTWURF' OR (q.status='ANGENOMMEN' AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.sales_quote_id=q.id))) AS quotes,
+                (SELECT COUNT(*) FROM invoices WHERE status='ENTWURF') AS invoice_drafts,
+                (SELECT COUNT(*) FROM (SELECT m.id FROM materials m LEFT JOIN material_stock_movements sm ON sm.material_id=m.id WHERE m.status='ACTIVE' GROUP BY m.id,m.minimum_stock HAVING ${materialBalanceSql}<=m.minimum_stock) low) AS low_stock
+            FROM (SELECT CAST(? AS DATE) AS today) dates`, [day]),
+        getInvoiceReport(adminPool, null, day),
+        getRecordedInvoicePayments(adminPool, {from:day.slice(0,7)+"-01",to:day})
+    ]);
+    const counts = operations[0];
+    return {day, operations:{...counts,pending:counts.scheduled-counts.completed}, finance:{...finance,monthly_payments:monthlyPayments}};
+}
+const homeVisitFields = "o.order_number,o.title,DATE_FORMAT(a.assignment_date,'%Y-%m-%d') AS day,a.start_time,a.status";
+const homeVisitOrder = "ORDER BY a.assignment_date,a.start_time,a.id";
+const upcomingVisit = "o.status NOT IN ('ERLEDIGT','STORNIERT') AND a.status NOT IN ('ERLEDIGT','STORNIERT') AND (a.assignment_date>? OR (a.assignment_date=? AND a.start_time>=?))";
+async function employeeHome(id, day, time) {
+    const [[today], [next], [attendance], [reports], [vacation], [notifications]] = await Promise.all([
+        pool.execute(`SELECT ${homeVisitFields} FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE a.employee_id=? AND a.assignment_date=? AND a.status<>'STORNIERT' AND o.status<>'STORNIERT' ${homeVisitOrder}`,[id,day]),
+        pool.execute(`SELECT ${homeVisitFields} FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE a.employee_id=? AND ${upcomingVisit} ${homeVisitOrder} LIMIT 1`,[id,day,day,time]),
+        pool.execute("SELECT o.order_number,e.check_in_at FROM employee_attendance_sessions e JOIN orders o ON o.id=e.order_id WHERE e.employee_id=? AND e.status='OPEN' AND e.check_out_at IS NULL ORDER BY e.check_in_at DESC LIMIT 1",[id]),
+        pool.execute("SELECT COUNT(*) AS total FROM order_assignments a WHERE a.employee_id=? AND a.status<>'STORNIERT' AND ((a.status='ERLEDIGT' AND NOT EXISTS(SELECT 1 FROM service_reports r WHERE r.assignment_id=a.id AND r.status IN ('SUBMITTED','REVIEWED','SHARED','CUSTOMER_CONFIRMED'))) OR EXISTS(SELECT 1 FROM service_reports r WHERE r.assignment_id=a.id AND r.employee_id=? AND r.status IN ('DRAFT','RETURNED')))",[id,id]),
+        pool.execute("SELECT status,DATE_FORMAT(start_date,'%Y-%m-%d') AS day FROM employee_absence_requests WHERE employee_id=? ORDER BY id DESC LIMIT 1",[id]),
+        pool.execute("SELECT COUNT(*) AS total FROM notifications WHERE recipient_type='EMPLOYEE' AND recipient_id=? AND read_at IS NULL",[id])
+    ]);
+    return {day,today,next:next[0]??null,attendance:attendance[0]??null,reports:reports[0].total,vacation:vacation[0]??null,notifications:notifications[0].total};
+}
+async function customerHome(id, day, time) {
+    const [[next], [counts], [notifications], [bookings]] = await Promise.all([
+        pool.execute(`SELECT order_number,service_type,day,start_time,end_time,address,postal_code,city,status,kind FROM (
+            SELECT o.order_number,o.service_type,DATE_FORMAT(a.assignment_date,'%Y-%m-%d') AS day,a.start_time,a.end_time,o.address,o.postal_code,o.city,o.status,'ORDER' AS kind
+                FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE o.customer_id=? AND ${upcomingVisit}
+            UNION ALL
+            SELECT o.order_number,o.service_type,DATE_FORMAT(o.planned_start,'%Y-%m-%d'),TIME(o.planned_start),TIME(o.planned_end),o.address,o.postal_code,o.city,o.status,'ORDER'
+                FROM orders o WHERE o.customer_id=? AND o.status IN ('GEPLANT','ZUGEWIESEN','IN_BEARBEITUNG') AND o.planned_start>=?
+                AND NOT EXISTS(SELECT 1 FROM order_assignments a WHERE a.order_id=o.id AND a.status<>'STORNIERT')
+            UNION ALL
+            SELECT o.order_number,b.service,DATE_FORMAT(b.preferred_date,'%Y-%m-%d'),b.start_time,b.end_time,b.address,b.postal_code,b.city,
+                COALESCE(o.status,b.status),IF(o.id IS NULL,'APPOINTMENT','ORDER')
+                FROM appointments b LEFT JOIN orders o ON o.appointment_id=b.id AND o.customer_id=b.portal_customer_id
+                WHERE b.portal_customer_id=? AND b.status='confirmed'
+                  AND (b.preferred_date>? OR (b.preferred_date=? AND b.end_time>?))
+                  AND (o.id IS NULL OR (o.status NOT IN ('ERLEDIGT','STORNIERT') AND o.planned_start IS NULL
+                       AND NOT EXISTS(SELECT 1 FROM order_assignments a WHERE a.order_id=o.id AND a.status<>'STORNIERT')))
+            ) visits ORDER BY day,start_time,kind DESC,order_number LIMIT 1`,[id,day,day,time,id,day+" "+time,id,day,day,time]),
+        pool.execute(`SELECT
+            (SELECT COUNT(*) FROM quote_requests WHERE customer_id=owner.id AND status IN ('new','in_progress','offer_sent','accepted')) AS requests,
+            (SELECT COUNT(*) FROM quotes WHERE customer_id=owner.id AND status='GESENDET') AS quotes,
+            (SELECT COUNT(*) FROM (${reportInvoiceLedger}) ledger WHERE ledger.customer_id=owner.id AND gross_amount>paid) AS invoices,
+            (SELECT COUNT(*) FROM customer_complaints WHERE customer_id=owner.id AND status IN ('RECEIVED','IN_REVIEW')) AS complaints
+            FROM (SELECT ? AS id) owner`,[id]),
+        pool.execute(`SELECT n.title,n.created_at,n.read_at FROM notifications n WHERE recipient_type='CUSTOMER' AND recipient_id=? AND ${customerNotificationPublicationFilter} ORDER BY n.created_at DESC,n.id DESC LIMIT 3`,[id]),
+        pool.execute("SELECT b.service AS service_type,DATE_FORMAT(b.preferred_date,'%Y-%m-%d') AS day,b.start_time,b.end_time,b.address,b.postal_code,b.city,'APPOINTMENT' AS kind FROM appointments b WHERE b.portal_customer_id=? AND b.status='confirmed' AND (b.preferred_date>? OR (b.preferred_date=? AND b.end_time>?)) AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.appointment_id=b.id AND o.customer_id=b.portal_customer_id) ORDER BY b.preferred_date,b.start_time LIMIT 4",[id,day,day,time])
+    ]);
+    return {next:next[0]??null,...counts[0],notifications,bookings:bookings.filter(row=>next[0]?.kind!=="APPOINTMENT"||row.day!==next[0].day||row.start_time!==next[0].start_time).slice(0,3)};
+}
+async function sendPortalHome(request,response,loadHome) {
+    if(request.method!=="GET") return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    response.setHeader("Cache-Control","no-store");
+    const now=berlinWallTime(new Date());
+    try {
+        return sendJson(response,200,await loadHome(now.slice(0,10),now.slice(11,19)));
+    } catch(error) {
+        console.error("[portal-home] query failed:",error.code||"dashboard_error");
+        return sendJson(response,503,{message:"Übersicht konnte nicht geladen werden."});
+    }
+}
+
 async function getOrderReport(connection, range) {
-    const [[row]] = await connection.execute("SELECT COUNT(*) total,SUM(status='NEU') new_orders,SUM(status IN ('GEPLANT','ZUGEWIESEN','IN_BEARBEITUNG','PAUSIERT')) active_orders,SUM(status='ERLEDIGT') completed_orders,SUM(status='STORNIERT') cancelled_orders,COALESCE(SUM(price_gross_snapshot),0) gross_value,COALESCE(AVG(price_gross_snapshot),0) average_gross_value FROM orders WHERE DATE(created_at) BETWEEN ? AND ?", [range.from, range.to]);
-    return Object.fromEntries(Object.entries(row).map(([key, value]) => [key, reportNumber(value)]));
+    const [[row]] = await connection.execute("SELECT COUNT(*) total,SUM(status='NEU') new_orders,SUM(status IN ('GEPLANT','ZUGEWIESEN','IN_BEARBEITUNG','PAUSIERT')) active_orders,SUM(status='ERLEDIGT') completed_orders,SUM(status='STORNIERT') cancelled_orders,COALESCE(SUM(price_gross_snapshot),0) gross_value,COALESCE(AVG(price_gross_snapshot),0) average_gross_value FROM orders WHERE UNIX_TIMESTAMP(created_at)>=? AND UNIX_TIMESTAMP(created_at)<?",reportTimestampRange(range));
+    const data=Object.fromEntries(Object.entries(row).map(([key,value])=>[key,reportNumber(value)]));
+    return {...data,completion_rate:data.total?data.completed_orders*100/data.total:0};
 }
-async function getCustomerReport(connection, range) {
-    const [[row]] = await connection.execute("SELECT COUNT(*) total_customers,SUM(status='active') active_customers,SUM(DATE(created_at) BETWEEN ? AND ?) new_customers FROM customers", [range.from, range.to]);
-    return Object.fromEntries(Object.entries(row).map(([key, value]) => [key, reportNumber(value)]));
+async function getCustomerReport(connection,range) {
+    const [[row]]=await connection.execute("SELECT COUNT(*) total_customers,SUM(status='active') active_customers,SUM(UNIX_TIMESTAMP(created_at)>=? AND UNIX_TIMESTAMP(created_at)<?) new_customers FROM customers",reportTimestampRange(range));
+    return Object.fromEntries(Object.entries(row).map(([key,value])=>[key,reportNumber(value)]));
 }
 async function getEmployeeReport(connection, range, { employeeId = null } = {}) {
     const employeeFilter = employeeId ? " AND employee_id=?" : "", employeeValues = employeeId ? [employeeId] : [];
@@ -979,7 +1263,12 @@ function createExportFilename(type, range) {
 }
 function exportDate(value, withTime = false) {
     if (!value) return "";
-    const text = value instanceof Date ? value.toISOString() : String(value);
+    if (value instanceof Date) {
+            const pad = part => String(part).padStart(2,"0");
+            const day = [value.getFullYear(),pad(value.getMonth()+1),pad(value.getDate())].join("-");
+            return withTime ? day+" "+pad(value.getHours())+":"+pad(value.getMinutes()) : day;
+        }
+        const text = String(value);
     return withTime ? text.slice(0, 16).replace("T", " ") : text.slice(0, 10);
 }
 async function reportExportRows(connection, type, range, compare) {
@@ -995,11 +1284,11 @@ async function reportExportRows(connection, type, range, compare) {
         return { headers: ["Rechnungsnummer", "Kunde", "Datum", "Status", "Netto", "MwSt.", "Brutto", "Bezahlt", "Offen"], rows: rows.map(row => [row.invoice_number, row.customer_name, exportDate(row.invoice_date), row.status, row.net_amount, row.tax_amount, row.gross_amount, row.paid_amount, Math.max(0, Number(row.gross_amount) - Number(row.paid_amount))]) };
     }
     if (type === "orders") {
-        const [rows] = await connection.execute("SELECT o.order_number,CONCAT(c.first_name,' ',c.last_name) customer_name,o.status,o.planned_start,o.planned_end,o.price_gross_snapshot FROM orders o JOIN customers c ON c.id=o.customer_id WHERE DATE(o.created_at) BETWEEN ? AND ? ORDER BY o.created_at,o.id", [range.from, range.to]);
+        const [rows] = await connection.execute("SELECT o.order_number,CONCAT(c.first_name,' ',c.last_name) customer_name,o.status,o.planned_start,o.planned_end,o.price_gross_snapshot FROM orders o JOIN customers c ON c.id=o.customer_id WHERE UNIX_TIMESTAMP(o.created_at)>=? AND UNIX_TIMESTAMP(o.created_at)<? ORDER BY o.created_at,o.id", reportTimestampRange(range));
         return { headers: ["Auftragsnummer", "Kunde", "Status", "Geplanter Start", "Geplantes Ende", "Preis Brutto"], rows: rows.map(row => [row.order_number, row.customer_name, row.status, exportDate(row.planned_start, true), exportDate(row.planned_end, true), row.price_gross_snapshot]) };
     }
     if (type === "customers") {
-        const [rows] = await connection.execute("SELECT c.customer_number,CONCAT(c.first_name,' ',c.last_name) customer_name,c.email,c.phone,(SELECT COUNT(*) FROM orders o WHERE o.customer_id=c.id AND DATE(o.created_at) BETWEEN ? AND ?) order_count,(SELECT COALESCE(SUM(i.gross_amount),0) FROM invoices i WHERE i.customer_id=c.id AND i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT')) revenue_gross FROM customers c ORDER BY revenue_gross DESC,customer_name", [range.from, range.to, range.from, range.to]);
+        const [rows] = await connection.execute("SELECT c.customer_number,CONCAT(c.first_name,' ',c.last_name) customer_name,c.email,c.phone,(SELECT COUNT(*) FROM orders o WHERE o.customer_id=c.id AND UNIX_TIMESTAMP(o.created_at)>=? AND UNIX_TIMESTAMP(o.created_at)<?) order_count,(SELECT COALESCE(SUM(i.gross_amount),0) FROM invoices i WHERE i.customer_id=c.id AND i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT')) revenue_gross FROM customers c ORDER BY revenue_gross DESC,customer_name", [...reportTimestampRange(range), range.from, range.to]);
         return { headers: ["Kundennummer", "Kunde", "E-Mail", "Telefon", "Anzahl Aufträge", "Umsatz Brutto"], rows: rows.map(row => [row.customer_number, row.customer_name, row.email, row.phone, row.order_count, row.revenue_gross]) };
     }
     if (type === "employees") {
@@ -1022,7 +1311,7 @@ async function handleAdminReportExport(request, response, searchParams, session)
     } catch (error) { console.error("[report-export] failed:", error.code || "export_error"); return sendExportError(response, 500, "EXPORT_FAILED", "Export konnte nicht erstellt werden."); }
 }
 function reportPdfMoney(value) { return `${Number(value || 0).toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} EUR`; }
-function reportPdfDate(value) { return value ? String(value).slice(0, 10) : "-"; }
+function reportPdfDate(value) { return exportDate(value) || "-"; }
 function reportPdfHeader(doc, range) {
     const logo = path.join(ROOT, "assets", "images", "Logo", "zoicas-osinski.png");
     doc.save().rect(0, 0, doc.page.width, 100).fill("#0B1F3A").restore();
@@ -1060,30 +1349,51 @@ function reportPdfTable(doc, title, rows, columns, y, range) {
     const drawHeader = () => { let x = 46; doc.fillColor("#173b5a").fontSize(8); columns.forEach(column => { doc.text(column.label, x, y + 3, { width: column.width - 4, align: column.align || "left" }); x += column.width; }); doc.strokeColor("#dce7ee").moveTo(46, y + 17).lineTo(549, y + 17).stroke(); y += 19; };
     drawHeader(); rows.slice(0, 12).forEach((row, index) => { y = reportPdfSpace(doc, y, 22, range); if (y === 108) drawHeader(); let x = 46; doc.fillColor("#111827").fontSize(8); columns.forEach(column => { const raw = typeof column.value === "function" ? column.value(row, index) : row[column.value]; doc.text(String(raw == null || raw === "" ? "-" : raw), x, y + 3, { width: column.width - 5, align: column.align || "left", ellipsis: true }); x += column.width; }); doc.strokeColor("#edf2f7").moveTo(46, y + 18).lineTo(549, y + 18).stroke(); y += 19; }); return y + 14;
 }
+async function getOrderTrend(connection, range, monthly) {
+    const [rows]=await connection.execute("SELECT FLOOR(UNIX_TIMESTAMP(created_at)/3600) AS hour_bucket,status,COUNT(*) AS total FROM orders WHERE UNIX_TIMESTAMP(created_at)>=? AND UNIX_TIMESTAMP(created_at)<? GROUP BY hour_bucket,status",reportTimestampRange(range));
+    const buckets=new Map();
+    for (const row of rows) {
+        const day=reportBerlinDate(new Date(Number(row.hour_bucket)*3600000));
+        const date=monthly?day.slice(0,7)+"-01":day;
+        if (!buckets.has(date)) buckets.set(date,{date,label:date,new_orders:0,completed:0,cancelled:0});
+        const bucket=buckets.get(date), count=Number(row.total);
+        bucket.new_orders+=count;
+        if(row.status==="ERLEDIGT") bucket.completed+=count;
+        if(row.status==="STORNIERT") bucket.cancelled+=count;
+    }
+    return [...buckets.values()].sort((a,b)=>a.date.localeCompare(b.date));
+}
+async function getInvoiceTrend(connection, range, dateExpression) {
+    const [rows] = await connection.execute(`SELECT ${dateExpression.replaceAll("%DATE%","invoice_date")} AS date,COUNT(*) AS issued,
+        COALESCE(SUM(gross_amount<=paid),0) AS paid,COALESCE(SUM(paid>0 AND gross_amount>paid),0) AS partial,
+        COALESCE(SUM(due_date<? AND gross_amount>paid),0) AS overdue
+        FROM (${reportInvoiceLedger} AND i.invoice_date BETWEEN ? AND ?) ledger GROUP BY date ORDER BY date`, [reportBerlinDate(),range.from,range.to]);
+    return rows;
+}
 async function reportPdfData(connection, range) {
     const span = reportDaySpan(range.from, range.to), dateExpr = (range.period === "year" || span > 62) ? "DATE_FORMAT(%DATE%,'%Y-%m-01')" : "DATE(%DATE%)";
     const queryTrend = async (metric) => {
+        if (metric==="orders") return getOrderTrend(connection,range,range.period==="year"||span>62);
         let sql;
         if (metric === "revenue") sql = `SELECT ${dateExpr.replaceAll("%DATE%", "invoice_date")} date,COALESCE(SUM(net_amount),0) net,COALESCE(SUM(gross_amount),0) gross FROM invoices WHERE invoice_date BETWEEN ? AND ? AND status NOT IN ('ENTWURF','STORNIERT') GROUP BY date ORDER BY date`;
         else if (metric === "cashflow") sql = `SELECT ${dateExpr.replaceAll("%DATE%", "transaction_date")} date,COALESCE(SUM(CASE WHEN transaction_type='INCOME' THEN amount ELSE 0 END),0) income,COALESCE(SUM(CASE WHEN transaction_type='EXPENSE' THEN amount ELSE 0 END),0) expense FROM financial_transactions WHERE transaction_date BETWEEN ? AND ? AND status<>'STORNIERT' GROUP BY date ORDER BY date`;
-        else if (metric === "invoices") sql = `SELECT ${dateExpr.replaceAll("%DATE%", "invoice_date")} date,COUNT(*) issued,COALESCE(SUM(status='BEZAHLT'),0) paid,COALESCE(SUM(status='ÜBERFÄLLIG'),0) overdue FROM invoices WHERE invoice_date BETWEEN ? AND ? AND status<>'ENTWURF' GROUP BY date ORDER BY date`;
-        else sql = `SELECT ${dateExpr.replaceAll("%DATE%", "created_at")} date,COUNT(*) new_orders,COALESCE(SUM(status='ERLEDIGT'),0) completed,COALESCE(SUM(status='STORNIERT'),0) cancelled FROM orders WHERE DATE(created_at) BETWEEN ? AND ? GROUP BY date ORDER BY date`;
-        const [rows] = await connection.execute(sql, [range.from, range.to]); return rows.map(row => ({ ...row, label: String(row.date).slice(0, 10) }));
+        else if (metric === "invoices") return (await getInvoiceTrend(connection,range,dateExpr)).map(row=>({...row,label:exportDate(row.date)}));
+        const [rows] = await connection.execute(sql, [range.from, range.to]); return rows.map(row => ({ ...row, label: exportDate(row.date) }));
     };
     const [revenue, cashflow, invoicesTrend, ordersTrend] = await Promise.all([queryTrend("revenue"), queryTrend("cashflow"), queryTrend("invoices"), queryTrend("orders")]);
     const [customers] = await connection.execute("SELECT CONCAT(c.first_name,' ',c.last_name) name,COALESCE(SUM(i.gross_amount),0) amount FROM customers c JOIN invoices i ON i.customer_id=c.id WHERE i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT') GROUP BY c.id,c.first_name,c.last_name ORDER BY amount DESC,c.last_name LIMIT 7", [range.from, range.to]);
     const [employees] = await connection.execute("SELECT CONCAT(e.first_name,' ',e.last_name) name,COALESCE((SELECT SUM(GREATEST(0,(TIME_TO_SEC(w.end_time)-TIME_TO_SEC(w.start_time))/3600-(w.break_minutes/60))) FROM employee_work_logs w WHERE w.employee_id=e.id AND w.work_date BETWEEN ? AND ? AND w.end_time>w.start_time),0) hours,(SELECT COUNT(*) FROM order_assignments a WHERE a.employee_id=e.id AND a.assignment_date BETWEEN ? AND ? AND a.status<>'STORNIERT') assignments FROM employees e WHERE e.status='ACTIVE' ORDER BY hours DESC,assignments DESC,e.last_name LIMIT 7", [range.from, range.to, range.from, range.to]);
     const [materials] = await connection.execute("SELECT m.name,m.unit,COALESCE(SUM(sm.quantity),0) quantity,COALESCE(SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)),0) amount FROM materials m JOIN material_stock_movements sm ON sm.material_id=m.id WHERE sm.movement_date BETWEEN ? AND ? AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION' GROUP BY m.id,m.name,m.unit ORDER BY amount DESC,m.name LIMIT 7", [range.from, range.to]);
     const [invoices] = await connection.execute("SELECT i.invoice_number,COALESCE(i.customer_name_snapshot,CONCAT(c.first_name,' ',c.last_name)) customer_name,i.invoice_date,i.gross_amount,i.status FROM invoices i JOIN customers c ON c.id=i.customer_id WHERE i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT') ORDER BY i.invoice_date DESC,i.id DESC LIMIT 12", [range.from, range.to]);
-    const [orders] = await connection.execute("SELECT o.order_number,CONCAT(c.first_name,' ',c.last_name) customer_name,COALESCE(DATE(o.planned_start),DATE(o.created_at)) service_date,o.status,o.price_gross_snapshot FROM orders o JOIN customers c ON c.id=o.customer_id WHERE DATE(o.created_at) BETWEEN ? AND ? ORDER BY o.created_at DESC,o.id DESC LIMIT 12", [range.from, range.to]);
-    return { trends: { revenue, cashflow, invoices: invoicesTrend, orders: ordersTrend }, customers, employees, materials, invoices, orders };
+    const [orders] = await connection.execute("SELECT o.order_number,CONCAT(c.first_name,' ',c.last_name) customer_name,DATE_FORMAT(o.planned_start,'%Y-%m-%d') service_date,UNIX_TIMESTAMP(o.created_at) created_epoch,o.status,o.price_gross_snapshot FROM orders o JOIN customers c ON c.id=o.customer_id WHERE UNIX_TIMESTAMP(o.created_at)>=? AND UNIX_TIMESTAMP(o.created_at)<? ORDER BY o.created_at DESC,o.id DESC LIMIT 12", reportTimestampRange(range));
+    return { trends: { revenue, cashflow, invoices: invoicesTrend, orders: ordersTrend }, customers, employees, materials, invoices, orders:orders.map(row=>({...row,service_date:row.service_date||reportBerlinDate(new Date(Number(row.created_epoch)*1000))})) };
 }
 async function createDetailedReportPdf(response, options) {
     const [report, data] = await Promise.all([getDashboardSummary(adminPool, options.range), reportPdfData(adminPool, options.range)]);
     const doc = new PDFDocument({ size: "A4", margin: 46, bufferPages: true, info: { Title: "Zoicas & Osinski Reporting", Author: "Zoicas & Osinski" } }); const chunks = []; doc.on("data", chunk => chunks.push(chunk));
     reportPdfHeader(doc, options.range); let y = 124; doc.fillColor("#173b5a").fontSize(21).text("Reporting", 46, y); y += 38;
     const f = report.finance, o = report.orders, c = report.customers, e = report.employees, m = report.materials;
-    const kpis = [["Umsatz Netto", reportPdfMoney(f.invoiced.net)], ["Umsatz Brutto", reportPdfMoney(f.invoiced.gross)], ["MwSt.", reportPdfMoney(f.invoiced.tax)], ["Einnahmen", reportPdfMoney(f.financial_income)], ["Ausgaben", reportPdfMoney(f.expenses)], ["Offene Forderungen", reportPdfMoney(f.outstanding_amount)], ["Überfällige Rechnungen", reportPdfMoney(f.overdue_amount)], ["Aufträge", o.total], ["Aktive Kunden", c.active_customers], ["Aktive Mitarbeiter", e.active_employees], ["Materialverbrauch", reportPdfMoney(m.consumption_costs)]];
+    const kpis = [["Fakturiert netto", reportPdfMoney(f.invoiced.net)], ["Fakturiert brutto", reportPdfMoney(f.invoiced.gross)], ["Erhaltene Rechnungszahlungen", reportPdfMoney(f.invoice_payments)], ["MwSt.", reportPdfMoney(f.invoiced.tax)], ["Einnahmen", reportPdfMoney(f.financial_income)], ["Ausgaben", reportPdfMoney(f.expenses)], ["Offene Forderungen", reportPdfMoney(f.outstanding_amount)], ["Überfällige Rechnungen", reportPdfMoney(f.overdue_amount)], ["Aufträge", o.total], ["Erledigte Aufträge", o.completed_orders], ["Erfasste Arbeitsstunden", Number(e.work_hours).toFixed(2)+" h"], ["Aktive Kunden", c.active_customers], ["Aktive Mitarbeiter", e.active_employees], ["Materialverbrauch", reportPdfMoney(m.consumption_costs)]];
     y = reportPdfTitle(doc, "Kennzahlen", y); kpis.forEach(([label, value]) => { y = reportPdfSpace(doc, y, 20, options.range); doc.fillColor("#173b5a").fontSize(9).text(label, 46, y + 3).fillColor("#111827").text(String(value), 358, y + 3, { width: 190, align: "right" }); doc.strokeColor("#edf2f7").moveTo(46, y + 18).lineTo(549, y + 18).stroke(); y += 20; });
     if (options.compare) { const previous = await getDashboardSummary(adminPool, buildPreviousComparisonRange(options.range)); y = reportPdfSpace(doc, y, 105, options.range); y = reportPdfTitle(doc, "Vergleich zur Vorperiode", y); [["Umsatz Brutto", f.invoiced.gross, previous.finance.invoiced.gross], ["Einnahmen", f.financial_income, previous.finance.financial_income], ["Ausgaben", f.expenses, previous.finance.expenses]].forEach(([label, current, prior]) => { doc.fillColor("#173b5a").fontSize(9).text(label, 46, y).fillColor("#111827").text(`Aktuell ${reportPdfMoney(current)} | Vorperiode ${reportPdfMoney(prior)} | Differenz ${reportPdfMoney(Number(current || 0) - Number(prior || 0))}`, 184, y, { width: 364, align: "right" }); y += 20; }); }
     y = reportPdfPage(doc, options.range); y = reportPdfChart(doc, "Umsatzentwicklung", data.trends.revenue, ["net", "gross"], ["Netto", "Brutto"], y, options.range); y = reportPdfChart(doc, "Einnahmen und Ausgaben", data.trends.cashflow, ["income", "expense"], ["Einnahmen", "Ausgaben"], y, options.range);
@@ -1136,7 +1446,7 @@ async function handleAdminPerformanceReportFilters(response, type, range, option
     if (customerId && !customerRows[0][0]) return sendJson(response, 404, { message: "Kunde nicht gefunden." });
     if (employeeId && !employeeRows[0][0]) return sendJson(response, 404, { message: "Mitarbeiter nicht gefunden." });
 
-    const orderClauses = ["DATE(o.created_at) BETWEEN ? AND ?"], orderValues = [range.from, range.to];
+    const orderClauses = ["UNIX_TIMESTAMP(o.created_at)>=? AND UNIX_TIMESTAMP(o.created_at)<?"], orderValues = reportTimestampRange(range);
     if (serviceType) { orderClauses.push("o.service_type=?"); orderValues.push(serviceType); }
     if (customerId) { orderClauses.push("o.customer_id=?"); orderValues.push(customerId); }
     if (employeeId) {
@@ -1153,7 +1463,7 @@ async function handleAdminPerformanceReportFilters(response, type, range, option
         if (serviceType) { assignmentClauses.push("o.service_type=?"); assignmentValues.push(serviceType); workLogClauses.push("o.service_type=?"); workLogValues.push(serviceType); reportClauses.push("o.service_type=?"); reportValues.push(serviceType); }
         if (customerId) { assignmentClauses.push("o.customer_id=?"); assignmentValues.push(customerId); workLogClauses.push("o.customer_id=?"); workLogValues.push(customerId); reportClauses.push("o.customer_id=?"); reportValues.push(customerId); }
         if (employeeId) { assignmentClauses.push("a.employee_id=?"); assignmentValues.push(employeeId); workLogClauses.push("w.employee_id=?"); workLogValues.push(employeeId); reportClauses.push("r.employee_id=?"); reportValues.push(employeeId); }
-        const [[orders], [planned], [actual], [reports]] = await Promise.all([
+        const [[[orders]], [[planned]], [[actual]], [[reports]]] = await Promise.all([
             adminPool.execute(`SELECT COUNT(*) total,SUM(o.status='ERLEDIGT') completed,SUM(o.status='STORNIERT') cancelled FROM orders o WHERE ${orderWhere}`, orderValues),
             adminPool.execute(`SELECT COALESCE(SUM(TIME_TO_SEC(TIMEDIFF(a.end_time,a.start_time))/3600),0) hours,COUNT(*) total,SUM(a.status='ERLEDIGT') completed FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE ${assignmentClauses.join(" AND ")}`, assignmentValues),
             adminPool.execute(`SELECT COALESCE(SUM(GREATEST(0,(TIME_TO_SEC(w.end_time)-TIME_TO_SEC(w.start_time))/3600-(w.break_minutes/60))),0) hours FROM employee_work_logs w JOIN orders o ON o.id=w.order_id WHERE ${workLogClauses.join(" AND ")}`, workLogValues),
@@ -1163,7 +1473,7 @@ async function handleAdminPerformanceReportFilters(response, type, range, option
         return sendJson(response, 200, { success:true, data:{ planned_hours:reportNumber(planned.hours), actual_hours:reportNumber(actual.hours), order_count:total, completion_rate:total ? reportNumber(orders.completed)*100/total : 0, cancellation_rate:total ? reportNumber(orders.cancelled)*100/total : 0, assignment_count:reportNumber(planned.total), assignment_completion_rate:reportNumber(planned.total) ? reportNumber(planned.completed)*100/reportNumber(planned.total) : 0, service_report_completion_rate:reportNumber(reports.total) ? reportNumber(reports.completed)*100/reportNumber(reports.total) : 0 }, meta:{period:range.period,from:range.from,to:range.to,compare:options.compare} });
     }
     if (type === "services") {
-        const clauses = ["DATE(o.created_at) BETWEEN ? AND ?"], values = [range.from, range.to];
+        const clauses = ["UNIX_TIMESTAMP(o.created_at)>=? AND UNIX_TIMESTAMP(o.created_at)<?"], values = reportTimestampRange(range);
         if (serviceType) { clauses.push("o.service_type=?"); values.push(serviceType); }
         if (customerId) { clauses.push("o.customer_id=?"); values.push(customerId); }
         const [rows] = await adminPool.execute(`SELECT o.service_type,COUNT(*) order_count,SUM(o.status='ERLEDIGT') completed_orders,SUM(o.status='STORNIERT') cancelled_orders,COALESCE(SUM(o.price_gross_snapshot),0) revenue,COALESCE(SUM((SELECT SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)) FROM material_stock_movements sm WHERE sm.order_id=o.id AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION')),0) material_cost FROM orders o WHERE ${clauses.join(" AND ")} GROUP BY o.service_type ORDER BY revenue DESC,o.service_type`, values);
@@ -1185,14 +1495,14 @@ async function handleAdminPerformanceReportFilters(response, type, range, option
         if(customerId){clauses.push("i.customer_id=?");values.push(customerId);} if(serviceType){clauses.push("o.service_type=?");values.push(serviceType);}
         const [rows]=await adminPool.execute(`SELECT i.gross_amount,i.due_date,COALESCE(SUM(p.amount),0) paid FROM invoices i LEFT JOIN orders o ON o.id=i.order_id LEFT JOIN invoice_payments p ON p.invoice_id=i.id WHERE ${clauses.join(" AND ")} GROUP BY i.id,i.gross_amount,i.due_date`,values);
         const buckets={current:0,days_1_30:0,days_31_60:0,days_61_90:0,days_90_plus:0};let overdue_invoice_count=0,overdue_invoice_amount=0,open_balance=0;
-        rows.forEach(row=>{const open=Math.max(0,reportNumber(row.gross_amount)-reportNumber(row.paid));if(!open)return;open_balance+=open;const days=Math.max(0,Math.floor((new Date(`${reportBerlinDate()}T12:00:00Z`)-new Date(`${String(row.due_date).slice(0,10)}T12:00:00Z`))/86400000));if(days===0)buckets.current+=open;else if(days<=30)buckets.days_1_30+=open;else if(days<=60)buckets.days_31_60+=open;else if(days<=90)buckets.days_61_90+=open;else buckets.days_90_plus+=open;if(days>0){overdue_invoice_count++;overdue_invoice_amount+=open;}});
+        rows.forEach(row=>{const open=Math.max(0,reportNumber(row.gross_amount)-reportNumber(row.paid));if(!open)return;open_balance+=open;const days=Math.max(0,Math.floor((new Date(`${reportBerlinDate()}T12:00:00Z`)-new Date(`${exportDate(row.due_date)}T12:00:00Z`))/86400000));if(days===0)buckets.current+=open;else if(days<=30)buckets.days_1_30+=open;else if(days<=60)buckets.days_31_60+=open;else if(days<=90)buckets.days_61_90+=open;else buckets.days_90_plus+=open;if(days>0){overdue_invoice_count++;overdue_invoice_amount+=open;}});
         return sendJson(response,200,{success:true,data:{buckets,overdue_invoice_count,overdue_invoice_amount,open_balance},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}});
     }
     if (type === "recurring") {
         const contractClauses=["c.interval_type<>'EINMALIG'","c.status='AKTIV'","c.start_date<=?","(c.end_date IS NULL OR c.end_date>=?)"], contractValues=[range.to,range.from];
         const logClauses=["al.execution_date BETWEEN ? AND ?"], logValues=[range.from,range.to];
         if(customerId){contractClauses.push("c.customer_id=?");contractValues.push(customerId);logClauses.push("c.customer_id=?");logValues.push(customerId);} if(serviceType){contractClauses.push("c.service_type=?");contractValues.push(serviceType);logClauses.push("c.service_type=?");logValues.push(serviceType);}
-        const [[contracts],[logs]]=await Promise.all([
+        const [[[contracts]],[[logs]]]=await Promise.all([
             adminPool.execute(`SELECT COUNT(*) total FROM contracts c WHERE ${contractClauses.join(" AND ")}`,contractValues),
             adminPool.execute(`SELECT COUNT(*) total,SUM(al.result='SUCCESS') successful,SUM(al.action LIKE '%DUPLICATE%') duplicates,SUM(al.result IN ('FAILED','NO_AVAILABILITY')) errors FROM automation_logs al JOIN contracts c ON c.id=al.contract_id WHERE ${logClauses.join(" AND ")}`,logValues)
         ]);
@@ -1262,17 +1572,17 @@ async function handleAdminPerformanceReports(request, response, pathname, search
     }
     try {
         if (type === "operations") {
-            const [[orders], [planned], [actual], [reports]] = await Promise.all([
-                adminPool.execute("SELECT COUNT(*) total,SUM(status='ERLEDIGT') completed,SUM(status='STORNIERT') cancelled FROM orders WHERE DATE(created_at) BETWEEN ? AND ?", [range.from, range.to]),
+            const [[[orders]], [[planned]], [[actual]], [[reports]]] = await Promise.all([
+                adminPool.execute("SELECT COUNT(*) total,SUM(status='ERLEDIGT') completed,SUM(status='STORNIERT') cancelled FROM orders WHERE UNIX_TIMESTAMP(created_at)>=? AND UNIX_TIMESTAMP(created_at)<?", reportTimestampRange(range)),
                 adminPool.execute("SELECT COALESCE(SUM(TIME_TO_SEC(TIMEDIFF(end_time,start_time))/3600),0) hours,COUNT(*) total,SUM(status='ERLEDIGT') completed FROM order_assignments WHERE assignment_date BETWEEN ? AND ? AND status<>'STORNIERT'", [range.from, range.to]),
                 adminPool.execute("SELECT COALESCE(SUM(GREATEST(0,(TIME_TO_SEC(end_time)-TIME_TO_SEC(start_time))/3600-(break_minutes/60))),0) hours FROM employee_work_logs WHERE work_date BETWEEN ? AND ? AND end_time>start_time", [range.from, range.to]),
                 adminPool.execute("SELECT COUNT(*) total,SUM(status IN ('SUBMITTED','REVIEWED','SHARED','CUSTOMER_CONFIRMED')) completed FROM service_reports WHERE service_date BETWEEN ? AND ?", [range.from, range.to])
             ]); const total = reportNumber(orders.total); return sendJson(response, 200, { success:true, data:{ planned_hours:reportNumber(planned.hours), actual_hours:reportNumber(actual.hours), order_count:total, completion_rate:total ? reportNumber(orders.completed)*100/total : 0, cancellation_rate:total ? reportNumber(orders.cancelled)*100/total : 0, assignment_count:reportNumber(planned.total), assignment_completion_rate:reportNumber(planned.total) ? reportNumber(planned.completed)*100/reportNumber(planned.total) : 0, service_report_completion_rate:reportNumber(reports.total) ? reportNumber(reports.completed)*100/reportNumber(reports.total) : 0 }, meta:{period:range.period,from:range.from,to:range.to,compare:options.compare} });
         }
-        if (type === "services") { const [rows] = await adminPool.execute("SELECT o.service_type,COUNT(*) order_count,SUM(o.status='ERLEDIGT') completed_orders,SUM(o.status='STORNIERT') cancelled_orders,COALESCE(SUM(o.price_gross_snapshot),0) revenue,COALESCE(SUM((SELECT SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)) FROM material_stock_movements sm WHERE sm.order_id=o.id AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION')),0) material_cost FROM orders o WHERE DATE(o.created_at) BETWEEN ? AND ? GROUP BY o.service_type ORDER BY revenue DESC,o.service_type", [range.from,range.to]); return sendJson(response,200,{success:true,data:{items:rows.map(row=>({...row,contribution_before_personnel_costs:reportNumber(row.revenue)-reportNumber(row.material_cost)}))},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
-        if (type === "orders") { const page=Number(searchParams.get("page")||1),pageSize=Number(searchParams.get("page_size")||25); if(!Number.isInteger(page)||page<1||!Number.isInteger(pageSize)||pageSize<1||pageSize>100)return sendJson(response,400,{message:"Ungültige Seitennavigation."}); const search=String(searchParams.get("search")||"").trim(); if(search.length>80)return sendJson(response,400,{message:"Ungültige Suche."}); const query=search?" AND (o.order_number LIKE ? OR o.title LIKE ?)":"",values=search?[`%${search}%`,`%${search}%`]:[]; const [[count],[rows]]=await Promise.all([adminPool.execute(`SELECT COUNT(*) total FROM orders o WHERE DATE(o.created_at) BETWEEN ? AND ?${query}`,[range.from,range.to,...values]),adminPool.execute(`SELECT o.order_number,o.service_type,o.status,o.price_gross_snapshot,CONCAT(c.first_name,' ',c.last_name) customer_name,COALESCE((SELECT SUM(TIME_TO_SEC(TIMEDIFF(a.end_time,a.start_time))/3600) FROM order_assignments a WHERE a.order_id=o.id AND a.status<>'STORNIERT'),0) planned_hours,COALESCE((SELECT SUM(GREATEST(0,(TIME_TO_SEC(w.end_time)-TIME_TO_SEC(w.start_time))/3600-(w.break_minutes/60))) FROM employee_work_logs w WHERE w.order_id=o.id AND w.end_time>w.start_time),0) actual_hours,COALESCE((SELECT SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)) FROM material_stock_movements sm WHERE sm.order_id=o.id AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION'),0) material_cost FROM orders o JOIN customers c ON c.id=o.customer_id WHERE DATE(o.created_at) BETWEEN ? AND ?${query} ORDER BY o.created_at DESC LIMIT ? OFFSET ?`,[range.from,range.to,...values,pageSize,(page-1)*pageSize])]); return sendJson(response,200,{success:true,data:{items:rows.map(row=>({...row,contribution_before_personnel_costs:reportNumber(row.price_gross_snapshot)-reportNumber(row.material_cost)})),page,page_size:pageSize,total:reportNumber(count.total),total_pages:Math.max(1,Math.ceil(reportNumber(count.total)/pageSize))},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
-        if (type === "receivables") { const [rows]=await adminPool.execute("SELECT i.gross_amount,i.due_date,COALESCE(SUM(p.amount),0) paid FROM invoices i LEFT JOIN invoice_payments p ON p.invoice_id=i.id WHERE i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT') GROUP BY i.id,i.gross_amount,i.due_date",[range.from,range.to]);const buckets={current:0,days_1_30:0,days_31_60:0,days_61_90:0,days_90_plus:0};let overdue_invoice_count=0,overdue_invoice_amount=0,open_balance=0;rows.forEach(row=>{const open=Math.max(0,reportNumber(row.gross_amount)-reportNumber(row.paid));if(!open)return;open_balance+=open;const days=Math.max(0,Math.floor((new Date(`${reportBerlinDate()}T12:00:00Z`)-new Date(`${String(row.due_date).slice(0,10)}T12:00:00Z`))/86400000));if(days===0)buckets.current+=open;else if(days<=30)buckets.days_1_30+=open;else if(days<=60)buckets.days_31_60+=open;else if(days<=90)buckets.days_61_90+=open;else buckets.days_90_plus+=open;if(days>0){overdue_invoice_count++;overdue_invoice_amount+=open;}});return sendJson(response,200,{success:true,data:{buckets,overdue_invoice_count,overdue_invoice_amount,open_balance},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
-        if (type === "recurring") { const [[contracts],[logs]]=await Promise.all([adminPool.execute("SELECT COUNT(*) total FROM contracts WHERE interval_type<>'EINMALIG' AND status='AKTIV' AND start_date<=? AND (end_date IS NULL OR end_date>=?)",[range.to,range.from]),adminPool.execute("SELECT COUNT(*) total,SUM(result='SUCCESS') successful,SUM(action LIKE '%DUPLICATE%') duplicates,SUM(result IN ('FAILED','NO_AVAILABILITY')) errors FROM automation_logs WHERE execution_date BETWEEN ? AND ?",[range.from,range.to])]);return sendJson(response,200,{success:true,data:{recurring_contracts:reportNumber(contracts.total),generated_orders:reportNumber(logs.total),successful_generation:reportNumber(logs.successful),duplicate_outcomes:reportNumber(logs.duplicates),error_outcomes:reportNumber(logs.errors)},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
+        if (type === "services") { const [rows] = await adminPool.execute("SELECT o.service_type,COUNT(*) order_count,SUM(o.status='ERLEDIGT') completed_orders,SUM(o.status='STORNIERT') cancelled_orders,COALESCE(SUM(o.price_gross_snapshot),0) revenue,COALESCE(SUM((SELECT SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)) FROM material_stock_movements sm WHERE sm.order_id=o.id AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION')),0) material_cost FROM orders o WHERE UNIX_TIMESTAMP(o.created_at)>=? AND UNIX_TIMESTAMP(o.created_at)<? GROUP BY o.service_type ORDER BY revenue DESC,o.service_type", reportTimestampRange(range)); return sendJson(response,200,{success:true,data:{items:rows.map(row=>({...row,contribution_before_personnel_costs:reportNumber(row.revenue)-reportNumber(row.material_cost)}))},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
+        if (type === "orders") { const page=Number(searchParams.get("page")||1),pageSize=Number(searchParams.get("page_size")||25); if(!Number.isInteger(page)||page<1||!Number.isInteger(pageSize)||pageSize<1||pageSize>100)return sendJson(response,400,{message:"Ungültige Seitennavigation."}); const search=String(searchParams.get("search")||"").trim(); if(search.length>80)return sendJson(response,400,{message:"Ungültige Suche."}); const query=search?" AND (o.order_number LIKE ? OR o.title LIKE ?)":"",values=search?[`%${search}%`,`%${search}%`]:[]; const [[count],[rows]]=await Promise.all([adminPool.execute(`SELECT COUNT(*) total FROM orders o WHERE UNIX_TIMESTAMP(o.created_at)>=? AND UNIX_TIMESTAMP(o.created_at)<?${query}`,[...reportTimestampRange(range),...values]),adminPool.execute(`SELECT o.order_number,o.service_type,o.status,o.price_gross_snapshot,CONCAT(c.first_name,' ',c.last_name) customer_name,COALESCE((SELECT SUM(TIME_TO_SEC(TIMEDIFF(a.end_time,a.start_time))/3600) FROM order_assignments a WHERE a.order_id=o.id AND a.status<>'STORNIERT'),0) planned_hours,COALESCE((SELECT SUM(GREATEST(0,(TIME_TO_SEC(w.end_time)-TIME_TO_SEC(w.start_time))/3600-(w.break_minutes/60))) FROM employee_work_logs w WHERE w.order_id=o.id AND w.end_time>w.start_time),0) actual_hours,COALESCE((SELECT SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)) FROM material_stock_movements sm WHERE sm.order_id=o.id AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION'),0) material_cost FROM orders o JOIN customers c ON c.id=o.customer_id WHERE UNIX_TIMESTAMP(o.created_at)>=? AND UNIX_TIMESTAMP(o.created_at)<?${query} ORDER BY o.created_at DESC LIMIT ? OFFSET ?`,[...reportTimestampRange(range),...values,pageSize,(page-1)*pageSize])]); return sendJson(response,200,{success:true,data:{items:rows.map(row=>({...row,contribution_before_personnel_costs:reportNumber(row.price_gross_snapshot)-reportNumber(row.material_cost)})),page,page_size:pageSize,total:reportNumber(count.total),total_pages:Math.max(1,Math.ceil(reportNumber(count.total)/pageSize))},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
+        if (type === "receivables") { const [rows]=await adminPool.execute("SELECT i.gross_amount,i.due_date,COALESCE(SUM(p.amount),0) paid FROM invoices i LEFT JOIN invoice_payments p ON p.invoice_id=i.id WHERE i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT') GROUP BY i.id,i.gross_amount,i.due_date",[range.from,range.to]);const buckets={current:0,days_1_30:0,days_31_60:0,days_61_90:0,days_90_plus:0};let overdue_invoice_count=0,overdue_invoice_amount=0,open_balance=0;rows.forEach(row=>{const open=Math.max(0,reportNumber(row.gross_amount)-reportNumber(row.paid));if(!open)return;open_balance+=open;const days=Math.max(0,Math.floor((new Date(`${reportBerlinDate()}T12:00:00Z`)-new Date(`${exportDate(row.due_date)}T12:00:00Z`))/86400000));if(days===0)buckets.current+=open;else if(days<=30)buckets.days_1_30+=open;else if(days<=60)buckets.days_31_60+=open;else if(days<=90)buckets.days_61_90+=open;else buckets.days_90_plus+=open;if(days>0){overdue_invoice_count++;overdue_invoice_amount+=open;}});return sendJson(response,200,{success:true,data:{buckets,overdue_invoice_count,overdue_invoice_amount,open_balance},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
+        if (type === "recurring") { const [[[contracts]],[[logs]]]=await Promise.all([adminPool.execute("SELECT COUNT(*) total FROM contracts WHERE interval_type<>'EINMALIG' AND status='AKTIV' AND start_date<=? AND (end_date IS NULL OR end_date>=?)",[range.to,range.from]),adminPool.execute("SELECT SUM(action='GENERATE_ORDER' AND result IN ('SUCCESS','NO_AVAILABILITY')) total,SUM(action='GENERATE_ORDER' AND result='SUCCESS') successful,SUM(action='GENERATE_ORDER' AND result='SKIPPED' AND generated_order_id IS NOT NULL) duplicates,SUM(result IN ('FAILED','NO_AVAILABILITY')) errors FROM automation_logs WHERE execution_date BETWEEN ? AND ?",[range.from,range.to])]);return sendJson(response,200,{success:true,data:{recurring_contracts:reportNumber(contracts.total),generated_orders:reportNumber(logs.total),successful_generation:reportNumber(logs.successful),duplicate_outcomes:reportNumber(logs.duplicates),error_outcomes:reportNumber(logs.errors)},meta:{period:range.period,from:range.from,to:range.to,compare:options.compare}}); }
         return sendJson(response,404,{message:"Leistungsanalyse nicht gefunden."});
     } catch(error){console.error("[performance-report] failed:",error.code||"database_error");return sendJson(response,503,{message:"Leistungsanalyse konnte nicht geladen werden."});}
 }
@@ -1295,8 +1605,8 @@ async function handleAdminReports(request, response, pathname, searchParams) {
 async function handleAdminReportVisuals(request,response,pathname,searchParams){
     if(!adminPool)return sendJson(response,503,{message:"Reporting ist nicht verfügbar."}); if(request.method!=="GET")return sendJson(response,405,{message:"Methode nicht erlaubt."});
     const options=normalizeReportRequest(searchParams);if(options.error)return sendJson(response,400,{message:options.error});const range=options.range,span=reportDaySpan(range.from,range.to),groupBy=range.period==="year"||span>62?"month":"day",dateExpr=groupBy==="month"?"DATE_FORMAT(%DATE%,'%Y-%m-01')":"DATE(%DATE%)";
-    if(pathname.endsWith("/trends")){const metric=String(searchParams.get("metric")||"");if(!["revenue","cashflow","invoices","orders"].includes(metric))return sendJson(response,400,{message:"Ungültige Kennzahl."});let sql,values=[range.from,range.to];if(metric==="revenue")sql=`SELECT ${dateExpr.replaceAll("%DATE%","invoice_date")} date,COALESCE(SUM(net_amount),0) net,COALESCE(SUM(tax_amount),0) tax,COALESCE(SUM(gross_amount),0) gross FROM invoices WHERE invoice_date BETWEEN ? AND ? AND status NOT IN ('ENTWURF','STORNIERT') GROUP BY date ORDER BY date`;else if(metric==="cashflow")sql=`SELECT ${dateExpr.replaceAll("%DATE%","transaction_date")} date,COALESCE(SUM(CASE WHEN transaction_type='INCOME' THEN amount ELSE 0 END),0) income,COALESCE(SUM(CASE WHEN transaction_type='EXPENSE' THEN amount ELSE 0 END),0) expense FROM financial_transactions WHERE transaction_date BETWEEN ? AND ? AND status<>'STORNIERT' GROUP BY date ORDER BY date`;else if(metric==="invoices")sql=`SELECT ${dateExpr.replaceAll("%DATE%","invoice_date")} date,COUNT(*) issued,COALESCE(SUM(status='BEZAHLT'),0) paid,COALESCE(SUM(status='TEILBEZAHLT'),0) partial,COALESCE(SUM(status='ÜBERFÄLLIG'),0) overdue FROM invoices WHERE invoice_date BETWEEN ? AND ? AND status<>'ENTWURF' GROUP BY date ORDER BY date`;else sql=`SELECT ${dateExpr.replaceAll("%DATE%","created_at")} date,COUNT(*) new_orders,COALESCE(SUM(status='ERLEDIGT'),0) completed,COALESCE(SUM(status='STORNIERT'),0) cancelled FROM orders WHERE DATE(created_at) BETWEEN ? AND ? GROUP BY date ORDER BY date`;try{const[rows]=await adminPool.execute(sql,values);return sendJson(response,200,{success:true,data:{series:rows.map(row=>({...row,date:String(row.date).slice(0,10),label:String(row.date).slice(0,10)}))},meta:{period:range.period,from:range.from,to:range.to,groupBy}})}catch(e){return sendJson(response,503,{message:"Trend konnte nicht geladen werden."})}}
-    const type=String(searchParams.get("type")||""),rawLimit=searchParams.get("limit")||"10",limit=Number(rawLimit);if(!["customers","employees","materials"].includes(type)||!Number.isInteger(limit)||limit<1||limit>20)return sendJson(response,400,{message:"Ungültiger Ranking-Filter."});let sql;if(type==="customers")sql="SELECT c.id,c.customer_number,CONCAT(c.first_name,' ',c.last_name) label,COALESCE(SUM(i.gross_amount),0) revenue_gross,COUNT(DISTINCT o.id) order_count FROM customers c LEFT JOIN invoices i ON i.customer_id=c.id AND i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT') LEFT JOIN orders o ON o.customer_id=c.id AND DATE(o.created_at) BETWEEN ? AND ? GROUP BY c.id,c.customer_number,c.first_name,c.last_name ORDER BY revenue_gross DESC LIMIT ?";else if(type==="employees")sql="SELECT e.id,e.employee_number,CONCAT(e.first_name,' ',e.last_name) label,COALESCE(SUM(GREATEST(0,(TIME_TO_SEC(w.end_time)-TIME_TO_SEC(w.start_time))/3600-(w.break_minutes/60))),0) work_hours,COUNT(DISTINCT a.id) assignments,COUNT(DISTINCT r.id) service_reports FROM employees e LEFT JOIN employee_work_logs w ON w.employee_id=e.id AND w.work_date BETWEEN ? AND ? AND w.end_time>w.start_time LEFT JOIN order_assignments a ON a.employee_id=e.id AND a.assignment_date BETWEEN ? AND ? AND a.status<>'STORNIERT' LEFT JOIN service_reports r ON r.employee_id=e.id AND r.service_date BETWEEN ? AND ? GROUP BY e.id,e.employee_number,e.first_name,e.last_name ORDER BY work_hours DESC LIMIT ?";else sql="SELECT m.id,m.material_number,m.name label,COALESCE(SUM(sm.quantity),0) consumed_quantity,COALESCE(SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)),0) consumption_cost FROM materials m JOIN material_stock_movements sm ON sm.material_id=m.id AND sm.movement_date BETWEEN ? AND ? AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION' GROUP BY m.id,m.material_number,m.name ORDER BY consumption_cost DESC LIMIT ?";const values=type==="customers"?[range.from,range.to,range.from,range.to,limit]:type==="employees"?[range.from,range.to,range.from,range.to,range.from,range.to,limit]:[range.from,range.to,limit];try{const[rows]=await adminPool.execute(sql,values);return sendJson(response,200,{success:true,data:{items:rows},meta:{type,from:range.from,to:range.to,limit}})}catch(e){return sendJson(response,503,{message:"Ranking konnte nicht geladen werden."})}
+    if(pathname.endsWith("/trends")){const metric=String(searchParams.get("metric")||"");if(!["revenue","cashflow","invoices","orders"].includes(metric))return sendJson(response,400,{message:"Ungültige Kennzahl."});let sql,values=[range.from,range.to];if(metric==="revenue")sql=`SELECT ${dateExpr.replaceAll("%DATE%","invoice_date")} date,COALESCE(SUM(net_amount),0) net,COALESCE(SUM(tax_amount),0) tax,COALESCE(SUM(gross_amount),0) gross FROM invoices WHERE invoice_date BETWEEN ? AND ? AND status NOT IN ('ENTWURF','STORNIERT') GROUP BY date ORDER BY date`;else if(metric==="cashflow")sql=`SELECT ${dateExpr.replaceAll("%DATE%","transaction_date")} date,COALESCE(SUM(CASE WHEN transaction_type='INCOME' THEN amount ELSE 0 END),0) income,COALESCE(SUM(CASE WHEN transaction_type='EXPENSE' THEN amount ELSE 0 END),0) expense FROM financial_transactions WHERE transaction_date BETWEEN ? AND ? AND status<>'STORNIERT' GROUP BY date ORDER BY date`;try{const rows=metric==="orders"?await getOrderTrend(adminPool,range,groupBy==="month"):metric==="invoices"?await getInvoiceTrend(adminPool,range,dateExpr):(await adminPool.execute(sql,values))[0];return sendJson(response,200,{success:true,data:{series:rows.map(row=>({...row,date:exportDate(row.date),label:exportDate(row.date)}))},meta:{period:range.period,from:range.from,to:range.to,groupBy}})}catch(e){return sendJson(response,503,{message:"Trend konnte nicht geladen werden."})}}
+    const type=String(searchParams.get("type")||""),rawLimit=searchParams.get("limit")||"10",limit=Number(rawLimit);if(!["customers","employees","materials"].includes(type)||!Number.isInteger(limit)||limit<1||limit>20)return sendJson(response,400,{message:"Ungültiger Ranking-Filter."});let sql;if(type==="customers")sql="SELECT c.id,c.customer_number,CONCAT(c.first_name,' ',c.last_name) label,COALESCE((SELECT SUM(i.gross_amount) FROM invoices i WHERE i.customer_id=c.id AND i.invoice_date BETWEEN ? AND ? AND i.status NOT IN ('ENTWURF','STORNIERT')),0) revenue_gross,(SELECT COUNT(*) FROM orders o WHERE o.customer_id=c.id AND UNIX_TIMESTAMP(o.created_at)>=? AND UNIX_TIMESTAMP(o.created_at)<?) order_count FROM customers c ORDER BY revenue_gross DESC,c.id LIMIT ?";else if(type==="employees")sql="SELECT e.id,e.employee_number,CONCAT(e.first_name,' ',e.last_name) label,COALESCE((SELECT SUM(GREATEST(0,(TIME_TO_SEC(w.end_time)-TIME_TO_SEC(w.start_time))/3600-(w.break_minutes/60))) FROM employee_work_logs w WHERE w.employee_id=e.id AND w.work_date BETWEEN ? AND ? AND w.end_time>w.start_time),0) work_hours,(SELECT COUNT(*) FROM order_assignments a WHERE a.employee_id=e.id AND a.assignment_date BETWEEN ? AND ? AND a.status<>'STORNIERT') assignments,(SELECT COUNT(*) FROM service_reports r WHERE r.employee_id=e.id AND r.service_date BETWEEN ? AND ?) service_reports FROM employees e ORDER BY work_hours DESC,e.id LIMIT ?";else sql="SELECT m.id,m.material_number,m.name label,COALESCE(SUM(sm.quantity),0) consumed_quantity,COALESCE(SUM(sm.quantity*COALESCE(sm.unit_cost_snapshot,0)),0) consumption_cost FROM materials m JOIN material_stock_movements sm ON sm.material_id=m.id AND sm.movement_date BETWEEN ? AND ? AND sm.status='APPROVED' AND sm.movement_type='CONSUMPTION' GROUP BY m.id,m.material_number,m.name ORDER BY consumption_cost DESC LIMIT ?";const values=type==="customers"?[range.from,range.to,...reportTimestampRange(range),limit]:type==="employees"?[range.from,range.to,range.from,range.to,range.from,range.to,limit]:[range.from,range.to,limit];try{const[rows]=await adminPool.execute(sql,values);return sendJson(response,200,{success:true,data:{items:rows},meta:{type,from:range.from,to:range.to,limit}})}catch(e){return sendJson(response,503,{message:"Ranking konnte nicht geladen werden."})}
 }
 function employeeRecord(row) {
     if (!row) return null;
@@ -1315,7 +1625,7 @@ async function handleAdminEmployees(request, response, pathname, searchParams) {
         try {
             const [rows] = await adminPool.execute("SELECT id,first_name,last_name,email FROM employees WHERE id=?", [id]);
             if (!rows[0]) return sendJson(response, 404, { message: "Mitarbeiter nicht gefunden." });
-            await adminPool.execute("UPDATE employees SET status='INACTIVE' WHERE id=?", [id]);
+            await changePortalStatus("employee",id,"INACTIVE");
             const invite = await createEmployeeInvitation(id, "admin", rows[0]);
             return sendJson(response, 201, { message: invite.delivered ? "Ein neuer Einladungslink wurde per E-Mail gesendet." : "Einladung erstellt, aber SMTP ist noch nicht eingerichtet.", emailSent: invite.delivered, expiresAt: invite.expiresAt });
         } catch (error) { console.error("[admin] employee invitation failed:", error.code || "invite_error"); return sendJson(response, 503, { message: "Einladung konnte nicht erstellt werden." }); }
@@ -1347,7 +1657,7 @@ async function handleAdminEmployees(request, response, pathname, searchParams) {
         let body; try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "Ungültige Daten." }); }
         if (id && action === "status") {
             const status = readText(body.status, 16); if (!employeeStatuses.has(status)) return sendJson(response, 400, { message: "Ungültiger Status." });
-            const [result] = await adminPool.execute("UPDATE employees SET status=? WHERE id=?", [status, id]); return result.affectedRows ? sendJson(response, 200, { id, status }) : sendJson(response, 404, { message: "Mitarbeiter nicht gefunden." });
+            return await changePortalStatus("employee",id,status) ? sendJson(response, 200, { id, status }) : sendJson(response, 404, { message: "Mitarbeiter nicht gefunden." });
         }
         if (id && action === "role") {
             const role = readText(body.role, 16); if (!employeeRoles.has(role)) return sendJson(response, 400, { message: "Ungültige Rolle." });
@@ -1379,7 +1689,17 @@ async function handleAdminEmployees(request, response, pathname, searchParams) {
                 return sendJson(response, 201, { id: createdEmployee.insertId, employeeNumber: generatedEmployeeNumber, message: invite.delivered ? "Mitarbeiter angelegt und Einladung per E-Mail gesendet." : "Mitarbeiter angelegt. SMTP ist noch nicht eingerichtet; die Einladung wurde nicht versendet.", emailSent: invite.delivered, expiresAt: invite.expiresAt });
             }
             // Employee numbers are system-assigned at creation and deliberately remain immutable.
-            const [result] = await adminPool.execute("UPDATE employees SET first_name=?,last_name=?,email=?,phone=?,role=?,status=?,position=?,hire_date=?,notes=? WHERE id=?", [firstName,lastName,email,phone,role,status,position || null,hireDate || null,notes || null,id]);
+            const connection=await adminPool.getConnection(); let result;
+            try {
+                await connection.beginTransaction();
+                const [[previous]]=await connection.execute("SELECT status,session_version FROM employees WHERE id=? FOR UPDATE",[id]);
+                const changed=Boolean(previous&&previous.status!==status);
+                [result]=await connection.execute("UPDATE employees SET first_name=?,last_name=?,email=?,phone=?,role=?,status=?,position=?,hire_date=?,notes=?,session_version=session_version+? WHERE id=?",[firstName,lastName,email,phone,role,status,position||null,hireDate||null,notes||null,Number(changed),id]);
+                if(changed&&status!=="ACTIVE")await connection.execute("UPDATE employee_invitations SET revoked_at=NOW() WHERE employee_id=? AND accepted_at IS NULL AND revoked_at IS NULL",[id]);
+                if(changed)await auditEvent(connection,"ADMIN",null,"ACCOUNT_STATUS_CHANGED","EMPLOYEE",id,{previous:previous.status,status});
+                await connection.commit();
+                if(changed)revokePortalSessions("employee",id,previous.session_version);
+            } finally {try{await connection.rollback();}finally{connection.release();}}
             return result.affectedRows ? sendJson(response, 200, { id, message: "Mitarbeiter gespeichert." }) : sendJson(response, 404, { message: "Mitarbeiter nicht gefunden." });
         } catch (error) { if (error.code === "ER_DUP_ENTRY") return sendJson(response, 409, { message: "E-Mail oder Mitarbeiternummer ist bereits vergeben." }); console.error("[admin] employee save failed:", error.code || "database_error"); return sendJson(response, 503, { message: "Mitarbeiter konnte nicht gespeichert werden." }); }
     }
@@ -1525,13 +1845,24 @@ function recurringSchedulePayload(body) {
     const contractId = Number(body?.contract_id), startDate = readText(body?.start_date, 10), endDate = readText(body?.end_date, 10, { optional: true });
     const recurrenceType = readText(body?.recurrence_type, 32), startTime = readText(body?.preferred_start_time, 5);
     const durationMinutes = Number(body?.duration_minutes), employeeId = body?.preferred_employee_id === "" || body?.preferred_employee_id == null ? null : Number(body.preferred_employee_id);
-    const active = body?.active === false || body?.active === "0" ? 0 : 1;
-    const weekdays = parseScheduleWeekdays(body?.weekdays, recurrenceType, startDate).join(",");
-    if (!Number.isSafeInteger(contractId) || contractId < 1 || !isIsoDate(startDate) || (endDate && !isIsoDate(endDate)) || (endDate && startDate > endDate) || !contractIntervals.has(recurrenceType) || !isClockTime(startTime) || !Number.isInteger(durationMinutes) || durationMinutes < 15 || durationMinutes > 1440 || !endTimeForDuration(startTime, durationMinutes) || (employeeId !== null && (!Number.isSafeInteger(employeeId) || employeeId < 1))) return null;
+    const active = body?.active === false || body?.active === "0" || body?.active === 0 ? 0 : 1;
+    const rawWeekdays = readText(Array.isArray(body?.weekdays)?body.weekdays.join(","):body?.weekdays,32,{optional:true});
+    if (rawWeekdays===null || (rawWeekdays && !/^[1-7](?:,\s*[1-7])*$/.test(rawWeekdays))) return null;
+    const weekdays = parseScheduleWeekdays(rawWeekdays, recurrenceType, startDate).join(",");
+    const calculatedEnd = endTimeForDuration(startTime,durationMinutes);
+    if (!Number.isSafeInteger(contractId) || contractId < 1 || !reportIsIsoDate(startDate) || (endDate && !reportIsIsoDate(endDate)) || (endDate && startDate > endDate) || !contractIntervals.has(recurrenceType) || !isClockTime(startTime) || !Number.isInteger(durationMinutes) || durationMinutes < 15 || durationMinutes > 1440 || (!calculatedEnd || calculatedEnd==="24:00") || (employeeId !== null && (!Number.isSafeInteger(employeeId) || employeeId < 1))) return null;
     if (["WOECHENTLICH", "ZWEIMAL_WOECHENTLICH", "MEHRMALS_WOECHENTLICH", "INDIVIDUELL"].includes(recurrenceType) && !weekdays) return null;
     if (recurrenceType === "ZWEIMAL_WOECHENTLICH" && weekdays.split(",").filter(Boolean).length !== 2) return null;
     if (recurrenceType === "MEHRMALS_WOECHENTLICH" && weekdays.split(",").filter(Boolean).length < 2) return null;
-    return { contractId, startDate, endDate: endDate || null, recurrenceType, weekdays: weekdays || null, startTime, durationMinutes, employeeId, active };
+    const endTime = body?.planned_end_time;
+    if (endTime !== undefined && (!isClockTime(endTime) || endTime!==calculatedEnd)) return null;
+    const location = ["service_address","service_postal_code","service_city"].map((key,index)=>readText(body?.[key],[180,16,120][index],{optional:true}));
+    if (location.includes(null) || (location.some(Boolean) && !location.every(Boolean))) return null;
+    const crewSize = Number(body.required_crew_size ?? 1);
+    const rawPreferred = body.preferred_employee_ids ?? (employeeId ? [employeeId] : []);
+    if (!Number.isInteger(crewSize) || crewSize<1 || crewSize>20 || !Array.isArray(rawPreferred) || rawPreferred.length>20 || rawPreferred.some(id=>!positiveId(id))) return null;
+    const preferred = [...new Set(rawPreferred.map(Number))];
+    return { contractId, startDate, endDate: endDate || null, recurrenceType, weekdays: weekdays || null, startTime, durationMinutes, employeeId:preferred[0]||null, active, location,crewSize,preferred, hasLocation:["service_address","service_postal_code","service_city"].some(key=>body[key]!==undefined) };
 }
 
 async function logAutomation(connection, { contractId, scheduleId, date, action, result, orderId = null, errorMessage = null }) {
@@ -1548,49 +1879,198 @@ async function createRecurringOrderNumber(connection) {
     throw new Error("order_number_generation_failed");
 }
 
-async function generateRecurringOrders({ days = 7, contractId = null } = {}) {
+async function selectRecurringCrew(connection,date,startTime,endTime,crewSize,preferred) {
+    const availability = await availabilityForSlot(connection,date,startTime,endTime);
+    const candidates = availability.filter(row=>row.available && !(crewSize===1 && preferred.length && !preferred.includes(row.id)));
+    if (!candidates.length) return [];
+    const priority = id => preferred.includes(id) ? preferred.indexOf(id) : Infinity;
+    candidates.sort((a,b)=>priority(a.id)-priority(b.id));
+    const ids = candidates.map(row=>row.id);
+    const [active] = await connection.execute(`SELECT id FROM employees WHERE status='ACTIVE' AND id IN (${ids.map(()=>"?").join(",")}) ORDER BY id FOR UPDATE`,ids);
+    const stillActive = new Set(active.map(row=>row.id));
+    const refreshed = await availabilityForSlot(connection,date,startTime,endTime);
+    const available = new Set(refreshed.filter(row=>row.available).map(row=>row.id));
+    return ids.filter(id=>stillActive.has(id) && available.has(id)).slice(0,crewSize).map(id=>({id}));
+}
+
+async function generateRecurringOrders(connection, { days = 7, contractId = null } = {}) {
     const windowDays = Math.min(Math.max(Number(days) || 7, 1), 30);
-    const today = new Date().toISOString().slice(0, 10), until = addDays(today, windowDays - 1);
-    const summary = { checkedContracts: 0, created: 0, existing: 0, noAvailability: 0, failed: 0, windowDays, from: today, to: until };
-    const filters = ["s.active=1", "c.status='AKTIV'", "c.start_date<=?", "(c.end_date IS NULL OR c.end_date>=?)"], values = [until, today];
+    const today = reportBerlinDate(), until = addDays(today, windowDays - 1);
+    const summary = { checkedContracts: 0, created: 0, existing: 0, noAvailability: 0, understaffed:0, failed: 0, windowDays, from: today, to: until };
+    const filters = ["s.active=1", "(c.status='AKTIV' OR (c.status='GEKUENDIGT' AND c.termination_date IS NOT NULL))", "c.start_date<=?", "(c.end_date IS NULL OR c.end_date>=?)", "(c.termination_date IS NULL OR c.termination_date>=?)"], values = [until, today, today];
     if (contractId !== null) { filters.push("s.contract_id=?"); values.push(contractId); }
-    const [schedules] = await adminPool.execute(`SELECT s.*,c.customer_id,c.quote_id,c.contract_number,c.service_description,c.service_type,c.net_amount,c.tax_rate,c.tax_amount,c.gross_amount,c.start_date AS contract_start_date,c.end_date AS contract_end_date,cu.address AS customer_address,cu.postal_code AS customer_postal_code,cu.city AS customer_city,q.object_address,q.postal_code AS quote_postal_code,q.city AS quote_city FROM recurring_schedules s JOIN contracts c ON c.id=s.contract_id JOIN customers cu ON cu.id=c.customer_id LEFT JOIN quotes q ON q.id=c.quote_id WHERE ${filters.join(" AND ")} ORDER BY s.next_run_date IS NULL,s.next_run_date,s.id`, values);
+    const [schedules] = await connection.execute(`SELECT s.*,c.customer_id,c.quote_id,c.contract_number,c.service_description,c.service_type,c.net_amount,c.tax_rate,c.tax_amount,c.gross_amount,DATE_FORMAT(c.start_date,'%Y-%m-%d') AS contract_start_date,DATE_FORMAT(CASE WHEN c.end_date IS NULL THEN c.termination_date WHEN c.termination_date IS NULL THEN c.end_date ELSE LEAST(c.end_date,c.termination_date) END,'%Y-%m-%d') AS contract_end_date,cu.address AS customer_address,cu.postal_code AS customer_postal_code,cu.city AS customer_city,q.object_address,q.postal_code AS quote_postal_code,q.city AS quote_city FROM recurring_schedules s JOIN contracts c ON c.id=s.contract_id JOIN customers cu ON cu.id=c.customer_id LEFT JOIN quotes q ON q.id=c.quote_id WHERE ${filters.join(" AND ")} ORDER BY s.next_run_date IS NULL,s.next_run_date,s.id`, values);
     summary.checkedContracts = schedules.length;
-    for (const schedule of schedules) {
-        const dates = scheduleDates(schedule, today, until);
-        const connection = await adminPool.getConnection();
+    for (const candidate of schedules) {
+        let createdCount=0, existingCount=0, unstaffedCount=0, understaffedCount=0;
         try {
+            await connection.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
             await connection.beginTransaction();
-            const createdBefore = summary.created;
+            const [[locked]] = await connection.execute("SELECT s.id FROM recurring_schedules s JOIN contracts c ON c.id=s.contract_id WHERE s.id=? AND s.active=1 AND (c.status='AKTIV' OR (c.status='GEKUENDIGT' AND c.termination_date IS NOT NULL)) FOR UPDATE",[candidate.id]);
+            if (!locked) { await connection.rollback(); continue; }
+            const [[schedule]] = await connection.execute("SELECT s.*,c.customer_id,c.quote_id,c.contract_number,c.service_description,c.service_type,c.net_amount,c.tax_amount,c.gross_amount,DATE_FORMAT(c.start_date,'%Y-%m-%d') AS contract_start_date,DATE_FORMAT(CASE WHEN c.end_date IS NULL THEN c.termination_date WHEN c.termination_date IS NULL THEN c.end_date ELSE LEAST(c.end_date,c.termination_date) END,'%Y-%m-%d') AS contract_end_date,cu.address AS customer_address,cu.postal_code AS customer_postal_code,cu.city AS customer_city,q.object_address,q.postal_code AS quote_postal_code,q.city AS quote_city FROM recurring_schedules s JOIN contracts c ON c.id=s.contract_id JOIN customers cu ON cu.id=c.customer_id LEFT JOIN quotes q ON q.id=c.quote_id WHERE s.id=?",[candidate.id]);
+            if (contractId !== null && schedule.contract_id !== contractId) { await connection.rollback(); continue; }
+            const first=isoDate(dateOnly(schedule.contract_start_date));
+            const last=schedule.contract_end_date ? isoDate(dateOnly(schedule.contract_end_date)) : null;
+            const dates=scheduleDates(schedule, first>today?first:today, last&&last<until?last:until);
             for (const date of dates) {
                 const endTime = endTimeForDuration(String(schedule.preferred_start_time).slice(0, 5), schedule.duration_minutes);
+                if (!endTime || endTime === "24:00") throw Object.assign(new Error("invalid recurring slot"),{code:"INVALID_SLOT"});
                 const plannedStart = `${date} ${String(schedule.preferred_start_time).slice(0, 5)}:00`, plannedEnd = `${date} ${endTime}:00`;
-                const [existing] = await connection.execute("SELECT id FROM orders WHERE contract_id=? AND planned_start=? FOR UPDATE", [schedule.contract_id, plannedStart]);
-                if (existing[0]) { summary.existing += 1; await logAutomation(connection, { contractId: schedule.contract_id, scheduleId: schedule.id, date, action: "GENERATE_ORDER", result: "SKIPPED", orderId: existing[0].id, errorMessage: "Auftrag bereits vorhanden" }); continue; }
-                const availability = await availabilityForSlot(connection, date, String(schedule.preferred_start_time).slice(0, 5), endTime);
-                let employee = schedule.preferred_employee_id ? availability.find(row => row.id === Number(schedule.preferred_employee_id) && row.available) : availability.find(row => row.available);
+                const [existing] = await connection.execute("SELECT id FROM orders WHERE (automation_schedule_id=? AND planned_start>=? AND planned_start<DATE_ADD(?,INTERVAL 1 DAY)) OR (contract_id=? AND planned_start=?) LIMIT 1", [schedule.id,date,date,schedule.contract_id,plannedStart]);
+                if (existing[0]) { existingCount += 1; await logAutomation(connection, { contractId: schedule.contract_id, scheduleId: schedule.id, date, action: "GENERATE_ORDER", result: "SKIPPED", orderId: existing[0].id, errorMessage: "Auftrag bereits vorhanden" }); continue; }
+                const startTime = String(schedule.preferred_start_time).slice(0,5);
+                const crewSize = Number(schedule.required_crew_size);
+                const preferred = Array.isArray(schedule.preferred_employee_ids) ? schedule.preferred_employee_ids.map(Number)
+                    : schedule.preferred_employee_id ? [Number(schedule.preferred_employee_id)] : [];
+                const employees = await selectRecurringCrew(connection,date,startTime,endTime,crewSize,preferred);
+                const fullyStaffed = employees.length===crewSize;
                 const orderNumber = await createRecurringOrderNumber(connection);
-                const address = schedule.object_address || schedule.customer_address || null, postalCode = schedule.quote_postal_code || schedule.customer_postal_code || null, city = schedule.quote_city || schedule.customer_city || null;
-                const [created] = await connection.execute("INSERT INTO orders (order_number,customer_id,contract_id,automation_schedule_id,service_type,title,description,address,postal_code,city,preferred_date,planned_start,planned_end,is_automated,status,priority,estimated_duration_minutes,notes,price_net_snapshot,price_tax_snapshot,price_gross_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'NORMAL',?,?,?,?,?)", [orderNumber,schedule.customer_id,schedule.contract_id,schedule.id,schedule.service_type,`${schedule.service_type} – ${schedule.contract_number}`,schedule.service_description,address,postalCode,city,date,plannedStart,plannedEnd,1,employee ? "ZUGEWIESEN" : "GEPLANT",schedule.duration_minutes,"Automatisch aus Vertrag erzeugt.",schedule.net_amount,schedule.tax_amount,schedule.gross_amount]);
-                if (employee) await connection.execute("INSERT INTO order_assignments (order_id,employee_id,assignment_date,start_time,end_time,status,notes) VALUES (?,?,?,?,?,'GEPLANT',?)", [created.insertId, employee.id, date, String(schedule.preferred_start_time).slice(0, 5), endTime, "Automatisch vorgeschlagen/zugeordnet."]);
-                summary.created += 1;
-                if (!employee) summary.noAvailability += 1;
-                await logAutomation(connection, { contractId: schedule.contract_id, scheduleId: schedule.id, date, action: "GENERATE_ORDER", result: employee ? "SUCCESS" : "NO_AVAILABILITY", orderId: created.insertId, errorMessage: employee ? null : "Kein verfügbarer Mitarbeiter" });
+                const address = schedule.service_address || schedule.object_address || schedule.customer_address || null, postalCode = schedule.service_postal_code || schedule.quote_postal_code || schedule.customer_postal_code || null, city = schedule.service_city || schedule.quote_city || schedule.customer_city || null;
+                const [created] = await connection.execute("INSERT INTO orders (order_number,customer_id,contract_id,automation_schedule_id,service_type,title,description,address,postal_code,city,preferred_date,planned_start,planned_end,is_automated,status,priority,estimated_duration_minutes,notes,price_net_snapshot,price_tax_snapshot,price_gross_snapshot,required_crew_size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'NORMAL',?,?,?,?,?,?)", [orderNumber,schedule.customer_id,schedule.contract_id,schedule.id,schedule.service_type,`${schedule.service_type} – ${schedule.contract_number}`,schedule.service_description,address,postalCode,city,date,plannedStart,plannedEnd,1,fullyStaffed ? "ZUGEWIESEN" : "GEPLANT",schedule.duration_minutes,"Automatisch aus Vertrag erzeugt.",schedule.net_amount,schedule.tax_amount,schedule.gross_amount,crewSize]);
+                for (const employee of employees) await connection.execute("INSERT INTO order_assignments (order_id,employee_id,assignment_date,start_time,end_time,status,notes) VALUES (?,?,?,?,?,'GEPLANT',?)", [created.insertId, employee.id, date, String(schedule.preferred_start_time).slice(0, 5), endTime, "Automatisch vorgeschlagen/zugeordnet."]);
+                createdCount += 1;
+                if (employees.length===0) unstaffedCount += 1;
+                else if (!fullyStaffed) understaffedCount += 1;
+                await logAutomation(connection, {contractId:schedule.contract_id,scheduleId:schedule.id,date,action:"GENERATE_ORDER",
+                    result:fullyStaffed?"SUCCESS":"NO_AVAILABILITY",orderId:created.insertId,errorMessage:fullyStaffed?null:employees.length+"/"+crewSize+" Einsatzkräfte"});
             }
-            const future = scheduleDates(schedule, addDays(until, 1), schedule.end_date || addDays(until, 366))[0] || null;
+            const nextFrom=addDays(until,1);
+            const future = scheduleDates(schedule, first>nextFrom?first:nextFrom, last || schedule.end_date || addDays(first>until?first:until,366))[0] || null;
             await connection.execute("UPDATE recurring_schedules SET next_run_date=?,last_generated_at=NOW() WHERE id=?", [future, schedule.id]);
-            if (summary.created > createdBefore) await auditEvent(connection,"SYSTEM",null,"RECURRING_ORDER_GENERATED","RECURRING_SCHEDULE",schedule.id,{created:summary.created-createdBefore,contract_id:schedule.contract_id});
+            if (createdCount) await auditEvent(connection,"SYSTEM",null,"RECURRING_ORDER_GENERATED","RECURRING_SCHEDULE",schedule.id,{created:createdCount,contract_id:schedule.contract_id});
+            await logAutomation(connection,{contractId:schedule.contract_id,scheduleId:schedule.id,date:today,action:"SCHEDULE_GENERATION",result:"SUCCESS"});
             await connection.commit();
+            summary.created += createdCount;
+            summary.existing += existingCount;
+            summary.noAvailability += unstaffedCount;
+            summary.understaffed += understaffedCount;
         } catch (error) {
             await connection.rollback(); summary.failed += 1;
-            try { await logAutomation(connection, { contractId: schedule.contract_id, scheduleId: schedule.id, date: today, action: "GENERATE_ORDER", result: "FAILED", errorMessage: error.code || "generation_error" }); } catch {}
-        } finally { connection.release(); }
+            try { await logAutomation(connection, { contractId: candidate.contract_id, scheduleId: candidate.id, date: today, action: "SCHEDULE_GENERATION", result: "FAILED", errorMessage: error.code || "generation_error" }); } catch {}
+        }
     }
     return summary;
 }
 
+
+const recurringTestAutomationAllowed = ENV_FILE === ".env.test" && process.env.MYSQL_DATABASE === "zoicas_osinski_test" && PORT === 3001 && !IS_PRODUCTION;
+const recurringAutomationIntervalMs = Math.max(1000, Math.min(3600000, Number(process.env.RECURRING_AUTOMATION_INTERVAL_MS) || 900000));
+const recurringAutomationSettings = { enabled: false, days: 7 };
+let recurringAutomationTimer;
+
+async function recurringSchedulingExceptions(connection, until) {
+    const [orders] = await connection.execute(`
+        SELECT o.id,o.order_number,o.title,DATE_FORMAT(o.planned_start,'%Y-%m-%d %H:%i') AS planned_start,
+            a.id AS assignment_id,a.employee_id,a.status AS assignment_status,o.required_crew_size,
+            (SELECT COUNT(DISTINCT a.employee_id) FROM order_assignments a WHERE a.order_id=o.id AND a.status<>'STORNIERT' AND ${crewAssignmentCoversOccurrence}
+                AND NOT EXISTS(SELECT 1 FROM employee_absences aa WHERE aa.employee_id=a.employee_id AND a.assignment_date BETWEEN aa.start_date AND aa.end_date)) AS assigned_crew,
+            EXISTS(SELECT 1 FROM employee_absences ea WHERE ea.employee_id=a.employee_id AND a.assignment_date BETWEEN ea.start_date AND ea.end_date) AS absence,
+            EXISTS(SELECT 1 FROM order_assignments x JOIN orders other_order ON other_order.id=x.order_id WHERE x.id<>a.id AND x.employee_id=a.employee_id AND x.assignment_date=a.assignment_date AND x.status IN ('GEPLANT','IN_BEARBEITUNG') AND other_order.status NOT IN ('STORNIERT','ERLEDIGT') AND x.start_time<a.end_time AND x.end_time>a.start_time) AS overlap,
+            NOT EXISTS(SELECT 1 FROM employees e JOIN employee_work_hours h ON h.employee_id=e.id WHERE e.id=a.employee_id AND e.status='ACTIVE' AND h.weekday=WEEKDAY(a.assignment_date)+1 AND h.start_time<=a.start_time AND h.end_time>=a.end_time) AS needs_review
+        FROM orders o LEFT JOIN order_assignments a ON a.order_id=o.id AND a.status<>'STORNIERT'
+        WHERE o.is_automated=1 AND o.status NOT IN ('ERLEDIGT','STORNIERT') AND o.planned_start<DATE_ADD(?,INTERVAL 1 DAY)
+        ORDER BY o.planned_start,o.id,a.id`, [until]);
+    const issues = new Map();
+    for (const row of orders) {
+        const types = row.assignment_id === null ? ["UNSTAFFED"] : row.assignment_status === "ERLEDIGT" ? [] :
+            [...(row.absence ? ["ABSENCE_CONFLICT"] : []), ...(row.overlap ? ["ASSIGNMENT_CONFLICT"] : []), ...(row.needs_review ? ["MANUAL_REVIEW"] : [])];
+        if (row.assignment_id!==null && Number(row.required_crew_size)>1 && Number(row.assigned_crew)<Number(row.required_crew_size)) types.push("UNDERSTAFFED");
+        for (const type of types) issues.set(type+":"+row.id,{type,order_id:row.id,order_number:row.order_number,title:row.title,planned_start:row.planned_start,required_crew:Number(row.required_crew_size),assigned_crew:Number(row.assigned_crew)});
+    }
+    const [failed] = await connection.execute(`
+        SELECT s.id AS schedule_id,c.contract_number,l.error_message,DATE_FORMAT(l.execution_date,'%Y-%m-%d') AS planned_start
+        FROM recurring_schedules s JOIN contracts c ON c.id=s.contract_id
+        JOIN automation_logs l ON l.id=(SELECT x.id FROM automation_logs x WHERE x.schedule_id=s.id AND x.action IN ('SCHEDULE_GENERATION','GENERATE_ORDER') ORDER BY x.id DESC LIMIT 1)
+        WHERE s.active=1 AND (c.status='AKTIV' OR (c.status='GEKUENDIGT' AND c.termination_date IS NOT NULL)) AND (s.end_date IS NULL OR s.end_date>=?) AND (c.end_date IS NULL OR c.end_date>=?) AND l.result='FAILED'
+        ORDER BY l.id DESC`,[reportBerlinDate(),reportBerlinDate()]);
+    for (const row of failed) issues.set("GENERATION_FAILED:"+row.schedule_id,{type:"GENERATION_FAILED",...row});
+    return [...issues.values()];
+}
+
+const recurringExceptionTitles = {
+    UNSTAFFED:"Wiederkehrender Auftrag ohne Mitarbeiter",
+    UNDERSTAFFED:"Wiederkehrender Auftrag unterbesetzt",
+    ASSIGNMENT_CONFLICT:"Überschneidender Einsatz",
+    ABSENCE_CONFLICT:"Einsatz während einer Abwesenheit",
+    MANUAL_REVIEW:"Einsatz manuell prüfen",
+    GENERATION_FAILED:"Auftragsgenerierung fehlgeschlagen"
+};
+
+async function notifyRecurringExceptions(connection, issues) {
+    for (const issue of issues) {
+        const entityType = issue.order_id ? "ORDER" : "RECURRING_SCHEDULE";
+        const entityId = issue.order_id || issue.schedule_id;
+        const notificationType = "RECURRING_" + issue.type;
+        await connection.execute(`INSERT INTO notifications(recipient_type,recipient_id,notification_type,title,body,entity_type,entity_id)
+            SELECT 'ADMIN',NULL,?,?,?,?,? WHERE NOT EXISTS (
+                SELECT 1 FROM notifications WHERE recipient_type='ADMIN' AND notification_type=? AND entity_type=? AND entity_id=?
+            )`, [notificationType,recurringExceptionTitles[issue.type],issue.order_number || issue.contract_number,entityType,entityId,notificationType,entityType,entityId]);
+    }
+}
+
+async function runRecurringGeneration(options = {}, trigger = "MANUAL") {
+    const connection = await adminPool.getConnection();
+    const lockName = "zoicas.recurring." + process.env.MYSQL_DATABASE;
+    const action = trigger === "AUTOMATIC" ? "RUN_AUTOMATIC" : "RUN_MANUAL";
+    const date = reportBerlinDate();
+    let locked = false;
+    try {
+        const [[result]] = await connection.query("SELECT GET_LOCK(?,0) AS acquired",[lockName]);
+        locked = result.acquired === 1;
+        if (!locked) {
+            await logAutomation(connection,{date,action,result:"SKIPPED",errorMessage:"Generation already running"});
+            return {busy:true,checkedContracts:0,created:0,existing:0,noAvailability:0,failed:0};
+        }
+        const summary = await generateRecurringOrders(connection, options);
+        await notifyRecurringExceptions(connection,await recurringSchedulingExceptions(connection,addDays(date,29)));
+        await logAutomation(connection,{date,action,result:summary.failed?"FAILED":"SUCCESS",errorMessage:JSON.stringify(summary)});
+        return summary;
+    } catch (error) {
+        const code = /^[A-Z0-9_]{1,64}$/.test(error.code || "") ? error.code : "GENERATION_ERROR";
+        await logAutomation(connection,{date,action,result:"FAILED",errorMessage:code}).catch(()=>{});
+        console.error("[recurring] run failed:",code);
+        throw error;
+    } finally {
+        if (!locked) connection.release();
+        else {
+            try {
+                await connection.query("SELECT RELEASE_LOCK(?)",[lockName]);
+                connection.release();
+            } catch { connection.destroy(); }
+        }
+    }
+}
+
+function configureRecurringTimer() {
+    clearInterval(recurringAutomationTimer);
+    if (!recurringTestAutomationAllowed || !recurringAutomationSettings.enabled) return;
+    recurringAutomationTimer = setInterval(() => {
+        if (recurringAutomationSettings.enabled) runRecurringGeneration({days:recurringAutomationSettings.days},"AUTOMATIC").catch(()=>{});
+    }, recurringAutomationIntervalMs);
+    recurringAutomationTimer.unref();
+}
+
 async function handleAdminRecurringOrders(request, response, pathname, searchParams) {
     if (!adminPool) return sendJson(response, 503, { message: "Die Datenbankrechte für die Automation sind nicht eingerichtet." });
+    if (pathname === "/api/admin/recurring-orders/automation") {
+        if (request.method === "GET") return sendJson(response,200,{allowed:recurringTestAutomationAllowed,...recurringAutomationSettings,intervalMs:recurringAutomationIntervalMs});
+        if (request.method !== "PATCH" || !isSameOriginRequest(request) || !recurringTestAutomationAllowed) return sendJson(response,403,{message:"Automatische Ausführung ist nur im isolierten Testsystem verfügbar."});
+        let body;
+        try { body=await readJson(request); } catch { return sendJson(response,400,{message:"Ungültige Einstellungen."}); }
+        if (!body || typeof body.enabled!=="boolean" || !Number.isInteger(body.days) || body.days<1 || body.days>30) return sendJson(response,400,{message:"Der Zeitraum muss zwischen 1 und 30 Tagen liegen."});
+        await auditEvent(adminPool,"ADMIN",null,"RECURRING_AUTOMATION_CONFIGURED","RECURRING_AUTOMATION",null,{enabled:body.enabled,days:body.days});
+        Object.assign(recurringAutomationSettings,{enabled:body.enabled,days:body.days});
+        configureRecurringTimer();
+        return sendJson(response,200,{allowed:true,...recurringAutomationSettings,intervalMs:recurringAutomationIntervalMs});
+    }
+    if (pathname === "/api/admin/recurring-orders/exceptions" && request.method === "GET") {
+        const page=Number(searchParams.get("page") || 1);
+        if (!Number.isInteger(page) || page<1 || page>10000) return sendJson(response,400,{message:"Ungültige Seite."});
+        const rows=await recurringSchedulingExceptions(adminPool,addDays(reportBerlinDate(),29));
+        const [runs]=await adminPool.execute("SELECT id,action,result,error_message,created_at FROM automation_logs WHERE action IN ('RUN_AUTOMATIC','RUN_MANUAL') ORDER BY id DESC LIMIT 15");
+        return sendJson(response,200,{rows:rows.slice((page-1)*25,page*25),hasMore:rows.length>page*25,runs});
+    }
     const scheduleMatch = pathname.match(/^\/api\/admin\/recurring-orders(?:\/(\d+))?$/);
     if (pathname === "/api/admin/automation-logs" && request.method === "GET") {
         const [rows] = await adminPool.execute("SELECT l.*,c.contract_number,o.order_number FROM automation_logs l LEFT JOIN contracts c ON c.id=l.contract_id LEFT JOIN orders o ON o.id=l.generated_order_id ORDER BY l.created_at DESC LIMIT 200");
@@ -1601,33 +2081,167 @@ async function handleAdminRecurringOrders(request, response, pathname, searchPar
         let body; try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "Ungültige Generator-Daten." }); }
         const days = Number(body.days || 7), contractId = body.contract_id === "" || body.contract_id == null ? null : Number(body.contract_id);
         if (!Number.isInteger(days) || days < 1 || days > 30 || (contractId !== null && (!Number.isSafeInteger(contractId) || contractId < 1))) return sendJson(response, 400, { message: "Der Zeitraum muss zwischen 1 und 30 Tagen liegen." });
-        return sendJson(response, 201, { summary: await generateRecurringOrders({ days, contractId }) });
+        return sendJson(response, 201, { summary: await runRecurringGeneration({ days, contractId }) });
     }
     if (!scheduleMatch) return sendJson(response, 404, { message: "API-Endpunkt nicht gefunden." });
     const scheduleId = scheduleMatch[1] ? Number(scheduleMatch[1]) : null;
     if (!scheduleId && request.method === "GET") {
         const contract = searchParams.get("contract_id") ? Number(searchParams.get("contract_id")) : null;
         if (contract !== null && (!Number.isSafeInteger(contract) || contract < 1)) return sendJson(response, 400, { message: "Ungültiger Vertrag." });
-        const [rows] = await adminPool.execute(`SELECT s.*,c.contract_number,c.service_type,c.status AS contract_status,cu.first_name,cu.last_name,cu.customer_number,e.first_name AS employee_first_name,e.last_name AS employee_last_name,(SELECT l.result FROM automation_logs l WHERE l.schedule_id=s.id ORDER BY l.created_at DESC LIMIT 1) AS last_result,(SELECT l.created_at FROM automation_logs l WHERE l.schedule_id=s.id ORDER BY l.created_at DESC LIMIT 1) AS last_logged_at FROM recurring_schedules s JOIN contracts c ON c.id=s.contract_id JOIN customers cu ON cu.id=c.customer_id LEFT JOIN employees e ON e.id=s.preferred_employee_id${contract ? " WHERE s.contract_id=?" : ""} ORDER BY s.active DESC,s.next_run_date,s.id`, contract ? [contract] : []);
+        const [rows] = await adminPool.execute(`SELECT s.*,c.contract_number,c.service_type,c.status AS contract_status, (s.start_date<c.start_date OR (c.end_date IS NOT NULL AND (s.end_date IS NULL OR s.end_date>c.end_date)) OR (c.termination_date IS NOT NULL AND (s.end_date IS NULL OR s.end_date>c.termination_date))) AS lifecycle_conflict,cu.first_name,cu.last_name,cu.customer_number,e.first_name AS employee_first_name,e.last_name AS employee_last_name,(SELECT l.result FROM automation_logs l WHERE l.schedule_id=s.id ORDER BY l.created_at DESC LIMIT 1) AS last_result,(SELECT l.created_at FROM automation_logs l WHERE l.schedule_id=s.id ORDER BY l.created_at DESC LIMIT 1) AS last_logged_at FROM recurring_schedules s JOIN contracts c ON c.id=s.contract_id JOIN customers cu ON cu.id=c.customer_id LEFT JOIN employees e ON e.id=s.preferred_employee_id${contract ? " WHERE s.contract_id=?" : ""} ORDER BY s.active DESC,s.next_run_date,s.id`, contract ? [contract] : []);
         return sendJson(response, 200, { rows });
     }
     if (scheduleId && request.method === "GET") {
-        const [rows] = await adminPool.execute("SELECT s.*,c.contract_number,c.customer_id,c.service_type,c.status AS contract_status FROM recurring_schedules s JOIN contracts c ON c.id=s.contract_id WHERE s.id=?", [scheduleId]);
+        const [rows] = await adminPool.execute("SELECT s.*,DATE_FORMAT(s.start_date,'%Y-%m-%d') AS start_date,DATE_FORMAT(s.end_date,'%Y-%m-%d') AS end_date,c.contract_number,c.customer_id,c.service_type,c.status AS contract_status FROM recurring_schedules s JOIN contracts c ON c.id=s.contract_id WHERE s.id=?", [scheduleId]);
         return rows[0] ? sendJson(response, 200, { schedule: rows[0] }) : sendJson(response, 404, { message: "Wiederkehrender Auftrag nicht gefunden." });
     }
     if (request.method !== (scheduleId ? "PATCH" : "POST") || !isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
     let body; try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "Ungültige Plan-Daten." }); }
-    const schedule = recurringSchedulePayload(body); if (!schedule) return sendJson(response, 400, { message: "Bitte prüfen Sie Intervall, Wochentage und Einsatzzeit." });
-    const [contracts] = await adminPool.execute("SELECT id,start_date,end_date,status FROM contracts WHERE id=?", [schedule.contractId]);
-    const contract = contracts[0]; if (!contract || contract.status !== "AKTIV") return sendJson(response, 400, { message: "Nur aktive Verträge können automatisiert werden." });
-    if (schedule.employeeId !== null) { const [employees] = await adminPool.execute("SELECT id FROM employees WHERE id=? AND status='ACTIVE'", [schedule.employeeId]); if (!employees[0]) return sendJson(response, 400, { message: "Der bevorzugte Mitarbeiter ist nicht aktiv." }); }
-    const recurrence = { start_date: schedule.startDate, end_date: schedule.endDate, recurrence_type: schedule.recurrenceType, weekdays: schedule.weekdays };
-    const nextRunDate = scheduleDates(recurrence, schedule.startDate, schedule.endDate || addDays(schedule.startDate, 366))[0] || schedule.startDate;
-    if (!scheduleId) {
-        try { const [created] = await adminPool.execute("INSERT INTO recurring_schedules (contract_id,start_date,end_date,recurrence_type,weekdays,preferred_start_time,duration_minutes,preferred_employee_id,next_run_date,active) VALUES (?,?,?,?,?,?,?,?,?,?)", [schedule.contractId,schedule.startDate,schedule.endDate,schedule.recurrenceType,schedule.weekdays,schedule.startTime,schedule.durationMinutes,schedule.employeeId,nextRunDate,schedule.active]); return sendJson(response, 201, { id: created.insertId, message: "Wiederkehrender Einsatzplan gespeichert." }); } catch (error) { if (error.code === "ER_DUP_ENTRY") return sendJson(response,409,{message:"Für diesen Vertrag existiert bereits ein Einsatzplan."}); throw error; }
+    const schedule = recurringSchedulePayload(body); if (!schedule) return sendJson(response, 400, { message: "Bitte prüfen Sie Intervall, Wochentage, Einsatzzeit und die vollständige Einsatzadresse." });
+    const connection = await adminPool.getConnection();
+    try {
+        await connection.beginTransaction();
+        const [contracts] = await connection.execute("SELECT id,DATE_FORMAT(start_date,'%Y-%m-%d') AS start_date,DATE_FORMAT(end_date,'%Y-%m-%d') AS end_date,DATE_FORMAT(termination_date,'%Y-%m-%d') AS termination_date,status,historical_registration FROM contracts WHERE id=? FOR UPDATE", [schedule.contractId]);
+        const contract = contracts[0];
+        if (!contract || (schedule.active && contract.status!=="AKTIV" && !(contract.status==="GEKUENDIGT" && contract.termination_date))) return sendJson(response,400,{message:"Nur laufende Verträge können automatisiert werden."});
+        const cutoff = contract.termination_date;
+        if (schedule.active && cutoff && (!schedule.endDate || schedule.endDate>cutoff)) return sendJson(response,409,{message:"Der Einsatzplan liegt außerhalb der Vertragslaufzeit."});
+        if ((scheduleId || contract.historical_registration) && body.confirm_schedule_change !== true) return sendJson(response,409,{message:"Bitte bestätigen Sie die Änderung künftiger Einsätze."});
+        if (scheduleId) {
+            const [[previous]] = await connection.execute("SELECT required_crew_size,preferred_employee_id,preferred_employee_ids FROM recurring_schedules WHERE id=? FOR UPDATE",[scheduleId]);
+            if (!previous) return sendJson(response,404,{message:"Wiederkehrender Auftrag nicht gefunden."});
+            if (body.required_crew_size===undefined) schedule.crewSize=Number(previous.required_crew_size);
+            if (body.preferred_employee_ids===undefined && body.preferred_employee_id===undefined) {
+                schedule.preferred=previous.preferred_employee_ids || (previous.preferred_employee_id ? [Number(previous.preferred_employee_id)] : []);
+                schedule.employeeId=schedule.preferred[0] || null;
+            }
+        }
+        if (schedule.preferred.length) {
+            const [employees] = await connection.execute(`SELECT id FROM employees WHERE status='ACTIVE' AND id IN (${schedule.preferred.map(()=>"?").join(",")})`,schedule.preferred);
+            if (employees.length!==schedule.preferred.length) return sendJson(response,400,{message:"Bevorzugte Einsatzkräfte müssen aktiv sein."});
+        }
+        const recurrence = { start_date: schedule.startDate, end_date: schedule.endDate, recurrence_type: schedule.recurrenceType, weekdays: schedule.weekdays };
+        const nextRunDate = scheduleDates(recurrence, schedule.startDate, schedule.endDate || addDays(schedule.startDate, 366))[0] || schedule.startDate;
+        if (!scheduleId) {
+            try { const [created] = await connection.execute("INSERT INTO recurring_schedules (contract_id,start_date,end_date,recurrence_type,weekdays,preferred_start_time,duration_minutes,preferred_employee_id,next_run_date,active,service_address,service_postal_code,service_city,required_crew_size,preferred_employee_ids) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [schedule.contractId,schedule.startDate,schedule.endDate,schedule.recurrenceType,schedule.weekdays,schedule.startTime,schedule.durationMinutes,schedule.employeeId,nextRunDate,schedule.active,...schedule.location.map(value=>value||null),schedule.crewSize,JSON.stringify(schedule.preferred)]); await auditEvent(connection,"ADMIN",null,"RECURRING_SCHEDULE_CREATED","RECURRING_SCHEDULE",created.insertId,{contractId:schedule.contractId}); await connection.commit(); return sendJson(response, 201, { id: created.insertId, message: "Wiederkehrender Einsatzplan gespeichert." }); } catch (error) { if (error.code === "ER_DUP_ENTRY") return sendJson(response,409,{message:"Für diesen Vertrag existiert bereits ein Einsatzplan."}); throw error; }
+        }
+        let result;
+        try { [result] = await connection.execute("UPDATE recurring_schedules SET contract_id=?,start_date=?,end_date=?,recurrence_type=?,weekdays=?,preferred_start_time=?,duration_minutes=?,preferred_employee_id=?,next_run_date=?,active=?,service_address=IF(?,?,service_address),service_postal_code=IF(?,?,service_postal_code),service_city=IF(?,?,service_city),required_crew_size=?,preferred_employee_ids=? WHERE id=?", [schedule.contractId,schedule.startDate,schedule.endDate,schedule.recurrenceType,schedule.weekdays,schedule.startTime,schedule.durationMinutes,schedule.employeeId,nextRunDate,schedule.active,...schedule.location.flatMap(value=>[schedule.hasLocation,value||null]),schedule.crewSize,JSON.stringify(schedule.preferred),scheduleId]); } catch (error) {
+            if (error.code==="ER_DUP_ENTRY") return sendJson(response,409,{message:"Für diesen Vertrag existiert bereits ein Einsatzplan."});
+            throw error;
+        }
+        if (result.affectedRows) {
+            await auditEvent(connection,"ADMIN",null,"RECURRING_SCHEDULE_UPDATED","RECURRING_SCHEDULE",scheduleId,{contractId:schedule.contractId});
+            await connection.commit();
+        }
+        return result.affectedRows ? sendJson(response, 200, { id: scheduleId, message: "Wiederkehrender Einsatzplan gespeichert." }) : sendJson(response, 404, { message: "Wiederkehrender Auftrag nicht gefunden." });
+    } finally {
+        try { await connection.rollback(); } finally { connection.release(); }
     }
-    const [result] = await adminPool.execute("UPDATE recurring_schedules SET contract_id=?,start_date=?,end_date=?,recurrence_type=?,weekdays=?,preferred_start_time=?,duration_minutes=?,preferred_employee_id=?,next_run_date=?,active=? WHERE id=?", [schedule.contractId,schedule.startDate,schedule.endDate,schedule.recurrenceType,schedule.weekdays,schedule.startTime,schedule.durationMinutes,schedule.employeeId,nextRunDate,schedule.active,scheduleId]);
-    return result.affectedRows ? sendJson(response, 200, { id: scheduleId, message: "Wiederkehrender Einsatzplan gespeichert." }) : sendJson(response, 404, { message: "Wiederkehrender Auftrag nicht gefunden." });
+}
+
+
+async function absenceRequestConflicts(connection, employeeId, start, end) {
+    const [rows] = await connection.execute(
+        "SELECT a.id,a.order_id,o.order_number,o.title,DATE_FORMAT(a.assignment_date,'%Y-%m-%d') AS assignment_date,a.start_time,a.end_time FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE a.employee_id=? AND a.assignment_date BETWEEN ? AND ? AND a.status NOT IN ('STORNIERT','ERLEDIGT') AND o.status NOT IN ('STORNIERT','ERLEDIGT') ORDER BY a.assignment_date,a.start_time,a.id",
+        [employeeId,start,end]
+    );
+    return rows;
+}
+
+async function handleAbsenceRequests(request, response, pathname, searchParams, employeeId = null) {
+    const admin = employeeId === null;
+    const database = admin ? adminPool : pool;
+    if (!database) return sendJson(response,503,{message:"Abwesenheitsanträge sind derzeit nicht verfügbar."});
+    const match = pathname.match(/^\/api\/(?:admin|employee)\/absence-requests(?:\/(\d+))?$/);
+    const id = match?.[1] ? Number(match[1]) : null;
+    if (id !== null && (!Number.isSafeInteger(id) || id < 1)) return sendJson(response,404,{message:"Antrag nicht gefunden."});
+    const columns = "r.id,r.employee_id,r.absence_type,DATE_FORMAT(r.start_date,'%Y-%m-%d') AS start_date,DATE_FORMAT(r.end_date,'%Y-%m-%d') AS end_date,r.note,r.status,r.decision_note,r.decided_at,r.created_at";
+    if (request.method === "GET") {
+        if (id !== null) {
+            const [[row]] = await database.execute(
+                "SELECT "+columns+(admin?",e.first_name,e.last_name,e.employee_number":"")+" FROM employee_absence_requests r JOIN employees e ON e.id=r.employee_id WHERE r.id=?" + (admin?"":" AND r.employee_id=?"),
+                admin?[id]:[id,employeeId]);
+            if (!row) return sendJson(response,404,{message:"Antrag nicht gefunden."});
+            if (!admin) return sendJson(response,200,{request:row});
+            const conflicts = await absenceRequestConflicts(database,row.employee_id,row.start_date,row.end_date);
+            return sendJson(response,200,{request:row,conflicts});
+        }
+        const status = admin ? String(searchParams.get("status") || "ALL") : "ALL";
+        if (!["ALL","PENDING","APPROVED","REJECTED","WITHDRAWN"].includes(status)) return sendJson(response,400,{message:"Ungültiger Status."});
+        const page = Number(searchParams.get("page") || 1);
+        if (!Number.isInteger(page) || page < 1 || page > 10000) return sendJson(response,400,{message:"Ungültige Seite."});
+        const where = admin ? (status==="ALL"?"":" WHERE r.status=?") : " WHERE r.employee_id=?";
+        const values = admin ? (status==="ALL"?[]:[status]) : [employeeId];
+        const [rows] = await database.execute(
+            "SELECT "+columns+(admin?",e.first_name,e.last_name,e.employee_number":"")+" FROM employee_absence_requests r JOIN employees e ON e.id=r.employee_id"+where+
+            " ORDER BY r.id DESC LIMIT 26 OFFSET ?", [...values,(page-1)*25]);
+        return sendJson(response,200,{rows:rows.slice(0,25),page,hasMore:rows.length>25});
+    }
+    if (!(request.method === "POST" && !admin && id === null) && !(request.method === "PATCH" && id !== null)) {
+        return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    }
+    if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+    let body;
+    try { body = await readJson(request); } catch { return sendJson(response,400,{message:"Ungültige Antragsdaten."}); }
+    if (!body || typeof body !== "object" || Array.isArray(body)) return sendJson(response,400,{message:"Ungültige Antragsdaten."});
+    const submitting = id === null;
+    const decision = submitting ? null : body.status;
+    const start = submitting ? readText(body.start_date,10) : null;
+    const end = submitting ? readText(body.end_date,10) : null;
+    const type = submitting ? readText(body.absence_type,20) : null;
+    const note = readText(submitting ? body.note : body.decision_note,1000,{optional:true,multiline:true});
+    if (note === null || (submitting && (!reportIsIsoDate(start) || !reportIsIsoDate(end) || start>end || !absenceTypes.has(type)))) {
+        return sendJson(response,400,{message:"Bitte prüfen Sie Art, Zeitraum und Notiz."});
+    }
+    if (!submitting && !(admin ? ["APPROVED","REJECTED"].includes(decision) : decision==="WITHDRAWN")) {
+        return sendJson(response,403,{message:"Diese Entscheidung ist nicht erlaubt."});
+    }
+
+    const connection = await database.getConnection();
+    try {
+        await connection.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+        await connection.beginTransaction();
+        const [[initial]] = submitting ? [[]] : await connection.execute("SELECT employee_id FROM employee_absence_requests WHERE id=?" +
+            (admin?"":" AND employee_id=?"),admin?[id]:[id,employeeId]);
+        if (!submitting && !initial) return sendJson(response,404,{message:"Antrag nicht gefunden."});
+        const owner = submitting ? employeeId : initial.employee_id;
+        const [[employee]] = await connection.execute("SELECT id,status FROM employees WHERE id=? FOR UPDATE",[owner]);
+        if (!employee || (submitting && employee.status!=="ACTIVE")) return sendJson(response,403,{message:"Mitarbeiter ist nicht aktiv."});
+        if (submitting) {
+            const [[pending]] = await connection.execute("SELECT id FROM employee_absence_requests WHERE employee_id=? AND status='PENDING' AND start_date<=? AND end_date>=? LIMIT 1",[owner,end,start]);
+            const [[recorded]] = await connection.execute("SELECT id FROM employee_absences WHERE employee_id=? AND start_date<=? AND end_date>=? LIMIT 1",[owner,end,start]);
+            if (pending || recorded) return sendJson(response,409,{message:"Der Zeitraum überschneidet sich mit einem Antrag oder einer erfassten Abwesenheit."});
+            const [created] = await connection.execute("INSERT INTO employee_absence_requests(employee_id,absence_type,start_date,end_date,note) VALUES(?,?,?,?,?)",[owner,type,start,end,note||null]);
+            await connection.execute("INSERT INTO notifications(recipient_type,recipient_id,notification_type,title,body,entity_type,entity_id) VALUES('ADMIN',NULL,'ABSENCE_REQUEST','Neuer Abwesenheitsantrag','Ein Antrag wartet auf Prüfung.','ABSENCE_REQUEST',?)",[created.insertId]);
+            await auditEvent(connection,"EMPLOYEE",owner,"ABSENCE_REQUEST_SUBMITTED","ABSENCE_REQUEST",created.insertId);
+            await connection.commit();
+            return sendJson(response,201,{id:created.insertId,status:"PENDING",message:"Antrag eingereicht."});
+        }
+        const [[row]] = await connection.execute("SELECT "+columns+" FROM employee_absence_requests r WHERE r.id=? AND r.employee_id=? FOR UPDATE",[id,owner]);
+        if (!row || row.status!=="PENDING") return sendJson(response,409,{message:"Der Antrag wurde bereits bearbeitet."});
+        let absenceId = null, conflicts = [];
+        if (decision==="APPROVED") {
+            if (employee.status!=="ACTIVE") return sendJson(response,409,{message:"Mitarbeiter ist nicht aktiv."});
+            const [[recorded]] = await connection.execute("SELECT id FROM employee_absences WHERE employee_id=? AND start_date<=? AND end_date>=? LIMIT 1",[owner,row.end_date,row.start_date]);
+            if (recorded) return sendJson(response,409,{message:"Für diesen Zeitraum ist bereits eine überschneidende Abwesenheit erfasst."});
+            conflicts = await absenceRequestConflicts(connection,owner,row.start_date,row.end_date);
+            const acknowledged = Array.isArray(body.conflict_ids) ? new Set(body.conflict_ids) : new Set();
+            if (conflicts.some(conflict=>!acknowledged.has(conflict.id))) {
+                return sendJson(response,409,{message:"Bestehende Einsätze müssen vor der Freigabe geprüft werden.",conflicts});
+            }
+            const [created] = await connection.execute("INSERT INTO employee_absences(employee_id,absence_type,start_date,end_date,created_by) VALUES(?,?,?,?,'absence-request')",[owner,row.absence_type,row.start_date,row.end_date]);
+            absenceId = created.insertId;
+        }
+        await connection.execute("UPDATE employee_absence_requests SET status=?,absence_id=?,decision_note=?,decided_at=NOW() WHERE id=?",[decision,absenceId,admin?(note||null):null,id]);
+        if (admin) await notifyEmployee(connection,owner,"ABSENCE_REQUEST","Abwesenheitsantrag bearbeitet",
+            decision==="APPROVED" ? "Ihr Antrag wurde genehmigt." : "Ihr Antrag wurde abgelehnt.","ABSENCE_REQUEST",id);
+        await auditEvent(connection,admin?"ADMIN":"EMPLOYEE",admin?null:owner,"ABSENCE_REQUEST_"+decision,"ABSENCE_REQUEST",id,{conflict_count:conflicts.length});
+        await connection.commit();
+        return sendJson(response,200,{id,status:decision,conflicts,message:"Antrag aktualisiert."});
+    } finally {
+        try { await connection.rollback(); } finally { connection.release(); }
+    }
 }
 
 async function handleAdminAvailability(request, response, pathname, searchParams) {
@@ -1665,21 +2279,97 @@ async function handleAdminAvailability(request, response, pathname, searchParams
     const absenceMatch = pathname.match(/^\/api\/admin\/absences\/(\d+)$/);
     if (absenceMatch) {
         const absenceId = Number(absenceMatch[1]);
-        if (request.method === "DELETE") { if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."}); const [result]=await adminPool.execute("DELETE FROM employee_absences WHERE id=?",[absenceId]); return result.affectedRows ? sendJson(response,200,{message:"Abwesenheit entfernt."}) : sendJson(response,404,{message:"Abwesenheit nicht gefunden."}); }
+        if (request.method === "DELETE") { if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."}); const [result]=await adminPool.execute("DELETE FROM employee_absences WHERE id=? AND created_by<>'absence-request'",[absenceId]); return result.affectedRows ? sendJson(response,200,{message:"Abwesenheit entfernt."}) : sendJson(response,404,{message:"Abwesenheit nicht gefunden."}); }
         if (request.method !== "PATCH" || !isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
         let body; try { body=await readJson(request); } catch { return sendJson(response,400,{message:"Ungültige Abwesenheit."}); }
         const type=readText(body.absence_type,16),startDate=readText(body.start_date,10),endDate=readText(body.end_date,10),notes=readText(body.notes,1000,{optional:true,multiline:true});
         if (!absenceTypes.has(type)||!isIsoDate(startDate)||!isIsoDate(endDate)||startDate>endDate||notes===null) return sendJson(response,400,{message:"Bitte prüfen Sie die Abwesenheit."});
-        const [result]=await adminPool.execute("UPDATE employee_absences SET absence_type=?,start_date=?,end_date=?,notes=? WHERE id=?",[type,startDate,endDate,notes || null,absenceId]); return result.affectedRows ? sendJson(response,200,{id:absenceId,message:"Abwesenheit gespeichert."}) : sendJson(response,404,{message:"Abwesenheit nicht gefunden."});
+        const [result]=await adminPool.execute("UPDATE employee_absences SET absence_type=?,start_date=?,end_date=?,notes=? WHERE id=? AND created_by<>'absence-request'",[type,startDate,endDate,notes || null,absenceId]); return result.affectedRows ? sendJson(response,200,{id:absenceId,message:"Abwesenheit gespeichert."}) : sendJson(response,404,{message:"Abwesenheit nicht gefunden."});
     }
     if (pathname === "/api/admin/employee-schedules" && request.method === "GET") {
         const date = String(searchParams.get("date") || ""); if (!isIsoDate(date)) return sendJson(response,400,{message:"Datum ist ungültig."});
         const weekday=weekdayForDate(date); const [employees]=await adminPool.execute("SELECT e.id,e.first_name,e.last_name,e.employee_number,wh.start_time AS work_start,wh.end_time AS work_end FROM employees e LEFT JOIN employee_work_hours wh ON wh.employee_id=e.id AND wh.weekday=? WHERE e.status='ACTIVE' ORDER BY e.last_name,e.first_name",[weekday]);
-        const [assignments]=await adminPool.execute("SELECT a.*,o.order_number,o.title FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE a.assignment_date=? AND a.status <> 'STORNIERT' ORDER BY a.start_time",[date]);
+        const [assignments]=await adminPool.execute("SELECT a.*,o.order_number,o.title,(a.status NOT IN ('STORNIERT','ERLEDIGT') AND EXISTS(SELECT 1 FROM employee_absences ea WHERE ea.employee_id=a.employee_id AND ea.start_date<=a.assignment_date AND ea.end_date>=a.assignment_date)) AS absence_review_required FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE a.assignment_date=? AND a.status <> 'STORNIERT' ORDER BY a.start_time",[date]);
         const [absences]=await adminPool.execute("SELECT employee_id,absence_type,start_date,end_date FROM employee_absences WHERE start_date<=? AND end_date>=?",[date,date]);
         return sendJson(response,200,{date,employees:employees.map(e=>({...e,work_start:e.work_start?String(e.work_start).slice(0,5):null,work_end:e.work_end?String(e.work_end).slice(0,5):null,assignments:assignments.filter(a=>a.employee_id===e.id),absence:absences.find(a=>a.employee_id===e.id)||null}))});
     }
     return false;
+}
+
+const billableReportStatuses = "('REVIEWED','SHARED','CUSTOMER_CONFIRMED')";
+const crewAssignmentCoversOccurrence = "(o.is_automated=0 OR o.required_crew_size=1 OR (a.assignment_date=DATE(o.planned_start) AND a.start_time<=TIME(o.planned_start) AND a.end_time>=TIME(o.planned_end)))";
+
+async function orderBillingState(connection, order, {invoiceId = null} = {}) {
+    const [[invoice]] = await connection.execute("SELECT id,invoice_number,status FROM invoices WHERE order_id=? LIMIT 1", [order.id]);
+    const alreadyInvoiced = Boolean(invoice && Number(invoice.id)!==invoiceId);
+    if (order.status==="STORNIERT") return {eligible:false,reason:"Der Auftrag ist storniert."};
+    const [assignments] = await connection.execute(`SELECT a.id,a.employee_id,a.status,e.first_name,e.last_name,
+        DATE_FORMAT(a.assignment_date,'%Y-%m-%d') AS assignment_date,x.reason AS exception_reason,x.note AS exception_note,
+        ${crewAssignmentCoversOccurrence} AS covers_occurrence,
+        EXISTS(SELECT 1 FROM employee_attendance_sessions t WHERE t.assignment_id=a.id AND t.employee_id=a.employee_id AND t.status='OPEN') AS attendance_open,
+        EXISTS(SELECT 1 FROM employee_attendance_sessions t WHERE t.assignment_id=a.id AND t.employee_id=a.employee_id AND t.check_out_at IS NOT NULL AND t.status='CLOSED') AS attendance_complete,
+        EXISTS(SELECT 1 FROM employee_attendance_sessions t WHERE t.assignment_id=a.id AND t.employee_id=a.employee_id AND t.status='REVIEW_REQUIRED') AS attendance_needs_review,
+        EXISTS(SELECT 1 FROM service_reports r WHERE r.assignment_id=a.id AND r.order_id=a.order_id AND r.employee_id=a.employee_id
+            AND r.service_date=a.assignment_date AND r.submitted_at IS NOT NULL AND r.reviewed_at IS NOT NULL AND r.status IN ${billableReportStatuses}) AS report_reviewed,
+        EXISTS(SELECT 1 FROM employee_absences b WHERE b.employee_id=a.employee_id AND a.assignment_date BETWEEN b.start_date AND b.end_date) AS absent
+        FROM order_assignments a JOIN employees e ON e.id=a.employee_id JOIN orders o ON o.id=a.order_id
+        LEFT JOIN order_billing_exceptions x ON x.assignment_id=a.id WHERE a.order_id=? ORDER BY a.assignment_date,a.start_time,a.id`,[order.id]);
+    const crew = Number(order.required_crew_size || 1);
+    const uniqueStaff = new Set(assignments.map(row=>row.employee_id));
+    if (crew>1 || uniqueStaff.size>1 || assignments.some(row=>row.exception_reason)) {
+        const obligations = assignments.map(row=>({...row,complete:row.status!=="STORNIERT" && !row.attendance_open && !row.attendance_needs_review && Boolean(row.attendance_complete && row.report_reviewed)}));
+        const covered = new Set(obligations.filter(row=>row.covers_occurrence && (row.status!=="STORNIERT" || row.exception_reason)).map(row=>row.employee_id)).size;
+        const staffed = covered>=crew;
+        const eligible = staffed && obligations.some(row=>row.complete) &&
+            obligations.every(row=>!row.attendance_open && (row.complete || row.exception_reason));
+        return {eligible:eligible && !alreadyInvoiced,invoice,team:obligations,requiredCrew:crew,coveredCrew:covered,reason:eligible?undefined:
+            !staffed?"Die erforderliche Teamgröße ist noch nicht abgedeckt.":"Das Team benötigt abgeschlossene Anwesenheiten und geprüfte Berichte oder dokumentierte Ausnahmen."};
+    }
+    const [[report]] = await connection.execute(`SELECT id FROM service_reports WHERE order_id=? AND status IN ${billableReportStatuses} LIMIT 1`,[order.id]);
+    return report ? {eligible:!alreadyInvoiced,invoice} : {eligible:false,invoice,reason:"Ein geprüfter Leistungsnachweis ist erforderlich."};
+}
+
+async function handleOrderBillingException(request,response,orderId,assignmentId) {
+    if (!["PUT","DELETE"].includes(request.method)) return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+    let reason,note;
+    if (request.method==="PUT") {
+        let body; try {body=await readJson(request);} catch {return sendJson(response,400,{message:"Ungültige Ausnahme."});}
+        reason=readText(body?.reason,24); note=readText(body?.note,1000,{multiline:true});
+        if (!["ABSENT","UNABLE_TO_COMPLETE"].includes(reason) || !note) return sendJson(response,400,{message:"Bitte wählen Sie einen Grund und dokumentieren Sie die Ausnahme."});
+    }
+    const connection=await adminPool.getConnection();
+    try {
+        await connection.beginTransaction();
+        const [[order]]=await connection.execute("SELECT id,status,required_crew_size FROM orders WHERE id=? FOR UPDATE",[orderId]);
+        if (!order) return sendJson(response,404,{message:"Auftrag nicht gefunden."});
+        const [[invoice]]=await connection.execute("SELECT id,status FROM invoices WHERE order_id=? LIMIT 1",[orderId]);
+        if (isPublishedCommercialStatus(invoice?.status) || order.status==="STORNIERT") return sendJson(response,409,{message:"Für diesen Auftrag kann keine Ausnahme geändert werden."});
+        const state=await orderBillingState(connection,order,{invoiceId:invoice?Number(invoice.id):null});
+        const assignment=state.team?.find(row=>Number(row.id)===assignmentId);
+        if (!assignment) return sendJson(response,404,{message:"Teameinsatz nicht gefunden."});
+        if (request.method==="PUT") {
+            if (assignment.attendance_open || assignment.complete || (reason==="ABSENT" && !assignment.absent)) return sendJson(response,409,{message:"Diese Ausnahme ist für den Einsatz nicht zulässig. Offene Anwesenheiten müssen zuerst beendet werden."});
+            const [write]=await connection.execute("INSERT IGNORE INTO order_billing_exceptions(assignment_id,reason,note) VALUES(?,?,?)",[assignmentId,reason,note]);
+            if (!write.affectedRows) return sendJson(response,409,{message:"Für den Einsatz ist bereits eine Ausnahme dokumentiert."});
+        } else {
+            const [write]=await connection.execute("DELETE FROM order_billing_exceptions WHERE assignment_id=?",[assignmentId]);
+            if (!write.affectedRows) return sendJson(response,404,{message:"Ausnahme nicht gefunden."});
+        }
+        await auditEvent(connection,"ADMIN",null,request.method==="PUT"?"BILLING_EXCEPTION_RECORDED":"BILLING_EXCEPTION_REVOKED","ORDER_ASSIGNMENT",assignmentId,{order_id:orderId,reason:reason||null});
+        await connection.commit();
+        return sendJson(response,200,{message:request.method==="PUT"?"Ausnahme dokumentiert.":"Ausnahme aufgehoben."});
+    } finally {
+        try {await connection.rollback();} finally {connection.release();}
+    }
+}
+
+async function updateOrderStaffing(connection,order) {
+    const [[staff]]=await connection.execute(`SELECT COUNT(DISTINCT a.employee_id) AS total FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE a.order_id=? AND a.status<>'STORNIERT' AND ${crewAssignmentCoversOccurrence}`,[order.id]);
+    const staffed=Number(staff.total)>=Number(order.required_crew_size);
+    if (staffed || order.is_automated) {
+        await connection.execute("UPDATE orders SET status=? WHERE id=? AND status IN ('NEU','GEPLANT','ZUGEWIESEN')",[staffed?"ZUGEWIESEN":"GEPLANT",order.id]);
+    }
 }
 
 async function handleAdminOrders(request, response, pathname, searchParams) {
@@ -1688,39 +2378,84 @@ async function handleAdminOrders(request, response, pathname, searchParams) {
     const orderId = match?.[1] ? Number(match[1]) : null;
     const assignmentId = match?.[2] ? Number(match[2]) : null;
     const assignmentsRoute = pathname.includes("/assignments");
+    const exceptionRoute = pathname.match(/^\/api\/admin\/orders\/(\d+)\/assignments\/(\d+)\/billing-exception$/);
+    if (exceptionRoute) return handleOrderBillingException(request,response,Number(exceptionRoute[1]),Number(exceptionRoute[2]));
     if (assignmentsRoute) {
         if (!orderId) return sendJson(response, 404, { message: "Auftrag nicht gefunden." });
         if (request.method === "GET" && !assignmentId) {
-            const [rows] = await adminPool.execute("SELECT a.*,e.first_name,e.last_name,e.employee_number,e.position FROM order_assignments a JOIN employees e ON e.id=a.employee_id WHERE a.order_id=? ORDER BY a.assignment_date,a.start_time", [orderId]);
+            const [rows] = await adminPool.execute("SELECT a.*,e.first_name,e.last_name,e.employee_number,e.position,(a.status NOT IN ('STORNIERT','ERLEDIGT') AND EXISTS(SELECT 1 FROM employee_absences ea WHERE ea.employee_id=a.employee_id AND ea.start_date<=a.assignment_date AND ea.end_date>=a.assignment_date)) AS absence_review_required FROM order_assignments a JOIN employees e ON e.id=a.employee_id WHERE a.order_id=? ORDER BY a.assignment_date,a.start_time", [orderId]);
             return sendJson(response, 200, { rows });
         }
         if (!["POST", "PATCH", "DELETE"].includes(request.method)) { response.setHeader("Allow", "GET, POST, PATCH, DELETE"); return sendJson(response, 405, { message: "Methode nicht erlaubt." }); }
         if (!isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
         if (request.method === "DELETE") {
             if (!assignmentId) return sendJson(response, 400, { message: "Einsatz fehlt." });
-            const [result] = await adminPool.execute("DELETE FROM order_assignments WHERE id=? AND order_id=?", [assignmentId, orderId]);
-            return result.affectedRows ? sendJson(response, 200, { message: "Einsatz entfernt." }) : sendJson(response, 404, { message: "Einsatz nicht gefunden." });
+            const connection=await adminPool.getConnection();
+            try {
+                await connection.beginTransaction();
+                const [[order]]=await connection.execute("SELECT required_crew_size FROM orders WHERE id=? FOR UPDATE",[orderId]);
+                const [[team]]=await connection.execute("SELECT COUNT(DISTINCT employee_id) AS total FROM order_assignments WHERE order_id=?",[orderId]);
+                if (Number(order?.required_crew_size)>1 || Number(team.total)>1) return sendJson(response,409,{message:"Teameinsätze bleiben zur Abrechnung erhalten. Dokumentieren Sie eine Ausnahme."});
+                const [result]=await connection.execute("DELETE FROM order_assignments WHERE id=? AND order_id=?",[assignmentId,orderId]);
+                await connection.commit();
+                return result.affectedRows?sendJson(response,200,{message:"Einsatz entfernt."}):sendJson(response,404,{message:"Einsatz nicht gefunden."});
+            } finally {try {await connection.rollback();} finally {connection.release();}}
         }
         let body; try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "Ungültige Daten." }); }
         const employeeId = Number(body.employee_id), assignmentDate = readText(body.assignment_date, 10), startTime = readText(body.start_time, 5), endTime = readText(body.end_time, 5), status = readText(body.status || "GEPLANT", 20), notes = readText(body.notes, 4000, { optional: true, multiline: true });
         if (!Number.isSafeInteger(employeeId) || employeeId < 1 || !isIsoDate(assignmentDate) || !isClockTime(startTime) || !isClockTime(endTime) || startTime >= endTime || !assignmentStatuses.has(status)) return sendJson(response, 400, { message: "Bitte prüfen Sie die Einsatzdaten." });
-        const [employee] = await adminPool.execute("SELECT id FROM employees WHERE id=? AND status='ACTIVE'", [employeeId]);
-        if (!employee[0]) return sendJson(response, 404, { message: "Aktiver Mitarbeiter nicht gefunden." });
-        if (await assignmentHasConflict(adminPool, employeeId, assignmentDate, startTime, endTime, assignmentId)) return sendJson(response, 409, { message: "Der Mitarbeiter ist zu diesem Zeitpunkt bereits eingeplant." });
-        const availability = await availabilityForSlot(adminPool, assignmentDate, startTime, endTime, { exceptAssignmentId: assignmentId });
-        const employeeAvailability = availability.find(item => item.id === employeeId);
-        if (!employeeAvailability?.available) return sendJson(response, 409, { message: employeeAvailability?.reason === "" ? "Der Mitarbeiter ist zu diesem Zeitpunkt nicht verfügbar." : `Der Mitarbeiter ist zu diesem Zeitpunkt nicht verfügbar: ${employeeAvailability?.reason || "Arbeitszeit prüfen."}` });
-        if (request.method === "POST") {
-            const [result] = await adminPool.execute("INSERT INTO order_assignments (order_id,employee_id,assignment_date,start_time,end_time,status,notes) VALUES (?,?,?,?,?,?,?)", [orderId, employeeId, assignmentDate, startTime, endTime, status, notes || null]);
-            await adminPool.execute("UPDATE orders SET status='ZUGEWIESEN' WHERE id=? AND status IN ('NEU','GEPLANT')", [orderId]);
-            const [[order]] = await adminPool.execute("SELECT customer_id,order_number FROM orders WHERE id=?",[orderId]);
-            await auditEvent(adminPool,"ADMIN",null,"EMPLOYEE_ASSIGNED","ORDER_ASSIGNMENT",result.insertId,{order_id:orderId,employee_id:employeeId,date:assignmentDate});
-            if (order) await notifyCustomer(adminPool,order.customer_id,"ORDER","Einsatz geplant",`Für Ihren Auftrag ${order.order_number} wurde ein Einsatz geplant.`,`ORDER`,orderId);
-            return sendJson(response, 201, { id: result.insertId, message: "Mitarbeiter eingeplant." });
+        const connection = await adminPool.getConnection();
+        try {
+            await connection.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+            await connection.beginTransaction();
+            const [[order]]=await connection.execute("SELECT id,status,customer_id,order_number,is_automated,required_crew_size FROM orders WHERE id=? FOR UPDATE",[orderId]);
+            if (!order) return sendJson(response,404,{message:"Auftrag nicht gefunden."});
+            const [[oldAssignment]]=assignmentId ? await connection.execute(`SELECT a.employee_id,DATE_FORMAT(a.assignment_date,'%Y-%m-%d') AS day,a.start_time,a.end_time,a.status,
+                EXISTS(SELECT 1 FROM order_billing_exceptions x WHERE x.assignment_id=a.id) AS waived,
+                EXISTS(SELECT 1 FROM employee_attendance_sessions t WHERE t.assignment_id=a.id) AS attendance,
+                EXISTS(SELECT 1 FROM service_reports r WHERE r.assignment_id=a.id) AS reported,
+                (SELECT COUNT(DISTINCT b.employee_id) FROM order_assignments b WHERE b.order_id=a.order_id) AS crew
+                FROM order_assignments a WHERE a.id=? AND a.order_id=?`,[assignmentId,orderId]) : [[]];
+            if (assignmentId && !oldAssignment) return sendJson(response,404,{message:"Einsatz nicht gefunden."});
+            if (oldAssignment && ((Number(oldAssignment.employee_id)!==employeeId && (Number(oldAssignment.crew)>1 || oldAssignment.waived)) ||
+                ((oldAssignment.waived || oldAssignment.attendance || oldAssignment.reported) &&
+                 (Number(oldAssignment.employee_id)!==employeeId || oldAssignment.day!==assignmentDate ||
+                  oldAssignment.start_time.slice(0,5)!==startTime || oldAssignment.end_time.slice(0,5)!==endTime)))) {
+                return sendJson(response,409,{message:"Ein dokumentierter Teameinsatz kann nicht umgebucht werden. Legen Sie einen neuen Einsatz an."});
+            }
+            const [[sameSlot]] = !order.is_automated && status!=="STORNIERT" ? await connection.execute(
+                "SELECT id FROM order_assignments WHERE order_id=? AND assignment_date=? AND start_time=? AND end_time=? AND status<>'STORNIERT' LIMIT 1",
+                [orderId,assignmentDate,startTime,endTime]) : [[]];
+            const [employee] = await connection.execute("SELECT id FROM employees WHERE id=? AND status='ACTIVE' FOR UPDATE", [employeeId]);
+            if (!employee[0]) return sendJson(response, 404, { message: "Aktiver Mitarbeiter nicht gefunden." });
+            if (status !== "STORNIERT") {
+                if (await assignmentHasConflict(connection, employeeId, assignmentDate, startTime, endTime, assignmentId)) return sendJson(response, 409, { message: "Der Mitarbeiter ist zu diesem Zeitpunkt bereits eingeplant." });
+                const availability = await availabilityForSlot(connection, assignmentDate, startTime, endTime, { exceptAssignmentId: assignmentId });
+                const employeeAvailability = availability.find(item => item.id === employeeId);
+                if (!employeeAvailability?.available) return sendJson(response, 409, { message: employeeAvailability?.reason === "" ? "Der Mitarbeiter ist zu diesem Zeitpunkt nicht verfügbar." : `Der Mitarbeiter ist zu diesem Zeitpunkt nicht verfügbar: ${employeeAvailability?.reason || "Arbeitszeit prüfen."}` });
+            }
+            if (request.method === "POST") {
+                const [result] = await connection.execute("INSERT INTO order_assignments (order_id,employee_id,assignment_date,start_time,end_time,status,notes) VALUES (?,?,?,?,?,?,?)", [orderId, employeeId, assignmentDate, startTime, endTime, status, notes || null]);
+                await updateOrderStaffing(connection,order);
+                await auditEvent(connection,"ADMIN",null,"EMPLOYEE_ASSIGNED","ORDER_ASSIGNMENT",result.insertId,{order_id:orderId,employee_id:employeeId,date:assignmentDate});
+                if (status!=="STORNIERT") await notifyEmployee(connection,employeeId,"ORDER","Einsatz zugewiesen","Für Sie wurde ein Einsatz eingeplant.","ORDER",orderId);
+                if (!sameSlot && !order.is_automated && status!=="STORNIERT") await notifyCustomer(connection,order.customer_id,"ORDER","Einsatz geplant",`Für Ihren Auftrag ${order.order_number} ist ein Einsatz am ${assignmentDate} von ${startTime} bis ${endTime} Uhr geplant.`,"ORDER",orderId);
+                await connection.commit();
+                return sendJson(response, 201, { id: result.insertId, message: "Mitarbeiter eingeplant." });
+            }
+            if (!assignmentId) return sendJson(response, 400, { message: "Einsatz fehlt." });
+            const [result] = await connection.execute("UPDATE order_assignments SET employee_id=?,assignment_date=?,start_time=?,end_time=?,status=?,notes=? WHERE id=? AND order_id=?", [employeeId, assignmentDate, startTime, endTime, status, notes || null, assignmentId, orderId]);
+            await updateOrderStaffing(connection,order);
+            if (status!=="STORNIERT" && (oldAssignment.status==="STORNIERT" || Number(oldAssignment.employee_id)!==employeeId || oldAssignment.day!==assignmentDate || oldAssignment.start_time.slice(0,5)!==startTime || oldAssignment.end_time.slice(0,5)!==endTime)) {
+                await notifyEmployee(connection,employeeId,"ORDER","Einsatz geändert","Ihre Einsatzplanung wurde aktualisiert.","ORDER",orderId);
+            }
+            if (!sameSlot && !order.is_automated && status!=="STORNIERT") await notifyCustomer(connection,order.customer_id,"ORDER","Einsatz geplant",`Für Ihren Auftrag ${order.order_number} ist ein Einsatz am ${assignmentDate} von ${startTime} bis ${endTime} Uhr geplant.`,"ORDER",orderId);
+            await auditEvent(connection,"ADMIN",null,"EMPLOYEE_ASSIGNMENT_UPDATED","ORDER_ASSIGNMENT",assignmentId,{order_id:orderId,employee_id:employeeId,date:assignmentDate});
+            await connection.commit();
+            return result.affectedRows ? sendJson(response, 200, { id: assignmentId, message: "Einsatz gespeichert." }) : sendJson(response, 404, { message: "Einsatz nicht gefunden." });
+        } finally {
+            try { await connection.rollback(); } finally { connection.release(); }
         }
-        if (!assignmentId) return sendJson(response, 400, { message: "Einsatz fehlt." });
-        const [result] = await adminPool.execute("UPDATE order_assignments SET employee_id=?,assignment_date=?,start_time=?,end_time=?,status=?,notes=? WHERE id=? AND order_id=?", [employeeId, assignmentDate, startTime, endTime, status, notes || null, assignmentId, orderId]);
-        return result.affectedRows ? sendJson(response, 200, { id: assignmentId, message: "Einsatz gespeichert." }) : sendJson(response, 404, { message: "Einsatz nicht gefunden." });
     }
     if (!orderId && request.method === "GET") {
         const search = String(searchParams.get("search") || "").trim().slice(0, 100), status = String(searchParams.get("status") || "all"), priority = String(searchParams.get("priority") || "all");
@@ -1731,16 +2466,16 @@ async function handleAdminOrders(request, response, pathname, searchParams) {
         if (priority !== "all") { clauses.push("o.priority=?"); values.push(priority); }
         if (search) { clauses.push("(o.order_number LIKE ? OR o.title LIKE ? OR o.service_type LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ? OR c.customer_number LIKE ?)"); for (let i = 0; i < 6; i += 1) values.push(`%${search}%`); }
         const where = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
-        const [rows] = await adminPool.execute(`SELECT o.id,o.order_number,o.service_type,o.title,o.address,o.postal_code,o.city,o.preferred_date,o.status,o.priority,o.created_at,c.first_name,c.last_name,c.customer_number,COUNT(a.id) AS assignment_count FROM orders o JOIN customers c ON c.id=o.customer_id LEFT JOIN order_assignments a ON a.order_id=o.id${where} GROUP BY o.id ORDER BY o.preferred_date IS NULL,o.preferred_date DESC,o.id DESC LIMIT 100`, values);
+        const [rows] = await adminPool.execute(`SELECT o.id,o.order_number,o.service_type,o.title,o.required_crew_size,o.address,o.postal_code,o.city,o.preferred_date,o.status,o.priority,o.created_at,c.first_name,c.last_name,c.customer_number,COUNT(a.id) AS assignment_count,COUNT(DISTINCT CASE WHEN a.status<>'STORNIERT' AND ${crewAssignmentCoversOccurrence} AND NOT EXISTS(SELECT 1 FROM employee_absences aa WHERE aa.employee_id=a.employee_id AND a.assignment_date BETWEEN aa.start_date AND aa.end_date) THEN a.employee_id END) AS staffed_crew_count FROM orders o JOIN customers c ON c.id=o.customer_id LEFT JOIN order_assignments a ON a.order_id=o.id${where} GROUP BY o.id ORDER BY o.preferred_date IS NULL,o.preferred_date DESC,o.id DESC LIMIT 100`, values);
         return sendJson(response, 200, { rows, total: rows.length });
     }
     if (orderId && request.method === "GET") {
         const [orders] = await adminPool.execute("SELECT o.*,c.first_name,c.last_name,c.customer_number,c.email,c.phone,c.address AS customer_address,c.postal_code AS customer_postal_code,c.city AS customer_city FROM orders o JOIN customers c ON c.id=o.customer_id WHERE o.id=?", [orderId]);
         if (!orders[0]) return sendJson(response, 404, { message: "Auftrag nicht gefunden." });
-        const [assignments] = await adminPool.execute("SELECT a.*,e.first_name,e.last_name,e.employee_number,e.position FROM order_assignments a JOIN employees e ON e.id=a.employee_id WHERE a.order_id=? ORDER BY a.assignment_date,a.start_time", [orderId]);
+        const [assignments] = await adminPool.execute("SELECT a.*,e.first_name,e.last_name,e.employee_number,e.position,(a.status NOT IN ('STORNIERT','ERLEDIGT') AND EXISTS(SELECT 1 FROM employee_absences ea WHERE ea.employee_id=a.employee_id AND ea.start_date<=a.assignment_date AND ea.end_date>=a.assignment_date)) AS absence_review_required FROM order_assignments a JOIN employees e ON e.id=a.employee_id WHERE a.order_id=? ORDER BY a.assignment_date,a.start_time", [orderId]);
         const [workLogs] = await adminPool.execute("SELECT w.*,e.first_name,e.last_name FROM employee_work_logs w JOIN employees e ON e.id=w.employee_id WHERE w.order_id=? ORDER BY w.work_date DESC,w.start_time DESC", [orderId]);
         const [documents] = await adminPool.execute("SELECT d.id,d.task_id,d.employee_id,d.file_name,d.mime_type,d.file_size,d.description,d.created_at,e.first_name,e.last_name FROM task_documents d JOIN employees e ON e.id=d.employee_id WHERE d.order_id=? ORDER BY d.created_at DESC", [orderId]);
-        return sendJson(response, 200, { order: orders[0], assignments, workLogs, documents });
+        return sendJson(response, 200, { order: orders[0], assignments, workLogs, documents, billing: await orderBillingState(adminPool, orders[0]) });
     }
     if (!orderId && request.method !== "POST") { response.setHeader("Allow", "GET, POST"); return sendJson(response, 405, { message: "Methode nicht erlaubt." }); }
     if (orderId && !["PATCH", "DELETE"].includes(request.method)) { response.setHeader("Allow", "GET, PATCH, DELETE"); return sendJson(response, 405, { message: "Methode nicht erlaubt." }); }
@@ -1855,6 +2590,73 @@ async function createDocumentNumber(connection, table, prefix, id) {
     return number;
 }
 
+async function deliverContractEmail(id, delivery) {
+    let result;
+    try {
+        result = await sendBrandedEmail(delivery.email,contractEmailSubject,customerContractEmail(delivery));
+    } catch {
+        result = {delivered:false,reason:"message_preparation_failed"};
+    }
+    const outcome = result.delivered ? "ACCEPTED" : result.uncertain ? "UNKNOWN" : "FAILED";
+    try {
+        await auditEvent(adminPool,"ADMIN",null,`CONTRACT_EMAIL_${outcome}`,"CONTRACT",id,result.reason?{reason:result.reason}:null);
+    } catch (error) {
+        console.error("[contract-email] audit result unavailable", {contractId:id,outcome,code:error.code||"database_error"});
+    }
+    return outcome;
+}
+
+const retryableContractEmailErrors = new Set(["smtp_rejected","smtp_connection_failed","smtp_not_configured","invalid_recipient","message_preparation_failed"]);
+async function contractEmailHistory(connection,id,contractStatus) {
+    const [rows] = await connection.execute(`SELECT action,DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') AS recorded_at,
+        JSON_UNQUOTE(JSON_EXTRACT(metadata,'$.reason')) AS reason FROM audit_logs
+        WHERE entity_type='CONTRACT' AND entity_id=? AND action IN
+        ('CONTRACT_EMAIL_ATTEMPTED','CONTRACT_EMAIL_ACCEPTED','CONTRACT_EMAIL_FAILED','CONTRACT_EMAIL_UNKNOWN')
+        ORDER BY id DESC LIMIT 40`,[id]);
+    const latest = rows[0];
+    const confirmedFailure = latest?.action==="CONTRACT_EMAIL_FAILED" && retryableContractEmailErrors.has(latest.reason);
+    const status = !latest ? "NONE" : latest.action==="CONTRACT_EMAIL_FAILED" && !confirmedFailure ? "UNKNOWN" : latest.action.slice("CONTRACT_EMAIL_".length);
+    let accepted = false;
+    if (confirmedFailure && contractStatus==="AKTIV") {
+        const [[prior]] = await connection.execute("SELECT id FROM audit_logs WHERE entity_type='CONTRACT' AND entity_id=? AND action='CONTRACT_EMAIL_ACCEPTED' LIMIT 1",[id]);
+        accepted = Boolean(prior);
+    }
+    return {status,canRetry:contractStatus==="AKTIV" && confirmedFailure && !accepted,
+        attempts:rows.map(row=>({status:row.action==="CONTRACT_EMAIL_FAILED" && !retryableContractEmailErrors.has(row.reason) ? "UNKNOWN" : row.action.slice("CONTRACT_EMAIL_".length),recordedAt:row.recorded_at}))};
+}
+async function retryContractEmail(response,id) {
+    const connection = await adminPool.getConnection();
+    let delivery;
+    try {
+        await connection.beginTransaction();
+        const [[contract]] = await connection.execute(`SELECT c.status,c.contract_number,DATE_FORMAT(c.start_date,'%Y-%m-%d') AS start_date,
+            cu.first_name,cu.last_name,cu.email FROM contracts c JOIN customers cu ON cu.id=c.customer_id WHERE c.id=? FOR UPDATE`,[id]);
+        if (!contract) {
+            await connection.rollback();
+            return sendJson(response,404,{message:"Vertrag nicht gefunden."});
+        }
+        const history = await contractEmailHistory(connection,id,contract.status);
+        if (!history.canRetry) {
+            await connection.rollback();
+            return sendJson(response,409,{message:"Für diese Vertrags-E-Mail ist kein erneuter Versand möglich."});
+        }
+        delivery = {email:contract.email,name:[contract.first_name,contract.last_name].filter(Boolean).join(" "),
+            number:contract.contract_number,startDate:contract.start_date};
+        await auditEvent(connection,"ADMIN",null,"CONTRACT_EMAIL_ATTEMPTED","CONTRACT",id,{retry:true});
+        await connection.commit();
+    } catch (error) {
+        await connection.rollback();
+        throw error;
+    } finally { connection.release(); }
+    const outcome = await deliverContractEmail(id,delivery);
+    return sendJson(response,200,{emailDelivery:outcome,message:contractEmailResultMessage(outcome)});
+}
+function contractEmailResultMessage(outcome) {
+    if (outcome==="ACCEPTED") return "Der Mailserver hat die Vertrags-E-Mail angenommen.";
+    if (outcome==="FAILED") return "Die Vertrags-E-Mail konnte nicht gesendet werden.";
+    return "Der Versandstatus der Vertrags-E-Mail ist unklar.";
+}
+
 async function handleAdminCommercial(request, response, pathname, searchParams) {
     if (!adminPool) return sendJson(response, 503, { message: "Die Datenbankrechte für Angebote und Verträge sind noch nicht eingerichtet." });
     const quoteMatch = pathname.match(/^\/api\/admin\/quotes(?:\/(\d+)(?:\/items(?:\/(\d+))?|\/create-order)?)?$/);
@@ -1935,21 +2737,191 @@ async function handleAdminCommercial(request, response, pathname, searchParams) 
         const fields=[quote.customerId,quote.requestId,quote.contactPerson||null,quote.serviceDescription,quote.objectAddress||null,quote.postalCode||null,quote.city||null,quote.serviceType,quote.area,quote.frequency||null,quote.startDate||null,quote.validUntil||null,quote.internalNotes||null,quote.customerNotes||null,quote.status];
         const connection=await adminPool.getConnection();
         try { await connection.beginTransaction(); let id=quoteId,number;
+            const [[previous]] = quoteId ? await connection.execute("SELECT status,quote_request_id,customer_id FROM quotes WHERE id=? FOR UPDATE", [quoteId]) : [[]];
+            if (previous && quote.requestId === null && previous.quote_request_id !== null) {
+                if (Number(previous.customer_id) !== quote.customerId) {
+                    await connection.rollback();
+                    return sendJson(response, 400, { message: "Die Anfrage gehört nicht zu diesem Kunden." });
+                }
+                fields[1] = previous.quote_request_id;
+            }
+            if (!isPublishedCommercialStatus(previous?.status) && isPublishedCommercialStatus(quote.status) && quote.status !== "GESENDET") {
+                await connection.rollback();
+                return sendJson(response, 409, { message: "Ein Entwurf muss zuerst gesendet werden." });
+            }
             if(request.method==='POST'){const items=Array.isArray(body.items)?body.items:[];if(!items.length){await connection.rollback();return sendJson(response,400,{message:"Mindestens eine Angebotsposition ist erforderlich."});}[{insertId:id}]=await connection.execute("INSERT INTO quotes (customer_id,quote_request_id,contact_person,service_description,object_address,postal_code,city,service_type,area_sqm,frequency,start_date,valid_until,internal_notes,customer_notes,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",fields);number=await createDocumentNumber(connection,"quotes","ANG",id);for(let index=0;index<items.length;index+=1){const item=quoteItemPayload(items[index],index+1);if(!item){await connection.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie alle Angebotspositionen."});}await connection.execute("INSERT INTO quote_items (quote_id,sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",[id,item.sortOrder,item.title,item.description,item.quantity,item.unit,item.unitPrice,item.discount,item.net,item.taxRate,item.tax,item.gross]);}}
             else { const [result]=await connection.execute("UPDATE quotes SET customer_id=?,quote_request_id=?,contact_person=?,service_description=?,object_address=?,postal_code=?,city=?,service_type=?,area_sqm=?,frequency=?,start_date=?,valid_until=?,internal_notes=?,customer_notes=?,status=? WHERE id=?",[...fields,id]);if(!result.affectedRows){await connection.rollback();return sendJson(response,404,{message:"Angebot nicht gefunden."});} if(Array.isArray(body.items)){await connection.execute("DELETE FROM quote_items WHERE quote_id=?",[id]);if(!body.items.length){await connection.rollback();return sendJson(response,400,{message:"Mindestens eine Angebotsposition ist erforderlich."});}for(let index=0;index<body.items.length;index+=1){const item=quoteItemPayload(body.items[index],index+1);if(!item){await connection.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie alle Angebotspositionen."});}await connection.execute("INSERT INTO quote_items (quote_id,sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",[id,item.sortOrder,item.title,item.description,item.quantity,item.unit,item.unitPrice,item.discount,item.net,item.taxRate,item.tax,item.gross]);}} }
-            const totals=await recalculateQuote(connection,id); await auditEvent(connection,"ADMIN",null,"QUOTE_STATUS_CHANGED","QUOTE",id,{status:quote.status,created:request.method==='POST'}); if(request.method==='POST'||quote.status==='GESENDET'||quote.status==='ANGENOMMEN')await notifyCustomer(connection,quote.customerId,"QUOTE","Angebot aktualisiert",`Ihr Angebot wurde auf ${quote.status} gesetzt.`,`QUOTE`,id); await connection.commit(); return sendJson(response,request.method==='POST'?201:200,{id,quoteNumber:number,message:request.method==='POST'?"Angebot erstellt.":"Angebot gespeichert.",totals});
+            const totals=await recalculateQuote(connection,id);
+            await auditEvent(connection,"ADMIN",null,"QUOTE_STATUS_CHANGED","QUOTE",id,{status:quote.status,created:request.method==="POST"});
+            if (fields[1] !== null && ["ENTWURF","GESENDET"].includes(quote.status)) {
+                const published = quote.status==="GESENDET";
+                await connection.execute("UPDATE quote_requests SET status=? WHERE id=? AND status IN ('new','in_progress') AND (? OR status='new')",
+                    [published?"offer_sent":"in_progress",fields[1],published]);
+            }
+            if (isPublishedCommercialStatus(quote.status) && !isPublishedCommercialStatus(previous?.status)) {
+                const [[notice]]=await connection.execute("SELECT id FROM notifications WHERE recipient_type='CUSTOMER' AND recipient_id=? AND notification_type='QUOTE' AND entity_type='QUOTE' AND entity_id=? LIMIT 1",
+                    [quote.customerId,id]);
+                if (!notice) await notifyCustomer(connection,quote.customerId,"QUOTE","Angebot verfügbar","Ihr Angebot ist im Kundenportal verfügbar.","QUOTE",id);
+            } await connection.commit(); return sendJson(response,request.method==='POST'?201:200,{id,quoteNumber:number,message:request.method==='POST'?"Angebot erstellt.":"Angebot gespeichert.",totals});
         } catch(error){await connection.rollback();throw error;} finally {connection.release();}
     }
     if (contractMatch) {
-        if (contractId && request.method === "GET") { const [rows]=await adminPool.execute("SELECT c.*,cu.customer_number,cu.first_name,cu.last_name,q.quote_number FROM contracts c JOIN customers cu ON cu.id=c.customer_id LEFT JOIN quotes q ON q.id=c.quote_id WHERE c.id=?",[contractId]);return rows[0]?sendJson(response,200,{contract:rows[0]}):sendJson(response,404,{message:"Vertrag nicht gefunden."}); }
-        if (!contractId && request.method === "GET") { const status=String(searchParams.get("status")||"all"),search=String(searchParams.get("search")||"").trim().slice(0,100);if(status!=="all"&&!contractStatuses.has(status))return sendJson(response,400,{message:"Ungültiger Status."});const where=[],values=[];if(status!=="all"){where.push("co.status=?");values.push(status)}if(search){where.push("(co.contract_number LIKE ? OR co.service_type LIKE ? OR cu.first_name LIKE ? OR cu.last_name LIKE ? OR cu.customer_number LIKE ?)");for(let i=0;i<5;i+=1)values.push(`%${search}%`)}const clause=where.length?` WHERE ${where.join(" AND ")}`:"";const [rows]=await adminPool.execute(`SELECT co.id,co.contract_number,co.service_type,co.interval_type,co.start_date,co.end_date,co.status,co.gross_amount,co.created_at,cu.first_name,cu.last_name,cu.customer_number FROM contracts co JOIN customers cu ON cu.id=co.customer_id${clause} ORDER BY co.created_at DESC,co.id DESC LIMIT 100`,values);return sendJson(response,200,{rows,total:rows.length}); }
+        if (contractId && request.method === "GET") {
+            const [[contract]] = await adminPool.execute("SELECT c.*,DATE_FORMAT(c.start_date,'%Y-%m-%d') AS start_date,DATE_FORMAT(c.end_date,'%Y-%m-%d') AS end_date,DATE_FORMAT(c.cancellation_date,'%Y-%m-%d') AS cancellation_date,DATE_FORMAT(c.termination_date,'%Y-%m-%d') AS termination_date,cu.customer_number,cu.first_name,cu.last_name,q.quote_number FROM contracts c JOIN customers cu ON cu.id=c.customer_id LEFT JOIN quotes q ON q.id=c.quote_id WHERE c.id=?",[contractId]);
+            if (!contract) return sendJson(response,404,{message:"Vertrag nicht gefunden."});
+            const cutoff = [contract.end_date,contract.termination_date].filter(Boolean).sort()[0] || null;
+            const [email,[documents],[schedules],[orders]] = await Promise.all([
+                contractEmailHistory(adminPool,contractId,contract.status),
+                adminPool.execute("SELECT id,file_name,visibility FROM documents WHERE contract_id=? AND customer_id=? ORDER BY id DESC",[contractId,contract.customer_id]),
+                adminPool.execute("SELECT id,active,DATE_FORMAT(start_date,'%Y-%m-%d') AS start_date,DATE_FORMAT(end_date,'%Y-%m-%d') AS end_date FROM recurring_schedules WHERE contract_id=?",[contractId]),
+                cutoff ? adminPool.execute("SELECT id,order_number FROM orders WHERE contract_id=? AND status NOT IN ('STORNIERT','ERLEDIGT') AND planned_start>=DATE_ADD(?, INTERVAL 1 DAY) ORDER BY planned_start,id",[contractId,cutoff]) : Promise.resolve([[]])
+            ]);
+            const schedule = schedules[0] || null;
+            const scheduleConflict = Boolean(schedule && (schedule.start_date<contract.start_date || (cutoff && (!schedule.end_date || schedule.end_date>cutoff))));
+            return sendJson(response,200,{contract,email,documents,schedule,scheduleConflict,ordersBeyondEnd:orders});
+        }
+        if (!contractId && request.method === "GET") {
+            const status=searchParams.get("status")||"all", schedule=searchParams.get("schedule")||"all";
+            const search=String(searchParams.get("search")||"").trim().slice(0,100);
+            const page=Math.max(1,Math.min(10000,parseInt(searchParams.get("page"),10)||1)),pageSize=searchParams.has("page")?25:100;
+            if ((status!=="all" && !contractStatuses.has(status)) || !["all","active","inactive","missing","incomplete"].includes(schedule)) {
+                return sendJson(response,400,{message:"Ungültiger Vertragsfilter."});
+            }
+            const where=[],values=[];
+            if(status!=="all"){where.push("co.status=?");values.push(status);}
+            if(search){
+                where.push("(co.contract_number LIKE ? OR co.external_contract_number LIKE ? OR co.service_type LIKE ? OR cu.first_name LIKE ? OR cu.last_name LIKE ? OR cu.customer_number LIKE ? OR CONCAT(cu.first_name,' ',cu.last_name) LIKE ?)");
+                values.push(...Array(7).fill("%"+search+"%"));
+            }
+            if(schedule==="active") where.push("s.active=1");
+            if(schedule==="inactive") where.push("s.active=0");
+            if(schedule==="missing") where.push("s.id IS NULL");
+            if(schedule==="incomplete") where.push("(co.historical_registration=1 AND co.external_contract_number IS NULL OR co.payment_interval IS NULL OR NOT EXISTS(SELECT 1 FROM documents d WHERE d.contract_id=co.id AND d.customer_id=co.customer_id))");
+            const clause=where.length?" WHERE "+where.join(" AND "):"";
+            const join="FROM contracts co JOIN customers cu ON cu.id=co.customer_id LEFT JOIN recurring_schedules s ON s.contract_id=co.id";
+            const [[count]]=await adminPool.execute(`SELECT COUNT(*) AS total ${join}${clause}`,values);
+            const [rows]=await adminPool.execute(`SELECT co.id,co.contract_number,co.external_contract_number,co.historical_registration,co.service_type,co.interval_type,co.payment_interval,
+                DATE_FORMAT(co.start_date,'%Y-%m-%d') AS start_date,DATE_FORMAT(co.end_date,'%Y-%m-%d') AS end_date,
+                DATE_FORMAT(co.termination_date,'%Y-%m-%d') AS termination_date,co.status,co.gross_amount,co.created_at,cu.first_name,cu.last_name,cu.customer_number,
+                s.id AS schedule_id,s.active AS schedule_active,
+                (SELECT DATE_FORMAT(MIN(o.planned_start),'%Y-%m-%d %H:%i') FROM orders o WHERE o.contract_id=co.id AND o.status NOT IN ('STORNIERT','ERLEDIGT') AND o.planned_start>=?) AS next_cleaning,
+                EXISTS(SELECT 1 FROM documents d WHERE d.contract_id=co.id AND d.customer_id=co.customer_id) AS has_documents
+                ${join}${clause} ORDER BY co.created_at DESC,co.id DESC LIMIT ? OFFSET ?`,[berlinWallTime(new Date()).replace("T"," "),...values,pageSize,(page-1)*pageSize]);
+            return sendJson(response,200,{rows,total:Number(count.total),page,pageSize});
+        }
         if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
-        if (request.method === "DELETE") { const [result]=await adminPool.execute("UPDATE contracts SET status='BEENDET' WHERE id=?",[contractId]);return result.affectedRows?sendJson(response,200,{message:"Vertrag beendet."}):sendJson(response,404,{message:"Vertrag nicht gefunden."}); }
+        if (request.method === "DELETE") {
+            const connection = await adminPool.getConnection();
+            try {
+                await connection.beginTransaction();
+                const [[contract]] = await connection.execute("SELECT status FROM contracts WHERE id=? FOR UPDATE",[contractId]);
+                if (!contract || contract.status==="ENTWURF") return sendJson(response,404,{message:"Vertrag nicht gefunden."});
+                const [[schedule]] = await connection.execute("SELECT id FROM recurring_schedules WHERE contract_id=? AND active=1",[contractId]);
+                if (schedule) return sendJson(response,409,{message:"Beenden Sie den Vertrag im Formular und bestätigen Sie die Auswirkungen auf künftige Einsätze."});
+                await connection.execute("UPDATE contracts SET status='BEENDET' WHERE id=?",[contractId]);
+                await auditEvent(connection,"ADMIN",null,"CONTRACT_STATUS_CHANGED","CONTRACT",contractId,{status:"BEENDET"});
+                await connection.commit();
+                return sendJson(response,200,{message:"Vertrag beendet."});
+            } finally {
+                try { await connection.rollback(); } finally { connection.release(); }
+            }
+        }
         if (!['POST','PATCH'].includes(request.method)) return sendJson(response,405,{message:"Methode nicht erlaubt."});
         let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Vertragsdaten."})};const customerId=Number(body.customer_id),quoteIdValue=body.quote_id==null||body.quote_id===""?null:Number(body.quote_id),startDate=readText(body.start_date,10),endDate=readText(body.end_date,10,{optional:true}),serviceDescription=readText(body.service_description,8000,{multiline:true}),serviceType=readText(body.service_type,160),interval=readText(body.interval_type||"INDIVIDUELL",32),details=readText(body.interval_details,255,{optional:true}),payment=readText(body.payment_interval,80,{optional:true}),status=readText(body.status||"ENTWURF",20),notes=readText(body.internal_notes,8000,{optional:true,multiline:true}),notice=body.cancellation_notice_days==null||body.cancellation_notice_days===""?null:Number(body.cancellation_notice_days),taxRate=money(body.tax_rate,{allowEmpty:false}),net=money(body.net_amount,{allowEmpty:false});
-        if(!Number.isSafeInteger(customerId)||customerId<1||quoteIdValue!==null&&(!Number.isSafeInteger(quoteIdValue)||quoteIdValue<1)||!isIsoDate(startDate)||(endDate&&!isIsoDate(endDate))||(endDate&&endDate<startDate)||!serviceDescription||!serviceType||!contractIntervals.has(interval)||!contractStatuses.has(status)||!Number.isSafeInteger(notice)&&notice!==null||notice!==null&&(notice<0||notice>3650)||taxRate===null||taxRate>100||net===null)return sendJson(response,400,{message:"Bitte prüfen Sie die Vertragsdaten."});
+        if(!Number.isSafeInteger(customerId)||customerId<1||quoteIdValue!==null&&(!Number.isSafeInteger(quoteIdValue)||quoteIdValue<1)||!reportIsIsoDate(startDate)||(endDate&&!reportIsIsoDate(endDate))||(endDate&&endDate<startDate)||!serviceDescription||!serviceType||!contractIntervals.has(interval)||!contractStatuses.has(status)||!Number.isSafeInteger(notice)&&notice!==null||notice!==null&&(notice<0||notice>3650)||taxRate===null||taxRate>100||net===null)return sendJson(response,400,{message:"Bitte prüfen Sie die Vertragsdaten."});
+        if (payment===null || details===null || endDate===null || (body.payment_interval!=null && typeof body.payment_interval!=="string")) return sendJson(response,400,{message:"Bitte prüfen Sie das Abrechnungsintervall, die Reinigungsfrequenz und das Vertragsende."});
         const tax=Math.round(net*taxRate)/100,gross=Math.round((net+tax)*100)/100;const [customers]=await adminPool.execute("SELECT id FROM customers WHERE id=?",[customerId]);if(!customers[0])return sendJson(response,404,{message:"Kunde nicht gefunden."});if(quoteIdValue!==null){const [quotes]=await adminPool.execute("SELECT id,customer_id FROM quotes WHERE id=?",[quoteIdValue]);if(!quotes[0])return sendJson(response,404,{message:"Angebot nicht gefunden."});if(Number(quotes[0].customer_id)!==customerId)return sendJson(response,400,{message:"Das Angebot gehört zu einem anderen Kunden."});}
-        const fields=[customerId,quoteIdValue,startDate,endDate||null,notice,readText(body.cancellation_date,10,{optional:true})||null,readText(body.termination_date,10,{optional:true})||null,readText(body.termination_note,8000,{optional:true,multiline:true})||null,serviceDescription,serviceType,interval,details||null,net,taxRate,tax,gross,payment||null,status,notes||null];const connection=await adminPool.getConnection();try{await connection.beginTransaction();let id=contractId,number;if(request.method==='POST'){const [result]=await connection.execute("INSERT INTO contracts (customer_id,quote_id,start_date,end_date,cancellation_notice_days,cancellation_date,termination_date,termination_note,service_description,service_type,interval_type,interval_details,net_amount,tax_rate,tax_amount,gross_amount,payment_interval,status,internal_notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",fields);id=result.insertId;number=await createDocumentNumber(connection,"contracts","VER",id);}else{const [result]=await connection.execute("UPDATE contracts SET customer_id=?,quote_id=?,start_date=?,end_date=?,cancellation_notice_days=?,cancellation_date=?,termination_date=?,termination_note=?,service_description=?,service_type=?,interval_type=?,interval_details=?,net_amount=?,tax_rate=?,tax_amount=?,gross_amount=?,payment_interval=?,status=?,internal_notes=? WHERE id=?",[...fields,id]);if(!result.affectedRows){await connection.rollback();return sendJson(response,404,{message:"Vertrag nicht gefunden."});}}await auditEvent(connection,"ADMIN",null,"CONTRACT_STATUS_CHANGED","CONTRACT",id,{status,created:request.method==='POST'});await connection.commit();return sendJson(response,request.method==='POST'?201:200,{id,contractNumber:number,message:request.method==='POST'?"Vertrag erstellt.":"Vertrag gespeichert."});}catch(error){await connection.rollback();throw error;}finally{connection.release();}
+        const activateAndNotify = body.notify_on_activation === true;
+        if (activateAndNotify && (!contractId || request.method !== "PATCH" || status !== "AKTIV")) {
+            return sendJson(response,409,{message:"Speichern Sie zuerst einen Vertragsentwurf."});
+        }
+        const registrationKey = body.registration_key == null ? null : readText(body.registration_key,36);
+        if (registrationKey !== null && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(registrationKey || "")) return sendJson(response,400,{message:"Ungültige Registrierungskennung."});
+        const fields=[customerId,quoteIdValue,startDate,endDate||null,notice,serviceDescription,serviceType,interval,details||null,net,taxRate,tax,gross,payment||null,status,notes||null];
+        const connection = await adminPool.getConnection();
+        let id = contractId, number, delivery;
+        try {
+            await connection.beginTransaction();
+            const [[previous]] = contractId
+                ? await connection.execute("SELECT status,contract_number,customer_id,historical_registration,external_contract_number,DATE_FORMAT(start_date,'%Y-%m-%d') AS start_date,DATE_FORMAT(end_date,'%Y-%m-%d') AS end_date,DATE_FORMAT(cancellation_date,'%Y-%m-%d') AS cancellation_date,DATE_FORMAT(termination_date,'%Y-%m-%d') AS termination_date,termination_note FROM contracts WHERE id=? FOR UPDATE", [contractId])
+                : [[]];
+            if (contractId && !previous) {
+                await connection.rollback();
+                return sendJson(response,404,{message:"Vertrag nicht gefunden."});
+            }
+            const externalNumber = body.external_contract_number === undefined ? previous?.external_contract_number : readText(body.external_contract_number,80,{optional:true});
+            const cancellationDate = body.cancellation_date === undefined ? previous?.cancellation_date : readText(body.cancellation_date,10,{optional:true});
+            const terminationDate = body.termination_date === undefined ? previous?.termination_date : readText(body.termination_date,10,{optional:true});
+            const terminationNote = body.termination_note === undefined ? previous?.termination_note : readText(body.termination_note,8000,{optional:true,multiline:true});
+            const historical = Boolean(previous?.historical_registration || body.historical_registration === true);
+            const invalidLifecycleField = Object.entries({external_contract_number:externalNumber,cancellation_date:cancellationDate,termination_date:terminationDate,termination_note:terminationNote})
+                .some(([key,value])=>body[key]!=null && (typeof body[key]!=="string" || value===null));
+            if (invalidLifecycleField) {
+                await connection.rollback();
+                return sendJson(response,400,{message:"Bitte prüfen Sie Vertragsnummer und Kündigungsdaten."});
+            }
+            if ((status==="GEKUENDIGT" && previous?.status!==status && !terminationDate) || (cancellationDate && !reportIsIsoDate(cancellationDate)) || (terminationDate && (!reportIsIsoDate(terminationDate) || terminationDate<startDate || (cancellationDate && terminationDate<cancellationDate)))) {
+                await connection.rollback();
+                return sendJson(response,400,{message:"Bitte prüfen Sie Kündigungseingang und wirksames Vertragsende."});
+            }
+            if (previous && Number(previous.customer_id) !== customerId) {
+                const [[linked]] = await connection.execute("SELECT id FROM documents WHERE contract_id=? LIMIT 1",[id]);
+                if (linked || activateAndNotify || isPublishedCommercialStatus(previous.status) || (await contractEmailHistory(connection,id,previous.status)).status!=="NONE") {
+                    await connection.rollback();
+                    return sendJson(response,409,{message:"Die Kundenzuordnung dieses Vertrags kann hier nicht geändert werden."});
+                }
+            }
+            if (!historical && !isPublishedCommercialStatus(previous?.status) && isPublishedCommercialStatus(status) && status !== "AKTIV") {
+                await connection.rollback();
+                return sendJson(response,409,{message:"Ein Vertragsentwurf muss zuerst aktiviert werden."});
+            }
+            const scheduleChanged = previous && (previous.start_date!==startDate || (previous.end_date||null)!==(endDate||null) || (previous.termination_date||null)!==(terminationDate||null) || previous.status!==status);
+            if (scheduleChanged && body.confirm_schedule_change !== true) {
+                const [[schedule]] = await connection.execute("SELECT id FROM recurring_schedules WHERE contract_id=? AND active=1",[id]);
+                if (schedule) {
+                    await connection.rollback();
+                    return sendJson(response,409,{message:"Bitte bestätigen Sie die Auswirkungen auf künftige Einsätze."});
+                }
+            }
+            const publishing = !historical && status === "AKTIV" && !isPublishedCommercialStatus(previous?.status);
+            if (activateAndNotify && publishing && startDate >= reportBerlinDate()) {
+                const [[history]] = await connection.execute(
+                    "SELECT id FROM audit_logs WHERE entity_type='CONTRACT' AND entity_id=? AND (action='CONTRACT_EMAIL_ATTEMPTED' OR (action='CONTRACT_STATUS_CHANGED' AND JSON_UNQUOTE(JSON_EXTRACT(metadata,'$.status')) IN ('AKTIV','PAUSIERT','GEKUENDIGT','ABGELAUFEN','BEENDET'))) LIMIT 1",
+                    [id]
+                );
+                if (!history) {
+                    const [[customer]] = await connection.execute("SELECT first_name,last_name,email FROM customers WHERE id=?",[customerId]);
+                    delivery = {email:customer.email,name:[customer.first_name,customer.last_name].filter(Boolean).join(" "),number:previous.contract_number,startDate};
+                    await auditEvent(connection,"ADMIN",null,"CONTRACT_EMAIL_ATTEMPTED","CONTRACT",id);
+                }
+            }
+            const lifecycle = [externalNumber||null,historical,cancellationDate||null,terminationDate||null,terminationNote||null];
+            if (request.method === "POST") {
+                const [result] = await connection.execute("INSERT INTO contracts (customer_id,quote_id,start_date,end_date,cancellation_notice_days,service_description,service_type,interval_type,interval_details,net_amount,tax_rate,tax_amount,gross_amount,payment_interval,status,internal_notes,external_contract_number,historical_registration,cancellation_date,termination_date,termination_note,registration_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",[...fields,...lifecycle,registrationKey]);
+                id = result.insertId;
+                number = await createDocumentNumber(connection,"contracts","VER",id);
+            } else {
+                const [result] = await connection.execute("UPDATE contracts SET customer_id=?,quote_id=?,start_date=?,end_date=?,cancellation_notice_days=?,service_description=?,service_type=?,interval_type=?,interval_details=?,net_amount=?,tax_rate=?,tax_amount=?,gross_amount=?,payment_interval=?,status=?,internal_notes=?,external_contract_number=?,historical_registration=?,cancellation_date=?,termination_date=?,termination_note=? WHERE id=?",[...fields,...lifecycle,id]);
+                if (!result.affectedRows) {
+                    await connection.rollback();
+                    return sendJson(response,404,{message:"Vertrag nicht gefunden."});
+                }
+            }
+            await auditEvent(connection,"ADMIN",null,"CONTRACT_STATUS_CHANGED","CONTRACT",id,{status,created:request.method==="POST",historical,cancellationRecorded:Boolean(cancellationDate||terminationDate||terminationNote)});
+            if (publishing) await notifyCustomer(connection,customerId,"CONTRACT","Vertrag verfügbar","Ihr Vertrag ist im Kundenportal verfügbar.","CONTRACT",id);
+            await connection.commit();
+        } catch (error) {
+            await connection.rollback();
+            if (error.code==="ER_DUP_ENTRY") return sendJson(response,409,{message:"Dieser Vertrag ist bereits erfasst."});
+            throw error;
+        } finally { connection.release(); }
+
+        const emailDelivery = delivery ? await deliverContractEmail(id,delivery) : undefined;
+        const message = request.method === "POST" ? "Vertrag erstellt."
+            : emailDelivery ? "Vertrag gespeichert. "+contractEmailResultMessage(emailDelivery)
+            : activateAndNotify && startDate < reportBerlinDate() ? "Vertrag gespeichert. Für den rückdatierten Vertrag wurde keine E-Mail gesendet."
+            : "Vertrag gespeichert.";
+        return sendJson(response,request.method==="POST"?201:200,{id,contractNumber:number,emailDelivery,message});
     }
     return sendJson(response,404,{message:"API-Endpunkt nicht gefunden."});
 }
@@ -1986,10 +2958,10 @@ function invoicePayload(body) {
 }
 
 async function customerInvoiceSnapshot(connection, customerId) {
-    const [rows] = await connection.execute("SELECT customer_number,first_name,last_name,address,postal_code,city FROM customers WHERE id=?", [customerId]);
+    const [rows] = await connection.execute("SELECT customer_number,first_name,last_name,company_name,COALESCE(billing_address,address) AS address,COALESCE(billing_postal_code,postal_code) AS postal_code,COALESCE(billing_city,city) AS city FROM customers WHERE id=?", [customerId]);
     const customer = rows[0];
     if (!customer) return null;
-    return { number: customer.customer_number || null, name: `${customer.first_name} ${customer.last_name}`.trim(), address: customer.address || null, postalCode: customer.postal_code || null, city: customer.city || null };
+    return { number: customer.customer_number || null, name: customer.company_name || (customer.first_name+" "+customer.last_name).trim(), address: customer.address || null, postalCode: customer.postal_code || null, city: customer.city || null };
 }
 
 async function recalculateInvoice(connection, invoiceId) {
@@ -1999,7 +2971,7 @@ async function recalculateInvoice(connection, invoiceId) {
     if (!invoice) return null;
     const gross = Number(items.gross_amount || 0), paid = Math.min(Number(payments.paid_amount || 0), gross), outstanding = Math.max(0, Math.round((gross - paid) * 100) / 100);
     let status = invoice.status;
-    if (status !== "STORNIERT") {
+    if (status !== "STORNIERT" && status !== "ENTWURF") {
         if (gross > 0 && paid >= gross) status = "BEZAHLT";
         else if (paid > 0) status = "TEILBEZAHLT";
         else if (status !== "ENTWURF" && String(invoice.due_date).slice(0, 10) < new Date().toISOString().slice(0, 10)) status = "ÜBERFÄLLIG";
@@ -2030,14 +3002,17 @@ async function handleAdminInvoices(request, response, pathname, searchParams) {
             await connection.beginTransaction();
             const [orders] = await connection.execute("SELECT * FROM orders WHERE id=? FOR UPDATE", [orderId]); const order = orders[0];
             if (!order) { await connection.rollback(); return sendJson(response, 404, { message: "Auftrag nicht gefunden." }); }
-            const [existing] = await connection.execute("SELECT id,invoice_number FROM invoices WHERE order_id=?", [orderId]);
-            if (existing[0]) { await connection.rollback(); return sendJson(response, 409, { message: `Für diesen Auftrag existiert bereits die Rechnung ${existing[0].invoice_number}.` }); }
+            const billing = await orderBillingState(connection, order);
+            if (!billing.eligible) {
+                await connection.rollback();
+                return sendJson(response, 409, { message: billing.invoice ? "Für diesen Auftrag existiert bereits eine Rechnung." : billing.reason, invoiceId: billing.invoice?.id });
+            }
             const snapshot = await customerInvoiceSnapshot(connection, order.customer_id); if (!snapshot) { await connection.rollback(); return sendJson(response, 404, { message: "Kunde nicht gefunden." }); }
             const today = new Date().toISOString().slice(0, 10), due = new Date(Date.now() + 14 * 86400000).toISOString().slice(0, 10);
             const [created] = await connection.execute("INSERT INTO invoices (customer_id,order_id,sales_quote_id,contract_id,customer_number_snapshot,customer_name_snapshot,billing_address_snapshot,billing_postal_code_snapshot,billing_city_snapshot,invoice_date,service_period_from,service_period_to,due_date,status,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [order.customer_id,order.id,order.sales_quote_id || null,order.contract_id || null,snapshot.number,snapshot.name,snapshot.address,snapshot.postalCode,snapshot.city,today,order.preferred_date || null,order.preferred_date || null,due,"ENTWURF",`Aus Auftrag ${order.order_number} erstellt.`]);
             const id = created.insertId, net = Number(order.price_net_snapshot || 0), tax = Number(order.price_tax_snapshot || 0), gross = Number(order.price_gross_snapshot || 0), taxRate = net > 0 ? Math.round((tax / net) * 10000) / 100 : 0;
             await connection.execute("INSERT INTO invoice_items (invoice_id,sort_order,title,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?)", [id,1,order.title,1,"Pauschale",net,0,net,taxRate,tax,gross]);
-            const number = await createInvoiceNumber(connection, id); const totals = await recalculateInvoice(connection, id); await auditEvent(connection,"ADMIN",null,"INVOICE_CREATED","INVOICE",id,{from_order:order.id}); await notifyCustomer(connection,order.customer_id,"INVOICE","Rechnung erstellt",`Ihre Rechnung ${number} wurde erstellt.`,`INVOICE`,id); await connection.commit();
+            const number = await createInvoiceNumber(connection, id); const totals = await recalculateInvoice(connection, id); await auditEvent(connection,"ADMIN",null,"INVOICE_CREATED","INVOICE",id,{from_order:order.id}); await connection.commit();
             return sendJson(response, 201, { id, invoiceNumber: number, totals, message: "Rechnungsentwurf aus Auftrag erstellt." });
         } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
     }
@@ -2055,7 +3030,7 @@ async function handleAdminInvoices(request, response, pathname, searchParams) {
             await connection.beginTransaction(); const [[invoice]] = await connection.execute("SELECT id,status,gross_amount FROM invoices WHERE id=? FOR UPDATE", [invoiceId]);
             if (!invoice) { await connection.rollback(); return sendJson(response, 404, { message: "Rechnung nicht gefunden." }); }
             if (resource === "items" && invoice.status !== "ENTWURF") { await connection.rollback(); return sendJson(response, 409, { message: "Positionen können nur im Entwurf geändert werden." }); }
-            if (resource === "payments" && invoice.status === "STORNIERT") { await connection.rollback(); return sendJson(response, 409, { message: "Für stornierte Rechnungen sind keine Zahlungen möglich." }); }
+            if (resource === "payments" && !isPublishedCommercialStatus(invoice.status)) { await connection.rollback(); return sendJson(response, 409, { message: "Zahlungen sind nur für veröffentlichte Rechnungen möglich." }); }
             if (request.method === "DELETE") {
                 if (!resourceId) { await connection.rollback(); return sendJson(response, 400, { message: "Eintrag fehlt." }); }
                 const [result] = await connection.execute(`DELETE FROM ${resource === "items" ? "invoice_items" : "invoice_payments"} WHERE id=? AND invoice_id=?`, [resourceId, invoiceId]);
@@ -2099,10 +3074,11 @@ async function handleAdminInvoices(request, response, pathname, searchParams) {
     }
     if (!["POST","PATCH"].includes(request.method)) return sendJson(response,405,{message:"Methode nicht erlaubt."});
     let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Rechnungsdaten."})}; const data=invoicePayload(body); if(!data)return sendJson(response,400,{message:"Bitte prüfen Sie die Rechnungsdaten."});
-    const connection=await adminPool.getConnection(); try { await connection.beginTransaction(); if(request.method==="PATCH"){const [[existing]] = await connection.execute("SELECT status FROM invoices WHERE id=? FOR UPDATE",[invoiceId]);if(!existing){await connection.rollback();return sendJson(response,404,{message:"Rechnung nicht gefunden."})}if(existing.status!=="ENTWURF"){await connection.rollback();return sendJson(response,409,{message:"Ausgestellte Rechnungen können nicht mehr geändert werden."})}} const snapshot=await customerInvoiceSnapshot(connection,data.customerId); if(!snapshot){await connection.rollback();return sendJson(response,404,{message:"Kunde nicht gefunden."})}; if(data.orderId!==null){const [orders]=await connection.execute("SELECT id,customer_id FROM orders WHERE id=?",[data.orderId]);if(!orders[0]||Number(orders[0].customer_id)!==data.customerId){await connection.rollback();return sendJson(response,400,{message:"Der Auftrag gehört nicht zu diesem Kunden."})}} const fields=[data.customerId,data.orderId,data.quoteId,data.contractId,snapshot.number,snapshot.name,snapshot.address,snapshot.postalCode,snapshot.city,data.invoiceDate,data.periodFrom,data.periodTo,data.dueDate,data.status,data.notes]; let id=invoiceId,number;
+    const connection=await adminPool.getConnection(); try { await connection.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); await connection.beginTransaction(); let existing; if(request.method==="PATCH"){[[existing]] = await connection.execute("SELECT status,order_id,sales_quote_id,contract_id,invoice_number FROM invoices WHERE id=? FOR UPDATE",[invoiceId]);if(!existing){await connection.rollback();return sendJson(response,404,{message:"Rechnung nicht gefunden."})}if(existing.status!=="ENTWURF"){await connection.rollback();return sendJson(response,409,{message:"Ausgestellte Rechnungen können nicht mehr geändert werden."})}} const snapshot=await customerInvoiceSnapshot(connection,data.customerId); if(!snapshot){await connection.rollback();return sendJson(response,404,{message:"Kunde nicht gefunden."})}; if(data.orderId!==null){const [[order]]=await connection.execute("SELECT id,customer_id,status,required_crew_size FROM orders WHERE id=? FOR UPDATE",[data.orderId]);if(!order||Number(order.customer_id)!==data.customerId){await connection.rollback();return sendJson(response,400,{message:"Der Auftrag gehört nicht zu diesem Kunden."})}if(Number(existing?.order_id)!==data.orderId || isPublishedCommercialStatus(data.status)){const billing=await orderBillingState(connection,order,{invoiceId:invoiceId||null});if(!billing.eligible){await connection.rollback();return sendJson(response,409,{message:billing.invoice?"Für diesen Auftrag existiert bereits eine Rechnung.":billing.reason});}}} if (existing?.order_id && Number(existing.order_id)!==data.orderId) {await connection.rollback();return sendJson(response,409,{message:"Zur Veröffentlichung muss die Auftragszuordnung erhalten bleiben."});} const fields=[data.customerId,data.orderId,body.sales_quote_id === undefined ? existing?.sales_quote_id ?? null : data.quoteId,body.contract_id === undefined ? existing?.contract_id ?? null : data.contractId,snapshot.number,snapshot.name,snapshot.address,snapshot.postalCode,snapshot.city,data.invoiceDate,data.periodFrom,data.periodTo,data.dueDate,data.status,data.notes]; let id=invoiceId,number=existing?.invoice_number;
         if(request.method==="POST"){const items=Array.isArray(body.items)?body.items:[];if(!items.length){await connection.rollback();return sendJson(response,400,{message:"Mindestens eine Rechnungsposition ist erforderlich."})};const [created]=await connection.execute("INSERT INTO invoices (customer_id,order_id,sales_quote_id,contract_id,customer_number_snapshot,customer_name_snapshot,billing_address_snapshot,billing_postal_code_snapshot,billing_city_snapshot,invoice_date,service_period_from,service_period_to,due_date,status,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",fields);id=created.insertId;number=await createInvoiceNumber(connection,id);for(let index=0;index<items.length;index+=1){const item=invoiceItemPayload(items[index],index+1);if(!item){await connection.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie alle Rechnungspositionen."})}await connection.execute("INSERT INTO invoice_items (invoice_id,sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",[id,item.sortOrder,item.title,item.description,item.quantity,item.unit,item.unitPrice,item.discount,item.net,item.taxRate,item.tax,item.gross])}}
-        else { const [result]=await connection.execute("UPDATE invoices SET customer_id=?,order_id=?,sales_quote_id=?,contract_id=?,customer_number_snapshot=?,customer_name_snapshot=?,billing_address_snapshot=?,billing_postal_code_snapshot=?,billing_city_snapshot=?,invoice_date=?,service_period_from=?,service_period_to=?,due_date=?,status=?,notes=? WHERE id=?",[...fields,id]);if(!result.affectedRows){await connection.rollback();return sendJson(response,404,{message:"Rechnung nicht gefunden."})}if(Array.isArray(body.items)){if(data.status!=="ENTWURF"){await connection.rollback();return sendJson(response,409,{message:"Positionen können nur im Entwurf geändert werden."})}await connection.execute("DELETE FROM invoice_items WHERE invoice_id=?",[id]);if(!body.items.length){await connection.rollback();return sendJson(response,400,{message:"Mindestens eine Rechnungsposition ist erforderlich."})}for(let index=0;index<body.items.length;index+=1){const item=invoiceItemPayload(body.items[index],index+1);if(!item){await connection.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie alle Rechnungspositionen."})}await connection.execute("INSERT INTO invoice_items (invoice_id,sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",[id,item.sortOrder,item.title,item.description,item.quantity,item.unit,item.unitPrice,item.discount,item.net,item.taxRate,item.tax,item.gross])}} }
-        const totals=await recalculateInvoice(connection,id);await auditEvent(connection,"ADMIN",null,request.method==="POST"?"INVOICE_CREATED":"INVOICE_STATUS_CHANGED","INVOICE",id,{status:totals.status,created:request.method==="POST"});if(request.method==="POST"||["AUSGESTELLT","GESENDET"].includes(data.status))await notifyCustomer(connection,data.customerId,"INVOICE","Rechnung aktualisiert",`Ihre Rechnung ${number || ""} wurde ${request.method==="POST"?"erstellt":"aktualisiert"}.`,`INVOICE`,id);await connection.commit();return sendJson(response,request.method==="POST"?201:200,{id,invoiceNumber:number,totals,message:request.method==="POST"?"Rechnung erstellt.":"Rechnung gespeichert."});
+        else { const [result]=await connection.execute("UPDATE invoices SET customer_id=?,order_id=?,sales_quote_id=?,contract_id=?,customer_number_snapshot=?,customer_name_snapshot=?,billing_address_snapshot=?,billing_postal_code_snapshot=?,billing_city_snapshot=?,invoice_date=?,service_period_from=?,service_period_to=?,due_date=?,status=?,notes=? WHERE id=?",[...fields,id]);if(!result.affectedRows){await connection.rollback();return sendJson(response,404,{message:"Rechnung nicht gefunden."})}if(Array.isArray(body.items)){await connection.execute("DELETE FROM invoice_items WHERE invoice_id=?",[id]);if(!body.items.length){await connection.rollback();return sendJson(response,400,{message:"Mindestens eine Rechnungsposition ist erforderlich."})}for(let index=0;index<body.items.length;index+=1){const item=invoiceItemPayload(body.items[index],index+1);if(!item){await connection.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie alle Rechnungspositionen."})}await connection.execute("INSERT INTO invoice_items (invoice_id,sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",[id,item.sortOrder,item.title,item.description,item.quantity,item.unit,item.unitPrice,item.discount,item.net,item.taxRate,item.tax,item.gross])}} }
+        if(isPublishedCommercialStatus(data.status)){const [[line]]=await connection.execute("SELECT id FROM invoice_items WHERE invoice_id=? LIMIT 1",[id]);if(!line){await connection.rollback();return sendJson(response,409,{message:"Mindestens eine Rechnungsposition ist erforderlich."});}}
+        const totals=await recalculateInvoice(connection,id);await auditEvent(connection,"ADMIN",null,request.method==="POST"?"INVOICE_CREATED":"INVOICE_STATUS_CHANGED","INVOICE",id,{status:totals.status,created:request.method==="POST"});if(isPublishedCommercialStatus(data.status))await notifyCustomer(connection,data.customerId,"INVOICE","Rechnung aktualisiert",`Ihre Rechnung ${number || ""} wurde ${request.method==="POST"?"erstellt":"aktualisiert"}.`,`INVOICE`,id);await connection.commit();return sendJson(response,request.method==="POST"?201:200,{id,invoiceNumber:number,totals,message:request.method==="POST"?"Rechnung erstellt.":"Rechnung gespeichert."});
     }catch(error){await connection.rollback();throw error}finally{connection.release()}
 }
 
@@ -2113,6 +3089,10 @@ async function auditEvent(connection, actorType, actorId, action, entityType, en
     if (action === "FINANCIAL_TRANSACTION_CREATED" && metadata?.status === "GEPRUEFT") action = "FINANCIAL_TRANSACTION_APPROVED";
     const safe = metadata && typeof metadata === "object" ? JSON.stringify(metadata).slice(0, 2000) : null;
     await connection.execute("INSERT INTO audit_logs (actor_type,actor_id,action,entity_type,entity_id,metadata) VALUES (?,?,?,?,?,?)", [actorType,actorId || null,action,entityType,entityId || null,safe]);
+}
+
+function isPublishedCommercialStatus(status) {
+    return Boolean(status) && status !== "ENTWURF" && status !== "STORNIERT";
 }
 
 async function notifyCustomer(connection, customerId, type, title, body, entityType, entityId) {
@@ -2197,7 +3177,7 @@ async function validateEmployeeCashPayment(connection, employeeId, body) {
     if (invoiceId !== null) {
         const [[invoice]] = await connection.execute("SELECT id,status,gross_amount,paid_amount FROM invoices WHERE id=? AND customer_id=? AND order_id=?", [invoiceId, customerId, orderId]);
         if (!invoice) return { error: "Die Rechnung gehört nicht zu diesem Kunden und Auftrag.", status: 404 };
-        if (invoice.status === "STORNIERT") return { error: "Für stornierte Rechnungen ist keine Zahlung möglich.", status: 409 };
+        if (!isPublishedCommercialStatus(invoice.status)) return { error: "Zahlungen sind nur für veröffentlichte Rechnungen möglich.", status: 409 };
         if (amount > Number(invoice.gross_amount) - Number(invoice.paid_amount) + 0.0001) return { error: "Der Betrag übersteigt den offenen Rechnungsbetrag.", status: 409 };
     }
     const [[duplicate]] = await connection.execute("SELECT id FROM employee_cash_payments WHERE employee_id=? AND customer_id=? AND order_id=? AND payment_date=? AND amount=? AND status IN ('ERFASST','GEPRUEFT') LIMIT 1", [employeeId, customerId, orderId, paymentDate, amount]);
@@ -2273,8 +3253,8 @@ async function handleAdminFinance(request, response, pathname, searchParams) {
         if (!isIsoDate(from) || !isIsoDate(to) || from > to) return sendJson(response,400,{message:"Ungültiger Zeitraum."});
         const [[totals]] = await adminPool.execute("SELECT COALESCE(SUM(CASE WHEN transaction_type='INCOME' THEN amount ELSE 0 END),0) income,COALESCE(SUM(CASE WHEN transaction_type='EXPENSE' THEN amount ELSE 0 END),0) expenses,COALESCE(SUM(CASE WHEN transaction_type='INCOME' AND payment_method='CASH' THEN amount ELSE 0 END),0) cash,COALESCE(SUM(CASE WHEN transaction_type='INCOME' AND payment_method='BANK' THEN amount ELSE 0 END),0) bank,COALESCE(SUM(CASE WHEN transaction_type='INCOME' AND payment_method='CARD' THEN amount ELSE 0 END),0) card FROM financial_transactions WHERE transaction_date BETWEEN ? AND ? AND status<>'STORNIERT'",[from,to]);
         const [[extra]] = await adminPool.execute("SELECT COALESCE(SUM(CASE WHEN p.status IN ('ERFASST','GEPRUEFT') THEN p.amount ELSE 0 END),0) employee_cash,COALESCE(SUM(CASE WHEN p.status IN ('ERFASST','GEPRUEFT') AND NOT EXISTS(SELECT 1 FROM cash_transfers t WHERE t.employee_id=p.employee_id AND t.status IN ('UEBERGEBEN','GEPRUEFT')) THEN p.amount ELSE 0 END),0) not_transferred FROM employee_cash_payments p WHERE p.payment_date BETWEEN ? AND ?",[from,to]);
-        const [[invoices]] = await adminPool.execute("SELECT COUNT(*) open_invoices,COALESCE(SUM(CASE WHEN due_date<CURDATE() THEN 1 ELSE 0 END),0) overdue_invoices FROM invoices WHERE status NOT IN ('BEZAHLT','STORNIERT') AND outstanding_amount>0");
-        return sendJson(response,200,{period:{from,to},income:Number(totals.income),expenses:Number(totals.expenses),cashflow:Number(totals.income)-Number(totals.expenses),cash:Number(totals.cash),bank:Number(totals.bank),card:Number(totals.card),employee_cash:Number(extra.employee_cash),not_transferred:Number(extra.not_transferred),open_invoices:Number(invoices.open_invoices),overdue_invoices:Number(invoices.overdue_invoices)});
+        const invoices = await getInvoiceReport(adminPool);
+        return sendJson(response,200,{period:{from,to},income:Number(totals.income),expenses:Number(totals.expenses),cashflow:Number(totals.income)-Number(totals.expenses),cash:Number(totals.cash),bank:Number(totals.bank),card:Number(totals.card),employee_cash:Number(extra.employee_cash),not_transferred:Number(extra.not_transferred),open_invoices:invoices.unpaid_count,overdue_invoices:invoices.overdue_count});
     }
     const transactionMatch = pathname.match(/^\/api\/admin\/finance\/transactions(?:\/(\d+))?$/);
     const cashMatch = pathname.match(/^\/api\/admin\/finance\/employee-cash-payments(?:\/(\d+))?$/);
@@ -2298,9 +3278,28 @@ async function handleAdminFinance(request, response, pathname, searchParams) {
 async function saveCommercialDocument(connection, file, data, actorType = "ADMIN", actorId = null) {
     if (!file || file.unsafeName || !file.originalName || !file.buffer?.length || file.buffer.length > EMPLOYEE_MAX_FILE_BYTES) { const e=new Error("invalid_file");e.statusCode=400;throw e; }
     const mime=detectQuoteMime(file.buffer); if (!allowedQuoteMimes.has(mime) || (file.declaredMime && file.declaredMime !== mime)) { const e=new Error("invalid_file_type");e.statusCode=400;throw e; }
-    const stored=crypto.randomUUID(), ext=allowedQuoteMimes.get(mime); await fs.promises.mkdir(PRIVATE_DOCUMENT_UPLOAD_DIR,{recursive:true,mode:0o700}); const filePath=path.join(PRIVATE_DOCUMENT_UPLOAD_DIR,`${stored}${ext}`);
-    await fs.promises.writeFile(filePath,file.buffer,{mode:0o600,flag:"wx"});
-    try { const [r]=await connection.execute("INSERT INTO documents(customer_id,quote_id,contract_id,order_id,invoice_id,document_type,file_name,stored_file_name,storage_path,mime_type,file_size,uploaded_by_type,uploaded_by_id,visibility) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",[data.customerId,data.quoteId,data.contractId,data.orderId,data.invoiceId,data.type,file.originalName,stored,path.join("private-documents",`${stored}${ext}`),mime,file.buffer.length,actorType,actorId,data.visibility]); await auditEvent(connection,actorType,actorId,"DOCUMENT_CREATED","DOCUMENT",r.insertId,{type:data.type,customer_id:data.customerId}); return r.insertId; } catch(e) { await fs.promises.unlink(filePath).catch(()=>{}); throw e; }
+    const stored = crypto.randomUUID();
+    const extension = allowedQuoteMimes.get(mime);
+    const filePath = path.join(PRIVATE_DOCUMENT_UPLOAD_DIR, stored + extension);
+    let operation = "mkdir";
+    try {
+        await fs.promises.mkdir(PRIVATE_DOCUMENT_UPLOAD_DIR, { recursive: true, mode: 0o700 });
+        operation = "write_file";
+        await fs.promises.writeFile(filePath, file.buffer, { mode: 0o600, flag: "wx" });
+    } catch (error) {
+        const code = ["EACCES", "EPERM", "ENOSPC", "EDQUOT", "EROFS", "ENOENT", "ENOTDIR", "EEXIST", "EMFILE", "ENFILE", "EIO"].includes(error.code)
+            ? error.code : "UNKNOWN";
+        console.error(JSON.stringify({
+            event: "DOCUMENT_UPLOAD_STORAGE_ERROR",
+            timestamp: new Date().toISOString(),
+            correlationId: stored,
+            code,
+            operation,
+            storage: "private-documents"
+        }));
+        throw error;
+    }
+    try { const [r]=await connection.execute("INSERT INTO documents(customer_id,quote_id,contract_id,order_id,invoice_id,document_type,file_name,stored_file_name,storage_path,mime_type,file_size,uploaded_by_type,uploaded_by_id,visibility) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",[data.customerId,data.quoteId,data.contractId,data.orderId,data.invoiceId,data.type,file.originalName,stored,path.join("private-documents", stored + extension),mime,file.buffer.length,actorType,actorId,data.visibility]); await auditEvent(connection,actorType,actorId,"DOCUMENT_CREATED","DOCUMENT",r.insertId,{type:data.type,customer_id:data.customerId}); return r.insertId; } catch(e) { await fs.promises.unlink(filePath).catch(()=>{}); throw e; }
 }
 
 function documentPayload(fields) { const value=n=>fields[n] ? Number(fields[n]) : null, type=readText(fields.document_type,40), visibility=readText(fields.visibility||"ADMIN",20); if(!["ANGEBOT","VERTRAG","AUFTRAG","LEISTUNGSNACHWEIS","RECHNUNG","ZAHLUNGSBELEG","VORHER_FOTO","NACHHER_FOTO","SONSTIGES"].includes(type)||!["ADMIN","CUSTOMER","EMPLOYEE"].includes(visibility))return null; const values=["customerId","quoteId","contractId","orderId","invoiceId"].reduce((o,k)=>{o[k]=value(k.replace("Id", "_id"));return o},{});if(Object.values(values).some(v=>v!==null&&(!Number.isSafeInteger(v)||v<1)))return null;return {...values,type,visibility}; }
@@ -2409,7 +3408,16 @@ async function handleAdminServiceReports(request, response, pathname, searchPara
     let body; try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "Ungültige Leistungsnachweis-Daten." }); }
     const connection = await adminPool.getConnection();
     try {
+        await connection.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
         await connection.beginTransaction();
+        if (id) {
+            const [[current]]=await connection.execute("SELECT order_id FROM service_reports WHERE id=?",[id]);
+            if (current) {
+                await connection.execute("SELECT id FROM orders WHERE id=? FOR UPDATE",[current.order_id]);
+                const [[lockedReport]]=await connection.execute("SELECT order_id FROM service_reports WHERE id=? FOR UPDATE",[id]);
+                if (lockedReport?.order_id!==current.order_id) return sendJson(response,409,{message:"Der Leistungsnachweis wurde zwischenzeitlich umgebucht."});
+            }
+        }
         if (!id && request.method === "POST") {
             const data = serviceReportPayload(body); if (!data) { await connection.rollback(); return sendJson(response, 400, { message: "Bitte prüfen Sie die Leistungsdaten." }); }
             const relationship = await serviceReportRelationship(connection, data.orderId, data.assignmentId); if (!relationship) { await connection.rollback(); return sendJson(response, 400, { message: "Auftrag und Einsatz passen nicht zusammen." }); }
@@ -2427,6 +3435,7 @@ async function handleAdminServiceReports(request, response, pathname, searchPara
                 await connection.commit(); return sendJson(response,200,{id,status:"SUBMITTED",message:"Leistungsnachweis eingereicht."});
             }
             const data = serviceReportPayload(body); if (!data) { await connection.rollback(); return sendJson(response, 400, { message: "Bitte prüfen Sie die Leistungsdaten." }); }
+            if (["REVIEWED","SHARED","CUSTOMER_CONFIRMED"].includes(existing.status) && (data.orderId!==Number(existing.order_id) || data.assignmentId!==Number(existing.assignment_id))) { await connection.rollback(); return sendJson(response,409,{message:"Ein geprüfter Leistungsnachweis kann nicht umgebucht werden."}); }
             if (existing.status === "CANCELLED") { await connection.rollback(); return sendJson(response,400,{message:"Stornierte Leistungsnachweise können nicht geändert werden."}); }
             const relationship = await serviceReportRelationship(connection,data.orderId,data.assignmentId); if (!relationship) { await connection.rollback(); return sendJson(response,400,{message:"Auftrag und Einsatz passen nicht zusammen."}); }
             await connection.execute("UPDATE service_reports SET order_id=?,assignment_id=?,customer_id=?,employee_id=?,service_date=?,started_at=?,finished_at=?,summary=?,internal_notes=?,customer_notes=? WHERE id=?",[data.orderId,data.assignmentId,relationship.customer_id,relationship.employee_id,data.serviceDate,data.startedAt,data.finishedAt,data.summary,data.internalNotes,data.customerNotes,id]);
@@ -2454,7 +3463,7 @@ async function handleAdminServiceReports(request, response, pathname, searchPara
             await connection.commit(); return sendJson(response,200,{id,status:"SHARED",message:"Leistungsnachweis für den Kunden freigegeben."});
         }
         await connection.rollback(); return sendJson(response,405,{message:"Methode nicht erlaubt."});
-    } catch (error) { await connection.rollback(); console.error("[service-reports admin] failed:",error.code || "database_error"); return sendJson(response,error.code === "ER_SIGNAL_EXCEPTION" ? 400 : 503,{message:error.code === "ER_SIGNAL_EXCEPTION" ? "Ungültige Leistungsbeziehung." : "Leistungsnachweis konnte nicht gespeichert werden."}); } finally { connection.release(); }
+    } catch (error) { await connection.rollback(); console.error("[service-reports admin] failed:",error.code || "database_error"); return sendJson(response,error.code === "ER_SIGNAL_EXCEPTION" ? 400 : 503,{message:error.code === "ER_SIGNAL_EXCEPTION" ? "Ungültige Leistungsbeziehung." : "Leistungsnachweis konnte nicht gespeichert werden."}); } finally { try {await connection.rollback();} finally {connection.release();} }
 }
 
 const qualityIncidentFields = `qi.*,c.customer_number,c.first_name AS customer_first_name,c.last_name AS customer_last_name,o.order_number,o.title AS order_title,e.employee_number,e.first_name AS assigned_employee_first_name,e.last_name AS assigned_employee_last_name`;
@@ -2480,6 +3489,11 @@ async function qualityForAdmin(connection,id) { const [rows]=await connection.ex
 async function qualityIncompleteActions(connection,id) { const [[row]]=await connection.execute("SELECT COUNT(*) total FROM quality_corrective_actions WHERE incident_id=? AND status NOT IN ('COMPLETED','CANCELLED')",[id]);return Number(row.total)>0; }
 async function createQualityNumber(connection,id) { const number=`QI-${new Date().getFullYear()}-${String(id).padStart(6,"0")}`;await connection.execute("UPDATE quality_incidents SET incident_number=? WHERE id=?",[number,id]);return number; }
 
+async function insertQualityIncident(connection,data) {
+    const[created]=await connection.execute("INSERT INTO quality_incidents (incident_number,customer_id,order_id,assignment_id,service_report_id,created_by_type,created_by_id,assigned_employee_id,category,severity,status,title,description,internal_notes,root_cause,due_date) VALUES (?,?,?,?,?,'ADMIN',NULL,?,?,?,'OPEN',?,?,?,?,?)",[crypto.randomUUID(),data.customerId,data.orderId,data.assignmentId,data.serviceReportId,data.assignedEmployeeId,data.category,data.severity,data.title,data.description,data.internalNotes,data.rootCause,data.dueDate]);const number=await createQualityNumber(connection,created.insertId);await auditEvent(connection,"ADMIN",null,"QUALITY_INCIDENT_CREATED","QUALITY_INCIDENT",created.insertId,{customer_id:data.customerId,order_id:data.orderId,severity:data.severity});if(data.assignedEmployeeId){await auditEvent(connection,"ADMIN",null,"QUALITY_INCIDENT_ASSIGNED","QUALITY_INCIDENT",created.insertId,{assigned_employee_id:data.assignedEmployeeId});await notifyEmployee(connection,data.assignedEmployeeId,"QUALITY_INCIDENT","Qualitätsmeldung zugewiesen",`Die Qualitätsmeldung ${number} wurde Ihnen zugewiesen.`,"QUALITY_INCIDENT",created.insertId);}
+    return {id:created.insertId,number};
+}
+
 async function handleAdminQualityIncidents(request,response,pathname,searchParams) {
     const match=pathname.match(/^\/api\/admin\/quality-incidents(?:\/(\d+)(?:\/(actions)(?:\/(\d+))?|\/(resolve|close))?)?$/),id=match?.[1]?positiveId(match[1]):null,actionResource=match?.[2]||null,actionId=match?.[3]?positiveId(match[3]):null,workflow=match?.[4]||null;
     if(!adminPool)return sendJson(response,503,{message:"Die Datenbankrechte für Qualitätsmeldungen sind nicht eingerichtet."});
@@ -2492,7 +3506,7 @@ async function handleAdminQualityIncidents(request,response,pathname,searchParam
     if(id&&!actionResource&&!workflow&&request.method==="GET"){const incident=await qualityForAdmin(adminPool,id);return incident?sendJson(response,200,{incident}):sendJson(response,404,{message:"Qualitätsmeldung nicht gefunden."});}
     if(!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});let body;try{body=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Qualitätsdaten."})};const c=await adminPool.getConnection();
     try{await c.beginTransaction();
-        if(!id&&request.method==="POST"){const data=qualityIncidentData(body),invalid=!data;if(invalid){await c.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie die Qualitätsdaten."})}const relation=await qualityRelations(c,data);if(relation.error){await c.rollback();return sendJson(response,relation.status,{message:relation.error})}const[created]=await c.execute("INSERT INTO quality_incidents (incident_number,customer_id,order_id,assignment_id,service_report_id,created_by_type,created_by_id,assigned_employee_id,category,severity,status,title,description,internal_notes,root_cause,due_date) VALUES (?,?,?,?,?,'ADMIN',NULL,?,?,?,'OPEN',?,?,?,?,?)",[crypto.randomUUID(),data.customerId,data.orderId,data.assignmentId,data.serviceReportId,data.assignedEmployeeId,data.category,data.severity,data.title,data.description,data.internalNotes,data.rootCause,data.dueDate]);const number=await createQualityNumber(c,created.insertId);await auditEvent(c,"ADMIN",null,"QUALITY_INCIDENT_CREATED","QUALITY_INCIDENT",created.insertId,{customer_id:data.customerId,order_id:data.orderId,severity:data.severity});if(data.assignedEmployeeId){await auditEvent(c,"ADMIN",null,"QUALITY_INCIDENT_ASSIGNED","QUALITY_INCIDENT",created.insertId,{assigned_employee_id:data.assignedEmployeeId});await notifyEmployee(c,data.assignedEmployeeId,"QUALITY_INCIDENT","Qualitätsmeldung zugewiesen",`Die Qualitätsmeldung ${number} wurde Ihnen zugewiesen.`,"QUALITY_INCIDENT",created.insertId);}await c.commit();return sendJson(response,201,{id:created.insertId,incidentNumber:number,status:"OPEN",message:"Qualitätsmeldung erstellt."});}
+        if(!id&&request.method==="POST"){const data=qualityIncidentData(body),invalid=!data;if(invalid){await c.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie die Qualitätsdaten."})}const relation=await qualityRelations(c,data);if(relation.error){await c.rollback();return sendJson(response,relation.status,{message:relation.error})}const created=await insertQualityIncident(c,data);await c.commit();return sendJson(response,201,{id:created.id,incidentNumber:created.number,status:"OPEN",message:"Qualitätsmeldung erstellt."});}
         const incident=await qualityForAdmin(c,id);if(!incident){await c.rollback();return sendJson(response,404,{message:"Qualitätsmeldung nicht gefunden."})}
         if(!actionResource&&!workflow&&request.method==="PATCH"){if(["RESOLVED","CLOSED"].includes(body.status)){await c.rollback();return sendJson(response,400,{message:"Für Lösung und Abschluss verwenden Sie den vorgesehenen Workflow."})}const data=qualityIncidentData(body);if(!data||["CLOSED","CANCELLED"].includes(incident.status)){await c.rollback();return sendJson(response,data?409:400,{message:data?"Die Qualitätsmeldung kann nicht geändert werden.":"Bitte prüfen Sie die Qualitätsdaten."})}const relation=await qualityRelations(c,data);if(relation.error){await c.rollback();return sendJson(response,relation.status,{message:relation.error})}const next=body.status?readText(body.status,24):incident.status;if(!qualityIncidentStatuses.has(next)||!qualityTransition(incident.status,next)){await c.rollback();return sendJson(response,400,{message:"Ungültiger Statusübergang."})}await c.execute("UPDATE quality_incidents SET customer_id=?,order_id=?,assignment_id=?,service_report_id=?,assigned_employee_id=?,category=?,severity=?,status=?,title=?,description=?,internal_notes=?,root_cause=?,due_date=? WHERE id=?",[data.customerId,data.orderId,data.assignmentId,data.serviceReportId,data.assignedEmployeeId,data.category,data.severity,next,data.title,data.description,data.internalNotes,data.rootCause,data.dueDate,id]);const event=Number(incident.assigned_employee_id)!==Number(data.assignedEmployeeId)?"QUALITY_INCIDENT_ASSIGNED":"QUALITY_INCIDENT_UPDATED";await auditEvent(c,"ADMIN",null,event,"QUALITY_INCIDENT",id,{status:next,assigned_employee_id:data.assignedEmployeeId});if(data.assignedEmployeeId&&Number(incident.assigned_employee_id)!==Number(data.assignedEmployeeId))await notifyEmployee(c,data.assignedEmployeeId,"QUALITY_INCIDENT","Qualitätsmeldung zugewiesen",`Die Qualitätsmeldung ${incident.incident_number} wurde Ihnen zugewiesen.`,"QUALITY_INCIDENT",id);await c.commit();return sendJson(response,200,{id,status:next,message:"Qualitätsmeldung gespeichert."});}
         if(actionResource&&!actionId&&request.method==="POST"){if(["RESOLVED","CLOSED","CANCELLED"].includes(incident.status)){await c.rollback();return sendJson(response,409,{message:"Für diese Qualitätsmeldung können keine Maßnahmen angelegt werden."})}const data=qualityActionData(body);if(!data){await c.rollback();return sendJson(response,400,{message:"Bitte prüfen Sie die Maßnahmen-Daten."})}if(data.assignedEmployeeId){const[[employee]]=await c.execute("SELECT id FROM employees WHERE id=? AND status='ACTIVE'",[data.assignedEmployeeId]);if(!employee){await c.rollback();return sendJson(response,404,{message:"Aktiver Mitarbeiter nicht gefunden."})}}const[created]=await c.execute("INSERT INTO quality_corrective_actions (incident_id,assigned_employee_id,title,description,due_date,status) VALUES (?,?,?,?,?,?)",[id,data.assignedEmployeeId,data.title,data.description,data.dueDate,data.status]);await auditEvent(c,"ADMIN",null,"QUALITY_ACTION_CREATED","QUALITY_CORRECTIVE_ACTION",created.insertId,{incident_id:id,assigned_employee_id:data.assignedEmployeeId});if(data.assignedEmployeeId)await notifyEmployee(c,data.assignedEmployeeId,"QUALITY_ACTION","Korrekturmaßnahme zugewiesen",`Für ${incident.incident_number} wurde Ihnen eine Maßnahme zugewiesen.`,"QUALITY_CORRECTIVE_ACTION",created.insertId);await c.commit();return sendJson(response,201,{id:created.insertId,message:"Korrekturmaßnahme erstellt."});}
@@ -2678,6 +3692,209 @@ async function handleEmployeeNotifications(request,response,pathname,session){
     return result.affectedRows?sendJson(response,200,{message:"Benachrichtigung gelesen."}):sendJson(response,404,{message:"Benachrichtigung nicht gefunden."});
 }
 
+async function handleAdminAttendance(request, response, pathname, searchParams) {
+    if (!adminPool) return sendJson(response, 503, { message: "Die Anwesenheitsdaten sind derzeit nicht verfügbar." });
+    if (request.method !== "GET") {
+        response.setHeader("Allow", "GET");
+        return sendJson(response, 405, { message: "Methode nicht erlaubt." });
+    }
+    const detailMatch = pathname.match(/^\/api\/admin\/attendance\/(\d+)$/);
+    const id = detailMatch ? Number(detailMatch[1]) : null;
+    if (detailMatch && (!Number.isSafeInteger(id) || id < 1)) return sendJson(response, 404, { message: "Anwesenheit nicht gefunden." });
+    const allowedStatuses = new Set(["OPEN", "CLOSED", "REVIEW_REQUIRED", "CANCELLED", "NICHT_ERFASST"]);
+    const status = String(searchParams.get("status") || "").trim();
+    const from = String(searchParams.get("from") || "").trim();
+    const to = String(searchParams.get("to") || "").trim();
+    if ((status && !allowedStatuses.has(status)) || (from && !isIsoDate(from)) || (to && !isIsoDate(to)) || (from && to && from > to)) return sendJson(response, 400, { message: "Ungültige Anwesenheitsfilter." });
+    const detailBase = ` FROM employee_attendance_sessions s
+        JOIN employees e ON e.id=s.employee_id
+        JOIN orders o ON o.id=s.order_id
+        JOIN order_assignments a ON a.id=s.assignment_id
+        JOIN customers c ON c.id=o.customer_id`;
+    if (id) {
+        const [rows] = await adminPool.execute(`SELECT s.id,s.employee_id,s.order_id,s.assignment_id,s.work_log_id,s.check_in_at,s.check_out_at,s.check_in_note,s.check_out_note,s.status,s.review_required,s.created_at,s.updated_at,e.employee_number,e.first_name,e.last_name,o.order_number,o.title,o.service_type,a.assignment_date,a.start_time,a.end_time,c.customer_number,c.first_name AS customer_first_name,c.last_name AS customer_last_name${detailBase} WHERE s.id=?`, [id]);
+        return rows[0] ? sendJson(response, 200, { attendance: rows[0] }) : sendJson(response, 404, { message: "Anwesenheit nicht gefunden." });
+    }
+    const page = Number(searchParams.get("page") || 1), pageSize = Number(searchParams.get("page_size") || 25);
+    if (!Number.isInteger(page) || page < 1 || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) return sendJson(response, 400, { message: "Ungültige Seitennavigation." });
+    const base = ` FROM order_assignments a
+        JOIN employees e ON e.id=a.employee_id
+        JOIN orders o ON o.id=a.order_id
+        JOIN customers c ON c.id=o.customer_id
+        LEFT JOIN employee_attendance_sessions s ON s.id=(SELECT s2.id FROM employee_attendance_sessions s2 WHERE s2.assignment_id=a.id ORDER BY s2.check_in_at DESC,s2.id DESC LIMIT 1)
+        LEFT JOIN service_reports r ON r.id=(SELECT r2.id FROM service_reports r2 WHERE r2.assignment_id=a.id ORDER BY r2.updated_at DESC,r2.id DESC LIMIT 1)`;
+    const clauses = [], values = [];
+    if (status === "NICHT_ERFASST") clauses.push("s.id IS NULL");
+    else if (status) { clauses.push("s.status=?"); values.push(status); }
+    if (from) { clauses.push("a.assignment_date>=?"); values.push(from); }
+    if (to) { clauses.push("a.assignment_date<=?"); values.push(to); }
+    const where = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
+    const [[countRows], [rows]] = await Promise.all([
+        adminPool.execute(`SELECT COUNT(*) AS total${base}${where}`, values),
+        adminPool.execute(`SELECT s.id,s.employee_id,a.order_id,a.id AS assignment_id,s.work_log_id,s.check_in_at,s.check_out_at,COALESCE(s.status,'NICHT_ERFASST') AS attendance_status,s.review_required,e.employee_number,e.first_name,e.last_name,o.order_number,o.title,o.service_type,a.assignment_date,a.start_time,a.end_time,c.customer_number,c.first_name AS customer_first_name,c.last_name AS customer_last_name,r.id AS service_report_id,r.report_number,r.status AS report_status,r.submitted_at,r.customer_confirmed_at,DATE_FORMAT(a.assignment_date,'%Y-%m-%d') AS scheduled_date_local, DATE_FORMAT(s.check_in_at,'%Y-%m-%dT%H:%i:%s') AS checked_in_local${base}${where} ORDER BY a.assignment_date DESC,a.start_time DESC,a.id DESC LIMIT ? OFFSET ?`, [...values, pageSize, (page - 1) * pageSize])
+    ]);
+    const total = Number(countRows[0]?.total || 0);
+    const visits = rows.map(({ scheduled_date_local, checked_in_local, ...visit }) => ({
+        ...visit,
+        punctuality_status: punctualityStatus({ attendanceId: visit.id, scheduledDate: scheduled_date_local, scheduledTime: visit.start_time, checkIn: checked_in_local })
+    }));
+    return sendJson(response, 200, { rows: visits, total, page, page_size: pageSize, total_pages: Math.max(1, Math.ceil(total / pageSize)) });
+}
+
+async function handleEmployeeAttendance(request, response, pathname, searchParams, session) {
+    const listPath = pathname === "/api/employee/attendance";
+    const checkInPath = pathname === "/api/employee/attendance/check-in";
+    const checkOutPath = pathname === "/api/employee/attendance/check-out";
+    if (!listPath && !checkInPath && !checkOutPath) return false;
+    if (listPath && request.method === "GET") {
+        const [currentRows, historyRows, assignmentRows] = await Promise.all([
+            pool.execute(`SELECT s.id,s.order_id,s.assignment_id,s.check_in_at,s.check_out_at,s.status,s.review_required,s.created_at,o.order_number,o.title,o.service_type,c.customer_number,c.first_name AS customer_first_name,c.last_name AS customer_last_name,a.assignment_date,a.start_time,a.end_time,r.report_number,r.status AS report_status,r.customer_confirmed_at FROM employee_attendance_sessions s JOIN orders o ON o.id=s.order_id JOIN customers c ON c.id=o.customer_id JOIN order_assignments a ON a.id=s.assignment_id LEFT JOIN service_reports r ON r.id=(SELECT r2.id FROM service_reports r2 WHERE r2.assignment_id=s.assignment_id AND r2.employee_id=s.employee_id ORDER BY r2.updated_at DESC,r2.id DESC LIMIT 1) WHERE s.employee_id=? AND s.status='OPEN' ORDER BY s.check_in_at DESC LIMIT 1`, [session.employeeId]),
+            pool.execute(`SELECT s.id,s.order_id,s.assignment_id,s.check_in_at,s.check_out_at,s.status,s.review_required,s.created_at,o.order_number,o.title,o.service_type,c.customer_number,c.first_name AS customer_first_name,c.last_name AS customer_last_name,a.assignment_date,a.start_time,a.end_time,r.report_number,r.status AS report_status,r.customer_confirmed_at FROM employee_attendance_sessions s JOIN orders o ON o.id=s.order_id JOIN customers c ON c.id=o.customer_id JOIN order_assignments a ON a.id=s.assignment_id LEFT JOIN service_reports r ON r.id=(SELECT r2.id FROM service_reports r2 WHERE r2.assignment_id=s.assignment_id AND r2.employee_id=s.employee_id ORDER BY r2.updated_at DESC,r2.id DESC LIMIT 1) WHERE s.employee_id=? ORDER BY s.check_in_at DESC LIMIT 30`, [session.employeeId]),
+            pool.execute(`SELECT a.id AS assignment_id,a.order_id,a.assignment_date,a.start_time,a.end_time,o.order_number,o.title,o.service_type,c.customer_number,c.first_name AS customer_first_name,c.last_name AS customer_last_name,r.report_number,r.status AS report_status,r.customer_confirmed_at FROM order_assignments a JOIN orders o ON o.id=a.order_id JOIN customers c ON c.id=o.customer_id LEFT JOIN service_reports r ON r.id=(SELECT r2.id FROM service_reports r2 WHERE r2.assignment_id=a.id AND r2.employee_id=a.employee_id ORDER BY r2.updated_at DESC,r2.id DESC LIMIT 1) WHERE a.employee_id=? AND a.assignment_date=CURDATE() AND a.status IN ('GEPLANT','IN_BEARBEITUNG') AND o.status<>'STORNIERT' ORDER BY a.start_time,a.id`, [session.employeeId])
+        ]);
+        return sendJson(response, 200, { current: currentRows[0][0] || null, rows: historyRows[0], assignments: assignmentRows[0] });
+    }
+    if (request.method !== "POST" || !isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
+    let body; try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "Ungültige Anwesenheitsdaten." }); }
+    const note = readText(checkInPath ? body.check_in_note : body.check_out_note, 1000, { optional: true, multiline: true });
+    if (note === null) return sendJson(response, 400, { message: "Der Hinweis ist zu lang oder ungültig." });
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+        if (checkInPath) {
+            const assignmentId = Number(body.assignment_id);
+            if (!Number.isSafeInteger(assignmentId) || assignmentId < 1) { await connection.rollback(); return sendJson(response, 400, { message: "Bitte wählen Sie einen eigenen Einsatz aus." }); }
+            const [assignments] = await connection.execute(`SELECT a.id,a.order_id FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE a.id=? AND a.employee_id=? AND a.assignment_date=CURDATE() AND a.status IN ('GEPLANT','IN_BEARBEITUNG') AND o.status<>'STORNIERT' FOR UPDATE`, [assignmentId, session.employeeId]);
+            const assignment = assignments[0];
+            if (!assignment) { await connection.rollback(); return sendJson(response, 404, { message: "Der Einsatz ist nicht verfügbar." }); }
+            const [openRows] = await connection.execute("SELECT id FROM employee_attendance_sessions WHERE employee_id=? AND status='OPEN' FOR UPDATE", [session.employeeId]);
+            if (openRows[0]) { await connection.rollback(); return sendJson(response, 409, { message: "Es besteht bereits eine offene Anwesenheit." }); }
+            const [created] = await connection.execute("INSERT INTO employee_attendance_sessions (employee_id,order_id,assignment_id,check_in_at,check_in_note,status) VALUES (?,?,?,NOW(),?,'OPEN')", [session.employeeId, assignment.order_id, assignment.id, note || null]);
+            await auditEvent(connection, "EMPLOYEE", session.employeeId, "ATTENDANCE_CHECKED_IN", "ATTENDANCE_SESSION", created.insertId, { order_id: assignment.order_id, assignment_id: assignment.id, manual_confirmation: true });
+            await connection.commit();
+            return sendJson(response, 201, { id: created.insertId, status: "OPEN", message: "Arbeitsbeginn manuell bestätigt." });
+        }
+        const [openRows] = await connection.execute("SELECT id,order_id,assignment_id,check_in_at FROM employee_attendance_sessions WHERE employee_id=? AND status='OPEN' FOR UPDATE", [session.employeeId]);
+        const attendance = openRows[0];
+        if (!attendance) { await connection.rollback(); return sendJson(response, 409, { message: "Es besteht keine offene Anwesenheit." }); }
+        const [[clock]] = await connection.execute("SELECT DATE(check_in_at)=CURDATE() AS same_day, DATE(check_in_at) AS work_date, TIME(check_in_at) AS start_time, TIME(NOW()) AS end_time FROM employee_attendance_sessions WHERE id=?", [attendance.id]);
+        let workLogId = null, status = "CLOSED", reviewRequired = 0;
+        if (Number(clock.same_day) && String(clock.end_time) > String(clock.start_time)) {
+            const [workLog] = await connection.execute("INSERT INTO employee_work_logs (employee_id,order_id,work_date,start_time,end_time,break_minutes,notes) VALUES (?,?,?,?,?,?,?)", [session.employeeId, attendance.order_id, clock.work_date, clock.start_time, clock.end_time, 0, "Automatisch aus Anwesenheits-Check-in/Check-out erstellt."]);
+            workLogId = workLog.insertId;
+        } else { status = "REVIEW_REQUIRED"; reviewRequired = 1; }
+        await connection.execute("UPDATE employee_attendance_sessions SET check_out_at=NOW(),check_out_note=?,work_log_id=?,status=?,review_required=? WHERE id=? AND employee_id=? AND status='OPEN'", [note || null, workLogId, status, reviewRequired, attendance.id, session.employeeId]);
+        await auditEvent(connection, "EMPLOYEE", session.employeeId, "ATTENDANCE_CHECKED_OUT", "ATTENDANCE_SESSION", attendance.id, { order_id: attendance.order_id, assignment_id: attendance.assignment_id, work_log_id: workLogId, manual_confirmation: true, review_required: Boolean(reviewRequired) });
+        await connection.commit();
+        return sendJson(response, 200, { id: attendance.id, work_log_id: workLogId, status, review_required: Boolean(reviewRequired), message: reviewRequired ? "Arbeitsende gespeichert und zur Prüfung markiert." : "Arbeitsende bestätigt und Arbeitszeit gespeichert." });
+    } catch (error) {
+        await connection.rollback().catch(() => {});
+        if (error.code === "ER_DUP_ENTRY") return sendJson(response, 409, { message: "Es besteht bereits eine offene Anwesenheit." });
+        throw error;
+    } finally { connection.release(); }
+}
+
+async function expireLocationSimulationSessions(connection) {
+    const [expired] = await connection.execute("SELECT id,employee_id,attendance_session_id FROM employee_location_sharing_sessions WHERE status='ACTIVE' AND expires_at<=NOW() FOR UPDATE");
+    if (!expired.length) return 0;
+    await connection.execute("UPDATE employee_location_sharing_sessions SET status='EXPIRED',stopped_at=COALESCE(stopped_at,expires_at) WHERE status='ACTIVE' AND expires_at<=NOW()");
+    await connection.execute("DELETE l FROM employee_live_locations l JOIN employee_location_sharing_sessions s ON s.id=l.sharing_session_id WHERE s.status='EXPIRED'");
+    for (const row of expired) {
+        await auditEvent(connection, "SYSTEM", null, "LOCATION_SIMULATION_EXPIRED", "LOCATION_SHARING_SESSION", row.id, { employee_id: row.employee_id, attendance_session_id: row.attendance_session_id, simulation: true });
+    }
+    return expired.length;
+}
+
+function validSyntheticCoordinates(body) {
+    const latitude = Number(body.latitude), longitude = Number(body.longitude);
+    const accuracy = body.accuracy_meters === "" || body.accuracy_meters == null ? null : Number(body.accuracy_meters);
+    if (body.synthetic !== true || !Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180 || (accuracy !== null && (!Number.isFinite(accuracy) || accuracy < 0 || accuracy > 100000))) return null;
+    return { latitude: Number(latitude.toFixed(6)), longitude: Number(longitude.toFixed(6)), accuracy };
+}
+
+async function handleEmployeeLocationSimulation(request, response, pathname, session) {
+    const statusPath = pathname === "/api/employee/location-simulation";
+    const startPath = pathname === "/api/employee/location-simulation/start";
+    const stopPath = pathname === "/api/employee/location-simulation/stop";
+    const updatePath = pathname === "/api/employee/location-simulation/update";
+    if (!statusPath && !startPath && !stopPath && !updatePath) return false;
+    if (!LOCATION_SIMULATION_TEST_MODE) return sendJson(response, 404, { message: "API-Endpunkt nicht gefunden." });
+    if (statusPath && request.method === "GET") {
+        const connection = await pool.getConnection();
+        try {
+            await connection.beginTransaction();
+            await expireLocationSimulationSessions(connection);
+            const [rows] = await connection.execute(`SELECT s.id,s.attendance_session_id,s.order_id,s.assignment_id,s.started_at,s.expires_at,s.status,l.updated_at AS last_updated_at,CASE WHEN l.employee_id IS NULL THEN 0 ELSE 1 END AS has_current_location
+                FROM employee_location_sharing_sessions s LEFT JOIN employee_live_locations l ON l.sharing_session_id=s.id
+                WHERE s.employee_id=? AND s.status='ACTIVE' ORDER BY s.started_at DESC LIMIT 1`, [session.employeeId]);
+            await connection.commit();
+            return sendJson(response, 200, { simulation: true, sharing: rows[0] || null });
+        } catch (error) { await connection.rollback().catch(() => {}); throw error; } finally { connection.release(); }
+    }
+    if (request.method !== "POST" || !isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
+    if (takeLocationSimulationRateLimit(request, session.employeeId)) return sendJson(response, 429, { message: "Zu viele Anfragen." });
+    let body; try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "Ungültige Simulationsdaten." }); }
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+        await expireLocationSimulationSessions(connection);
+        if (startPath) {
+            const [attendanceRows] = await connection.execute(`SELECT s.id,s.order_id,s.assignment_id FROM employee_attendance_sessions s
+                JOIN order_assignments a ON a.id=s.assignment_id AND a.employee_id=s.employee_id AND a.order_id=s.order_id
+                WHERE s.employee_id=? AND s.status='OPEN' AND a.status IN ('GEPLANT','IN_BEARBEITUNG') LIMIT 1 FOR UPDATE`, [session.employeeId]);
+            const attendance = attendanceRows[0];
+            if (!attendance) { await connection.rollback(); return sendJson(response, 409, { message: "Für die Standort-Simulation ist ein offener eigener Check-in erforderlich." }); }
+            const [activeRows] = await connection.execute("SELECT id FROM employee_location_sharing_sessions WHERE employee_id=? AND status='ACTIVE' FOR UPDATE", [session.employeeId]);
+            if (activeRows[0]) { await connection.rollback(); return sendJson(response, 409, { message: "Die Standort-Simulation ist bereits aktiv." }); }
+            const [created] = await connection.execute("INSERT INTO employee_location_sharing_sessions (employee_id,attendance_session_id,order_id,assignment_id,started_at,expires_at,status) VALUES (?,?,?,?,NOW(),DATE_ADD(NOW(), INTERVAL 30 MINUTE),'ACTIVE')", [session.employeeId, attendance.id, attendance.order_id, attendance.assignment_id]);
+            await auditEvent(connection, "EMPLOYEE", session.employeeId, "LOCATION_SIMULATION_STARTED", "LOCATION_SHARING_SESSION", created.insertId, { attendance_session_id: attendance.id, order_id: attendance.order_id, assignment_id: attendance.assignment_id, simulation: true });
+            await connection.commit();
+            return sendJson(response, 201, { id: created.insertId, status: "ACTIVE", expires_in_minutes: 30, simulation: true, message: "Standort-Simulation im Testmodus gestartet." });
+        }
+        const [sharingRows] = await connection.execute("SELECT id,attendance_session_id FROM employee_location_sharing_sessions WHERE employee_id=? AND status='ACTIVE' AND expires_at>NOW() FOR UPDATE", [session.employeeId]);
+        const sharing = sharingRows[0];
+        if (!sharing) { await connection.rollback(); return sendJson(response, 409, { message: "Es besteht keine aktive Standort-Simulation." }); }
+        if (stopPath) {
+            await connection.execute("DELETE FROM employee_live_locations WHERE employee_id=? AND sharing_session_id=?", [session.employeeId, sharing.id]);
+            await connection.execute("UPDATE employee_location_sharing_sessions SET status='STOPPED',stopped_at=NOW() WHERE id=? AND employee_id=? AND status='ACTIVE'", [sharing.id, session.employeeId]);
+            await auditEvent(connection, "EMPLOYEE", session.employeeId, "LOCATION_SIMULATION_STOPPED", "LOCATION_SHARING_SESSION", sharing.id, { attendance_session_id: sharing.attendance_session_id, simulation: true });
+            await connection.commit();
+            return sendJson(response, 200, { id: sharing.id, status: "STOPPED", simulation: true, message: "Standort-Simulation beendet und Testkoordinaten gelöscht." });
+        }
+        const coordinates = validSyntheticCoordinates(body);
+        if (!coordinates) { await connection.rollback(); return sendJson(response, 400, { message: "Ungültige synthetische Koordinaten." }); }
+        await connection.execute(`INSERT INTO employee_live_locations (employee_id,sharing_session_id,latitude,longitude,accuracy_meters,is_synthetic,updated_at)
+            VALUES (?,?,?,?,?,1,NOW()) ON DUPLICATE KEY UPDATE sharing_session_id=VALUES(sharing_session_id),latitude=VALUES(latitude),longitude=VALUES(longitude),accuracy_meters=VALUES(accuracy_meters),is_synthetic=1,updated_at=NOW()`, [session.employeeId, sharing.id, coordinates.latitude, coordinates.longitude, coordinates.accuracy]);
+        await connection.commit();
+        return sendJson(response, 200, { id: sharing.id, simulation: true, updated: true, message: "Synthetische Testkoordinaten aktualisiert." });
+    } catch (error) {
+        await connection.rollback().catch(() => {});
+        if (error.code === "ER_DUP_ENTRY") return sendJson(response, 409, { message: "Die Standort-Simulation ist bereits aktiv." });
+        throw error;
+    } finally { connection.release(); }
+}
+
+async function handleAdminLocationSimulations(request, response, pathname) {
+    if (pathname !== "/api/admin/location-simulations") return false;
+    if (!LOCATION_SIMULATION_TEST_MODE) return sendJson(response, 404, { message: "API-Endpunkt nicht gefunden." });
+    if (request.method !== "GET") { response.setHeader("Allow", "GET"); return sendJson(response, 405, { message: "Methode nicht erlaubt." }); }
+    const connection = await adminPool.getConnection();
+    try {
+        await connection.beginTransaction();
+        await expireLocationSimulationSessions(connection);
+        const [rows] = await connection.execute(`SELECT s.id,s.employee_id,s.order_id,s.assignment_id,s.started_at,s.expires_at,s.status,
+            e.employee_number,e.first_name,e.last_name,o.order_number,o.title,
+            l.latitude,l.longitude,l.accuracy_meters,l.updated_at AS last_updated_at,
+            CASE WHEN l.employee_id IS NULL THEN 'OFFLINE' WHEN l.updated_at < DATE_SUB(NOW(), INTERVAL 5 MINUTE) THEN 'STALE' ELSE 'ACTIVE' END AS location_status
+            FROM employee_location_sharing_sessions s
+            JOIN employees e ON e.id=s.employee_id JOIN orders o ON o.id=s.order_id
+            LEFT JOIN employee_live_locations l ON l.sharing_session_id=s.id
+            WHERE s.status='ACTIVE' ORDER BY l.updated_at DESC,s.started_at DESC`);
+        await connection.commit();
+        return sendJson(response, 200, { simulation: true, rows });
+    } catch (error) { await connection.rollback().catch(() => {}); throw error; } finally { connection.release(); }
+}
+
 async function handleAdminApi(request, response, pathname, searchParams) {
     if (pathname === "/api/admin/login") {
         if (request.method !== "POST") {
@@ -2769,8 +3986,14 @@ async function handleAdminApi(request, response, pathname, searchParams) {
 
     const session = adminSessionOrRespond(request, response);
     if (!session) return;
+    if (pathname === "/api/admin/home") return sendPortalHome(request,response,managementHome);
 
+
+    if (/^\/api\/admin\/absence-requests(?:\/\d+)?$/.test(pathname)) return handleAbsenceRequests(request,response,pathname,searchParams);
     if (pathname === "/api/admin/action-center") return handleAdminActionCenter(request, response, searchParams);
+    if (pathname === "/api/admin/attendance" || /^\/api\/admin\/attendance\/\d+$/.test(pathname)) return handleAdminAttendance(request, response, pathname, searchParams);
+    if (pathname === "/api/admin/location-simulations") return handleAdminLocationSimulations(request, response, pathname);
+    if (/^\/api\/admin\/complaints(?:\/\d+(?:\/(?:convert|publish))?)?$/.test(pathname)) return handleAdminComplaints(request,response,pathname,searchParams);
     if (pathname === "/api/admin/quality-incidents" || /^\/api\/admin\/quality-incidents\/\d+(?:\/(?:actions(?:\/\d+)?|resolve|close))?$/.test(pathname)) return handleAdminQualityIncidents(request,response,pathname,searchParams);
     if (pathname === "/api/admin/reports/trends" || pathname === "/api/admin/reports/rankings") return handleAdminReportVisuals(request,response,pathname,searchParams);
     if (/^\/api\/admin\/reports\/performance\/(?:operations|services|orders|receivables|recurring)$/.test(pathname)) return handleAdminPerformanceReports(request, response, pathname, searchParams);
@@ -2781,6 +4004,13 @@ async function handleAdminApi(request, response, pathname, searchParams) {
     if (pathname === "/api/admin/messages" || /^\/api\/admin\/messages\/\d+\/read$/.test(pathname) || pathname === "/api/admin/notifications" || /^\/api\/admin\/notifications\/\d+\/read$/.test(pathname) || pathname === "/api/admin/audit-logs") return handleAdminPhase12(request,response,pathname,searchParams);
     if (pathname === "/api/admin/finance/dashboard" || /^\/api\/admin\/finance\/employee-cash-payments\/\d+\/receipt$/.test(pathname) || /^\/api\/admin\/finance\/(?:transactions|employee-cash-payments|cash-transfers)(?:\/\d+)?$/.test(pathname) || /^\/api\/admin\/finance\/receipts\/\d+$/.test(pathname)) return handleAdminFinance(request,response,pathname,searchParams);
 
+    if (/^\/api\/admin\/orders\/\d+\/assignments\/\d+\/billing-exception$/.test(pathname)) return handleAdminOrders(request,response,pathname,searchParams);
+    const contractRetry = pathname.match(/^\/api\/admin\/contracts\/(\d+)\/email\/retry$/);
+    if (contractRetry) {
+        if (request.method !== "POST") return sendJson(response,405,{message:"Methode nicht erlaubt."});
+        if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+        return retryContractEmail(response,Number(contractRetry[1]));
+    }
     if (pathname === "/api/admin/quotes" || /^\/api\/admin\/quotes\/\d+(?:\/items(?:\/\d+)?|\/create-order)?$/.test(pathname) || pathname === "/api/admin/contracts" || /^\/api\/admin\/contracts\/\d+$/.test(pathname)) {
         return handleAdminCommercial(request, response, pathname, searchParams);
     }
@@ -2790,7 +4020,7 @@ async function handleAdminApi(request, response, pathname, searchParams) {
     if (pathname === "/api/admin/appointments" || /^\/api\/admin\/appointments\/\d+$/.test(pathname)) {
         return handleAdminAppointments(request, response, pathname, searchParams);
     }
-    if (pathname === "/api/admin/customers" || /^\/api\/admin\/customers\/\d+$/.test(pathname)) {
+    if (pathname === "/api/admin/customers" || /^\/api\/admin\/customers\/\d+(?:\/invitation)?$/.test(pathname)) {
         return handleAdminCustomers(request, response, pathname, searchParams);
     }
     if (pathname === "/api/admin/employees" || /^\/api\/admin\/employees\/\d+(?:\/(?:status|role|invitation))?$/.test(pathname)) {
@@ -2802,7 +4032,7 @@ async function handleAdminApi(request, response, pathname, searchParams) {
     if (pathname === "/api/admin/employee-tasks" || /^\/api\/admin\/employee-tasks\/\d+$/.test(pathname)) {
         return handleAdminEmployeeTasks(request, response, pathname, searchParams);
     }
-    if (pathname === "/api/admin/recurring-orders" || /^\/api\/admin\/recurring-orders\/\d+$/.test(pathname) || pathname === "/api/admin/recurring-orders/generate" || pathname === "/api/admin/automation-logs") {
+    if (pathname === "/api/admin/recurring-orders" || /^\/api\/admin\/recurring-orders\/\d+$/.test(pathname) || pathname === "/api/admin/recurring-orders/generate" || pathname === "/api/admin/automation-logs" || pathname === "/api/admin/recurring-orders/exceptions" || pathname === "/api/admin/recurring-orders/automation") {
         return handleAdminRecurringOrders(request, response, pathname, searchParams);
     }
     if (pathname === "/api/admin/orders" || /^\/api\/admin\/orders\/\d+(?:\/assignments(?:\/\d+)?)?$/.test(pathname)) {
@@ -2949,7 +4179,7 @@ async function handleApi(request, response, pathname, searchParams) {
         try {
             await connection.beginTransaction();
             const [customer] = await connection.execute("INSERT INTO appointment_customers (first_name, last_name, email, phone) VALUES (?, ?, ?, ?)", [booking.firstName, booking.lastName, booking.email, booking.phone]);
-            const portalSession = readCustomerSession(request);
+            const portalSession = await currentPortalSession(request,"customer");
             const [appointment] = await connection.execute("INSERT INTO appointments (customer_id, portal_customer_id, service, object_type, address, postal_code, city, area_m2, preferred_date, start_time, end_time, duration_minutes, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [customer.insertId, portalSession?.customerId || null, booking.service, booking.objectType, booking.address, booking.postalCode, booking.city, booking.areaM2, booking.date, booking.startTime, endTime, BOOKING_SLOT_DURATION_MINUTES, booking.message]);
             await connection.commit();
             return sendJson(response, 201, { id: appointment.insertId, service: booking.service, date: booking.date, startTime: booking.startTime, message: "Termin erfolgreich angefragt." });
@@ -2985,7 +4215,7 @@ async function handleApi(request, response, pathname, searchParams) {
             return sendJson(response, 400, { message: `Bitte laden Sie nur bis zu ${QUOTE_MAX_FILES} JPG-, PNG- oder PDF-Dateien mit maximal ${Math.floor(QUOTE_MAX_FILE_BYTES / 1024 / 1024)} MB hoch.` });
         }
         try {
-            const portalSession = readCustomerSession(request);
+            const portalSession = await currentPortalSession(request,"customer");
             const [result] = await pool.execute(
                 "INSERT INTO quote_requests (customer_id, first_name, last_name, company, email, phone, object_type, address, postal_code, city, requested_service, area_m2, frequency, preferred_period, preferred_date, message, additional_information) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [portalSession?.customerId || null, quote.firstName, quote.lastName, quote.company, quote.email, quote.phone, quote.objectType, quote.address, quote.postalCode, quote.city, quote.service, quote.areaM2, quote.frequency, quote.preferredPeriod, quote.preferredDate, quote.message, quote.additionalInformation]
@@ -3102,9 +4332,150 @@ function sendCustomerInvoicePdf(response, invoice, items) {
     document.end();
 }
 
+
+const complaintStatuses = new Set(["RECEIVED","IN_REVIEW","RESOLVED","CLOSED"]);
+
+function submissionKey(value) {
+    return typeof value === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value) ? value.toLowerCase() : null;
+}
+
+async function notifyCustomerIntake(connection, kind, id, title) {
+    await connection.execute("INSERT INTO notifications(recipient_type,recipient_id,notification_type,title,entity_type,entity_id) VALUES('ADMIN',NULL,?,?,?,?)",
+        [kind,title,kind,id]);
+}
+
+async function handleCustomerIntake(request,response,pathname,searchParams,session) {
+    const match = pathname.match(/^\/api\/customer\/(service-requests|complaints)(?:\/(\d+))?$/);
+    const service = match[1] === "service-requests";
+    const id = match[2] ? positiveId(match[2]) : null;
+    if (match[2] && !id) return sendJson(response,404,{message:"Eintrag nicht gefunden."});
+    if (request.method === "GET") {
+        const page = Number(searchParams.get("page") || 1);
+        if (!Number.isInteger(page) || page<1 || page>10000) return sendJson(response,400,{message:"Ungültige Seite."});
+        const query = service
+            ? "SELECT r.id,r.requested_service AS service,r.message AS description,DATE_FORMAT(r.preferred_date,'%Y-%m-%d') AS preferred_date,r.status,r.created_at,(SELECT q.id FROM quotes q WHERE q.quote_request_id=r.id AND q.customer_id=r.customer_id AND q.status NOT IN ('ENTWURF','STORNIERT') ORDER BY q.id DESC LIMIT 1) AS quote_id FROM quote_requests r WHERE r.customer_id=?"
+            : "SELECT r.id,r.order_id,o.order_number,r.description,r.status,r.created_at FROM customer_complaints r LEFT JOIN orders o ON o.id=r.order_id AND o.customer_id=r.customer_id WHERE r.customer_id=?";
+        if (id) {
+            const [[row]] = await pool.execute(query+" AND r.id=?",[session.customerId,id]);
+            if (!row) return sendJson(response,404,{message:"Eintrag nicht gefunden."});
+            const [updates] = service ? [[]] : await pool.execute("SELECT status,response,created_at FROM customer_complaint_updates WHERE complaint_id=? ORDER BY id",[id]);
+            return sendJson(response,200,{record:row,updates});
+        }
+        const [rows] = await pool.execute(query+" ORDER BY r.id DESC LIMIT 26 OFFSET ?",[session.customerId,(page-1)*25]);
+        return sendJson(response,200,{rows:rows.slice(0,25),hasMore:rows.length>25,...(service?{services:[...appointmentServices]}:{})});
+    }
+    if (id || request.method!=="POST") return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+    let body;
+    try { body=await readJson(request); } catch { return sendJson(response,400,{message:"Ungültige Eingabe."}); }
+    const key=submissionKey(body?.submission_key);
+    const description=readText(body?.description,4000,{multiline:true});
+    const category=body?.service;
+    const preferredDate=body?.preferred_date;
+    const orderId=body?.order_id==null||body.order_id==="" ? null : positiveId(body.order_id);
+    if (!key || !description || (service && (!appointmentServices.has(category) || !reportIsIsoDate(preferredDate))) ||
+        (!service && body?.order_id!=null && body.order_id!=="" && !orderId)) return sendJson(response,400,{message:"Bitte prüfen Sie Ihre Eingaben."});
+    const connection=await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+        const [[customer]]=await connection.execute("SELECT id,first_name,last_name,email,phone,address,postal_code,city FROM customers WHERE id=? AND status='active' FOR UPDATE",[session.customerId]);
+        if (!customer) return sendJson(response,404,{message:"Konto nicht gefunden."});
+        const [[previous]]=await connection.execute(service
+            ? "SELECT id,requested_service AS service,message AS description,DATE_FORMAT(preferred_date,'%Y-%m-%d') AS preferred_date FROM quote_requests WHERE customer_id=? AND portal_submission_key=?"
+            : "SELECT id,order_id,description FROM customer_complaints WHERE customer_id=? AND submission_key=?",
+            [customer.id,key]);
+        if (previous) {
+            const same=description===previous.description && (service ? previous.service===category&&previous.preferred_date===preferredDate : previous.order_id===orderId);
+            return sendJson(response,same?200:409,same?{id:previous.id}:{message:"Dieser Sendevorgang wurde bereits verwendet."});
+        }
+        if (!service && orderId) {
+            const [[order]]=await connection.execute("SELECT id FROM orders WHERE id=? AND customer_id=?",[orderId,customer.id]);
+            if (!order) return sendJson(response,404,{message:"Auftrag nicht gefunden."});
+        }
+        const [created]=service
+            ? await connection.execute("INSERT INTO quote_requests(customer_id,first_name,last_name,email,phone,object_type,address,postal_code,city,requested_service,preferred_date,message,portal_submission_key) VALUES(?,?,?,?,?,'Sonstiges',?,?,?,?,?,?,?)",
+                [customer.id,customer.first_name,customer.last_name,customer.email,customer.phone||"",customer.address||"",customer.postal_code||"",customer.city||"",category,preferredDate,description,key])
+            : await connection.execute("INSERT INTO customer_complaints(customer_id,order_id,submission_key,description) VALUES(?,?,?,?)",[customer.id,orderId,key,description]);
+        const kind=service?"SERVICE_REQUEST":"COMPLAINT";
+        await notifyCustomerIntake(connection,kind,created.insertId,service?"Neue Serviceanfrage":"Neue Beschwerde");
+        await auditEvent(connection,"CUSTOMER",customer.id,kind+"_SUBMITTED",kind,created.insertId);
+        await connection.commit();
+        return sendJson(response,201,{id:created.insertId});
+    } finally {
+        try { await connection.rollback(); } finally { connection.release(); }
+    }
+}
+
+async function handleAdminComplaints(request,response,pathname,searchParams) {
+    if (!adminPool) return sendJson(response,503,{message:"Beschwerden sind derzeit nicht verfügbar."});
+    const match=pathname.match(/^\/api\/admin\/complaints(?:\/(\d+)(?:\/(convert|publish))?)?$/);
+    const id=match[1]?positiveId(match[1]):null, action=match[2];
+    if (match[1]&&!id) return sendJson(response,404,{message:"Beschwerde nicht gefunden."});
+    if (!action && request.method==="GET") {
+        const query="SELECT r.id,r.customer_id,r.order_id,r.incident_id,r.description,r.status,r.created_at,c.first_name,c.last_name,o.order_number,q.incident_number,q.status AS incident_status FROM customer_complaints r JOIN customers c ON c.id=r.customer_id LEFT JOIN orders o ON o.id=r.order_id LEFT JOIN quality_incidents q ON q.id=r.incident_id";
+        if (id) {
+            const [[row]]=await adminPool.execute(query+" WHERE r.id=?",[id]);
+            if (!row) return sendJson(response,404,{message:"Beschwerde nicht gefunden."});
+            const [updates]=await adminPool.execute("SELECT status,response,created_at FROM customer_complaint_updates WHERE complaint_id=? ORDER BY id",[id]);
+            return sendJson(response,200,{record:row,updates});
+        }
+        const status=searchParams.get("status");
+        const page=Number(searchParams.get("page")||1);
+        if ((status&&!complaintStatuses.has(status)) || !Number.isInteger(page) || page<1 || page>10000) return sendJson(response,400,{message:"Ungültiger Filter."});
+        const [rows]=await adminPool.execute(query+(status?" WHERE r.status=?":"")+" ORDER BY r.id DESC LIMIT 26 OFFSET ?",status?[status,(page-1)*25]:[(page-1)*25]);
+        return sendJson(response,200,{rows:rows.slice(0,25),hasMore:rows.length>25});
+    }
+    if (!action || request.method!=="POST") return sendJson(response,405,{message:"Methode nicht erlaubt."});
+    if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."});
+    let body;
+    try { body=await readJson(request); } catch { return sendJson(response,400,{message:"Ungültige Eingabe."}); }
+    const status=body?.status;
+    const responseText=readText(body?.response,2000,{optional:true,multiline:true});
+    const key=submissionKey(body?.publication_key);
+    if (action==="publish" && (!complaintStatuses.has(status) || responseText===null || !key)) return sendJson(response,400,{message:"Bitte prüfen Sie die öffentliche Antwort."});
+    const connection=await adminPool.getConnection();
+    try {
+        await connection.beginTransaction();
+        const [[complaint]]=await connection.execute("SELECT id,customer_id,order_id,incident_id,description,status FROM customer_complaints WHERE id=? FOR UPDATE",[id]);
+        if (!complaint) return sendJson(response,404,{message:"Beschwerde nicht gefunden."});
+        if (action==="convert") {
+            if (complaint.incident_id) return sendJson(response,200,{incidentId:complaint.incident_id});
+            const created=await insertQualityIncident(connection,{
+                customerId:complaint.customer_id,orderId:complaint.order_id,assignmentId:null,serviceReportId:null,assignedEmployeeId:null,
+                category:"Kundenbeschwerde",severity:"NORMAL",title:"Beschwerde #"+id,description:complaint.description,internalNotes:null,rootCause:null,dueDate:null
+            });
+            await connection.execute("UPDATE customer_complaints SET incident_id=? WHERE id=?",[created.id,id]);
+            await auditEvent(connection,"ADMIN",null,"COMPLAINT_CONVERTED","COMPLAINT",id,{incident_id:created.id});
+            await connection.commit();
+            return sendJson(response,201,{incidentId:created.id});
+        }
+        const [[previous]]=await connection.execute("SELECT status,response FROM customer_complaint_updates WHERE complaint_id=? AND publication_key=?",[id,key]);
+        const safeResponse=responseText||null;
+        if (previous) {
+            const same=previous.status===status&&previous.response===safeResponse;
+            return sendJson(response,same?200:409,same?{id,status}:{message:"Dieser Sendevorgang wurde bereits verwendet."});
+        }
+        const [[latest]]=await connection.execute("SELECT response FROM customer_complaint_updates WHERE complaint_id=? ORDER BY id DESC LIMIT 1",[id]);
+        if (complaint.status===status&&(latest?.response||null)===safeResponse) return sendJson(response,200,{id,status});
+        await connection.execute("INSERT INTO customer_complaint_updates(complaint_id,publication_key,status,response) VALUES(?,?,?,?)",[id,key,status,safeResponse]);
+        await connection.execute("UPDATE customer_complaints SET status=? WHERE id=?",[status,id]);
+        await notifyCustomer(connection,complaint.customer_id,"COMPLAINT","Beschwerde aktualisiert","Eine Aktualisierung ist im Kundenportal verfügbar.","COMPLAINT",id);
+        await auditEvent(connection,"ADMIN",null,"COMPLAINT_UPDATE_PUBLISHED","COMPLAINT",id,{status});
+        await connection.commit();
+        return sendJson(response,200,{id,status});
+    } finally {
+        try { await connection.rollback(); } finally { connection.release(); }
+    }
+}
+
+async function updateRequestFromQuote(connection,quoteId,customerId,status) {
+    await connection.execute("UPDATE quote_requests r JOIN quotes q ON q.quote_request_id=r.id SET r.status=? WHERE q.id=? AND r.customer_id=? AND r.status IN ('new','in_progress','offer_sent')",[status,quoteId,customerId]);
+}
+
 async function handleCustomerApi(request, response, pathname, searchParams) {
     if (!pool) return sendJson(response, 503, { message: "Das Kundenportal ist derzeit nicht verfügbar." });
     const loginLimited = () => takeAdminLoginRateLimit(request);
+    if(pathname==="/api/customer/accept-invitation")return acceptCustomerPortalInvitation(request,response);
     if (pathname === "/api/customer/register") {
         if (request.method !== "POST") { response.setHeader("Allow", "POST"); return sendJson(response, 405, { message: "Methode nicht erlaubt." }); }
         if (!isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
@@ -3135,29 +4506,38 @@ async function handleCustomerApi(request, response, pathname, searchParams) {
         if (loginLimited()) return sendJson(response, 429, { message: "Zu viele Anmeldeversuche. Bitte versuchen Sie es später erneut." });
         let body; try { body = await readJson(request); } catch { return sendJson(response, 400, { message: "Die Anmeldedaten konnten nicht gelesen werden." }); }
         const email = validateEmail(body.email), password = typeof body.password === "string" ? body.password : ""; if (!email || !password) return sendJson(response, 401, { message: "E-Mail oder Passwort ist falsch." });
-        try { const [rows] = await pool.execute("SELECT id,first_name,last_name,email,password_hash,status FROM customers WHERE email = ?", [email]); const customer = rows[0]; if (!customer || customer.status !== "active" || !await verifyPassword(password, customer.password_hash)) return sendJson(response, 401, { message: "E-Mail oder Passwort ist falsch." }); const token = crypto.randomBytes(32).toString("base64url"); customerSessions.set(token, { customerId: customer.id, expiresAt: Date.now() + CUSTOMER_SESSION_TTL_MS }); await pool.execute("UPDATE customers SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?", [customer.id]); setCustomerCookie(response, token, Math.floor(CUSTOMER_SESSION_TTL_MS / 1000)); return sendJson(response, 200, { authenticated: true, customer: { id: customer.id, first_name: customer.first_name, last_name: customer.last_name, email: customer.email } }); } catch (error) { console.error("[customer] login failed:", error.code || "database_error"); return sendJson(response, 503, { message: "Die Anmeldung ist derzeit nicht verfügbar." }); }
+        try { const [rows] = await pool.execute("SELECT id,first_name,last_name,email,password_hash,status,session_version FROM customers WHERE email = ?", [email]); const customer = rows[0]; if (!customer || customer.status !== "active" || !await verifyPassword(password, customer.password_hash)) return sendJson(response, 401, { message: "E-Mail oder Passwort ist falsch." }); const token = crypto.randomBytes(32).toString("base64url"); customerSessions.set(token, { customerId: customer.id, version:customer.session_version, expiresAt: Date.now() + CUSTOMER_SESSION_TTL_MS }); await pool.execute("UPDATE customers SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?", [customer.id]); setCustomerCookie(response, token, Math.floor(CUSTOMER_SESSION_TTL_MS / 1000)); return sendJson(response, 200, { authenticated: true, customer: { id: customer.id, first_name: customer.first_name, last_name: customer.last_name, email: customer.email } }); } catch (error) { console.error("[customer] login failed:", error.code || "database_error"); return sendJson(response, 503, { message: "Die Anmeldung ist derzeit nicht verfügbar." }); }
     }
     if (pathname === "/api/customer/logout") { if (request.method !== "POST") return sendJson(response, 405, { message: "Methode nicht erlaubt." }); if (!isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." }); const session = readCustomerSession(request); if (session) customerSessions.delete(session.token); response.setHeader("Set-Cookie", `${CUSTOMER_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secureAdminCookie ? "; Secure" : ""}`); return sendJson(response, 200, { authenticated: false }); }
-    if (pathname === "/api/customer/session") { const session = customerSessionOrRespond(request,response); if (!session) return; const [rows] = await pool.execute("SELECT id,customer_number,first_name,last_name,email FROM customers WHERE id = ? AND status = 'active'", [session.customerId]); return rows[0] ? sendJson(response,200,{authenticated:true,customer:rows[0]}) : sendJson(response,401,{message:"Bitte melden Sie sich an."}); }
-    const session = customerSessionOrRespond(request,response); if (!session) return;
+    if (pathname === "/api/customer/session") { const session = await portalSessionOrRespond(request,response,"customer"); if (!session) return; const [rows] = await pool.execute("SELECT id,customer_number,first_name,last_name,company_name,email FROM customers WHERE id = ? AND status = 'active'", [session.customerId]); return rows[0] ? sendJson(response,200,{authenticated:true,customer:rows[0]}) : sendJson(response,401,{message:"Bitte melden Sie sich an."}); }
+    const session = await portalSessionOrRespond(request,response,"customer"); if (!session) return;
+
+    if (pathname === "/api/customer/home") return sendPortalHome(request,response,(day,time)=>customerHome(session.customerId,day,time));
+    if (/^\/api\/customer\/(?:service-requests|complaints)(?:\/\d+)?$/.test(pathname)) return handleCustomerIntake(request,response,pathname,searchParams,session);
     if (pathname === "/api/customer/service-reports" || /^\/api\/customer\/service-reports\/\d+(?:\/confirm)?$/.test(pathname)) return handleCustomerServiceReports(request,response,pathname,session);
     const customerPaymentMatch = pathname.match(/^\/api\/customer\/payments(?:\/(\d+))?$/);
     if (customerPaymentMatch) {
         if (request.method !== "GET") return sendJson(response,405,{message:"Methode nicht erlaubt."});
         const paymentId = customerPaymentMatch[1] ? Number(customerPaymentMatch[1]) : null;
-        const [rows] = await pool.execute(`SELECT p.id,p.payment_number,p.order_id,p.invoice_id,p.amount,p.payment_date,p.payment_method,p.purpose,p.receipt_number,p.status,p.customer_email_status,p.created_at,o.order_number,i.invoice_number FROM employee_cash_payments p JOIN orders o ON o.id=p.order_id LEFT JOIN invoices i ON i.id=p.invoice_id WHERE p.customer_id=?${paymentId ? " AND p.id=?" : ""} ORDER BY p.payment_date DESC,p.id DESC`, paymentId ? [session.customerId,paymentId] : [session.customerId]);
+        const [rows] = await pool.execute(`SELECT p.id,p.payment_number,p.order_id,p.invoice_id,p.amount,p.payment_date,p.payment_method,p.purpose,p.receipt_number,p.status,p.customer_email_status,p.created_at,o.order_number,i.invoice_number FROM employee_cash_payments p JOIN orders o ON o.id=p.order_id LEFT JOIN invoices i ON i.id=p.invoice_id AND i.customer_id=p.customer_id AND i.status NOT IN ('ENTWURF','STORNIERT') WHERE p.customer_id=? AND (p.invoice_id IS NULL OR i.id IS NOT NULL)${paymentId ? " AND p.id=?" : ""} ORDER BY p.payment_date DESC,p.id DESC`, paymentId ? [session.customerId,paymentId] : [session.customerId]);
         if (paymentId && !rows[0]) return sendJson(response,404,{message:"Zahlung nicht gefunden."});
         return sendJson(response,200,paymentId?{payment:rows[0]}:{rows});
     }
     const customerDocumentMatch=pathname.match(/^\/api\/customer\/documents(?:\/(\d+))?$/);
-    if(customerDocumentMatch&&request.method==="GET"){const id=customerDocumentMatch[1]?Number(customerDocumentMatch[1]):null;const[rows]=await pool.execute(`SELECT id,document_type,file_name,mime_type,file_size,created_at,stored_file_name,visibility FROM documents WHERE customer_id=? AND visibility='CUSTOMER'${id?" AND id=?":""} ORDER BY created_at DESC`,id?[session.customerId,id]:[session.customerId]);if(id&&!rows[0])return sendJson(response,404,{message:"Dokument nicht gefunden."});if(!id)return sendJson(response,200,{rows});const d=rows[0],ext=allowedQuoteMimes.get(d.mime_type),filePath=path.join(PRIVATE_DOCUMENT_UPLOAD_DIR,`${d.stored_file_name}${ext}`);try{const stat=await fs.promises.stat(filePath);response.writeHead(200,{"Content-Type":d.mime_type,"Content-Length":stat.size,"Content-Disposition":`attachment; filename=\"${d.file_name.replace(/[\"\\]/g,"_")}\"`,"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff"});return fs.createReadStream(filePath).pipe(response);}catch{return sendJson(response,404,{message:"Datei nicht gefunden."});}}
+    if(customerDocumentMatch&&request.method==="GET"){const id=customerDocumentMatch[1]?Number(customerDocumentMatch[1]):null;const[rows]=await pool.execute(`SELECT id,document_type,file_name,mime_type,file_size,created_at,stored_file_name,visibility FROM documents d WHERE d.customer_id=? AND d.visibility='CUSTOMER'
+        AND (d.document_type<>'ANGEBOT' OR d.quote_id IS NOT NULL)
+        AND (d.document_type<>'VERTRAG' OR d.contract_id IS NOT NULL)
+        AND (d.document_type<>'RECHNUNG' OR d.invoice_id IS NOT NULL)
+        AND (d.quote_id IS NULL OR EXISTS(SELECT 1 FROM quotes q WHERE q.id=d.quote_id AND q.customer_id=d.customer_id AND q.status NOT IN ('ENTWURF','STORNIERT')))
+        AND (d.contract_id IS NULL OR EXISTS(SELECT 1 FROM contracts c WHERE c.id=d.contract_id AND c.customer_id=d.customer_id AND c.status<>'ENTWURF'))
+        AND (d.invoice_id IS NULL OR EXISTS(SELECT 1 FROM invoices i WHERE i.id=d.invoice_id AND i.customer_id=d.customer_id AND i.status NOT IN ('ENTWURF','STORNIERT')))${id?" AND id=?":""} ORDER BY created_at DESC`,id?[session.customerId,id]:[session.customerId]);if(id&&!rows[0])return sendJson(response,404,{message:"Dokument nicht gefunden."});if(!id)return sendJson(response,200,{rows});const d=rows[0],ext=allowedQuoteMimes.get(d.mime_type),filePath=path.join(PRIVATE_DOCUMENT_UPLOAD_DIR,`${d.stored_file_name}${ext}`);try{const stat=await fs.promises.stat(filePath);response.writeHead(200,{"Content-Type":d.mime_type,"Content-Length":stat.size,"Content-Disposition":`attachment; filename=\"${d.file_name.replace(/[\"\\]/g,"_")}\"`,"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff"});return fs.createReadStream(filePath).pipe(response);}catch{return sendJson(response,404,{message:"Datei nicht gefunden."});}}
     const phase12Message = pathname.match(/^\/api\/customer\/messages(?:\/(\d+)\/read)?$/), phase12Notification = pathname.match(/^\/api\/customer\/notifications(?:\/(\d+)\/read)?$/);
     if (pathname === "/api/customer/messages") {
         if (request.method === "GET") { const [rows]=await pool.execute("SELECT id,sender_type,subject,message,read_at,created_at FROM messages WHERE customer_id=? ORDER BY created_at DESC",[session.customerId]);return sendJson(response,200,{rows}); }
         if (request.method !== "POST" || !isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."}); let b;try{b=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Nachricht."})};const subject=readText(b.subject,180),message=readText(b.message,8000,{multiline:true});if(!subject||!message)return sendJson(response,400,{message:"Bitte Nachricht prüfen."});const c=await pool.getConnection();try{await c.beginTransaction();const[r]=await c.execute("INSERT INTO messages(customer_id,sender_type,sender_id,recipient_type,subject,message) VALUES (?,'CUSTOMER',?,'ADMIN',?,?)",[session.customerId,session.customerId,subject,message]);await c.execute("INSERT INTO notifications(recipient_type,recipient_id,notification_type,title,body,entity_type,entity_id) VALUES ('ADMIN',NULL,'MESSAGE',?,?, 'MESSAGE',?)",["Neue Kundennachricht",subject,r.insertId]);await auditEvent(c,"CUSTOMER",session.customerId,"MESSAGE_SENT","MESSAGE",r.insertId,null);await c.commit();return sendJson(response,201,{id:r.insertId,message:"Nachricht gesendet."});}catch(e){await c.rollback();throw e;}finally{c.release();}
     }
     if (phase12Message?.[1]) { if(request.method!=="PATCH"||!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});const c=await pool.getConnection();try{await c.beginTransaction();const[r]=await c.execute("UPDATE messages SET read_at=COALESCE(read_at,NOW()) WHERE id=? AND customer_id=?",[Number(phase12Message[1]),session.customerId]);if(!r.affectedRows){await c.rollback();return sendJson(response,404,{message:"Nachricht nicht gefunden."});}await auditEvent(c,"CUSTOMER",session.customerId,"MESSAGE_READ","MESSAGE",Number(phase12Message[1]),null);await c.commit();return sendJson(response,200,{message:"Nachricht gelesen."});}catch(e){await c.rollback();throw e;}finally{c.release();} }
-    if (pathname === "/api/customer/notifications") { if(request.method!=="GET")return sendJson(response,405,{message:"Methode nicht erlaubt."});const[rows]=await pool.execute("SELECT id,notification_type,title,body,entity_type,entity_id,read_at,created_at FROM notifications WHERE recipient_type='CUSTOMER' AND recipient_id=? ORDER BY created_at DESC",[session.customerId]);return sendJson(response,200,{rows}); }
+    if (pathname === "/api/customer/notifications") { if(request.method!=="GET")return sendJson(response,405,{message:"Methode nicht erlaubt."});const[rows]=await pool.execute(`SELECT id,notification_type,title,body,entity_type,entity_id,read_at,created_at FROM notifications n WHERE recipient_type='CUSTOMER' AND recipient_id=? AND ${customerNotificationPublicationFilter} ORDER BY created_at DESC`,[session.customerId]);return sendJson(response,200,{rows}); }
     if (phase12Notification?.[1]) { if(request.method!=="PATCH"||!isSameOriginRequest(request))return sendJson(response,403,{message:"Anfrage nicht erlaubt."});const[r]=await pool.execute("UPDATE notifications SET read_at=COALESCE(read_at,NOW()) WHERE id=? AND recipient_type='CUSTOMER' AND recipient_id=?",[Number(phase12Notification[1]),session.customerId]);return r.affectedRows?sendJson(response,200,{message:"Benachrichtigung gelesen."}):sendJson(response,404,{message:"Benachrichtigung nicht gefunden."}); }
     if (pathname === "/api/customer/profile") { if (request.method === "GET") { const [rows] = await pool.execute("SELECT id,customer_number,first_name,last_name,email,phone,address,postal_code,city,status,created_at,last_login_at FROM customers WHERE id=?",[session.customerId]); return rows[0] ? sendJson(response,200,{customer:rows[0]}) : sendJson(response,404,{message:"Konto nicht gefunden."}); } if (request.method === "PATCH") { if (!isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."}); let b;try{b=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Daten."})}; const values=[readText(b.first_name,80),readText(b.last_name,80),readText(b.phone,40),readText(b.address,180,{optional:true}),readText(b.postal_code,16,{optional:true}),readText(b.city,120,{optional:true})]; if(!values[0]||!values[1]||!values[2])return sendJson(response,400,{message:"Bitte prüfen Sie Ihre Angaben."}); await pool.execute("UPDATE customers SET first_name=?,last_name=?,phone=?,address=?,postal_code=?,city=? WHERE id=?",[...values,session.customerId]);return sendJson(response,200,{message:"Profil gespeichert."}); } return sendJson(response,405,{message:"Methode nicht erlaubt."}); }
     if (pathname === "/api/customer/change-password") { if (request.method !== "POST" || !isSameOriginRequest(request)) return sendJson(response,403,{message:"Anfrage nicht erlaubt."}); if(takeRateLimit(request))return sendJson(response,429,{message:"Zu viele Anfragen."}); let b;try{b=await readJson(request)}catch{return sendJson(response,400,{message:"Ungültige Daten."})};const [rows]=await pool.execute("SELECT password_hash FROM customers WHERE id=?",[session.customerId]);if(!rows[0]||!await verifyPassword(b.current_password,rows[0].password_hash)||!validCustomerPassword(b.new_password)||b.new_password!==b.password_confirmation)return sendJson(response,400,{message:"Passwort konnte nicht geändert werden."});await pool.execute("UPDATE customers SET password_hash=? WHERE id=?",[await makePasswordHash(b.new_password),session.customerId]);return sendJson(response,200,{message:"Passwort geändert."}); }
@@ -3179,7 +4559,8 @@ async function handleCustomerApi(request, response, pathname, searchParams) {
             await connection.beginTransaction();
             const [result] = await connection.execute("UPDATE quotes SET status='ABGELEHNT' WHERE id=? AND customer_id=? AND status='GESENDET'",[quoteId,session.customerId]);
             if (!result.affectedRows) { await connection.rollback(); return sendJson(response,409,{message:"Angebot nicht gefunden oder nicht zur Ablehnung verfügbar."}); }
-            await auditEvent(connection,"CUSTOMER",session.customerId,"QUOTE_REJECTED","QUOTE",quoteId,{reason:reason || null});
+            await updateRequestFromQuote(connection,quoteId,session.customerId,"declined");
+              await auditEvent(connection,"CUSTOMER",session.customerId,"QUOTE_REJECTED","QUOTE",quoteId,{reason:reason || null});
             await connection.execute("INSERT INTO notifications(recipient_type,recipient_id,notification_type,title,body,entity_type,entity_id) VALUES ('ADMIN',NULL,'QUOTE',?,?, 'QUOTE',?)",["Angebot abgelehnt",reason ? `Ein Kunde hat ein Angebot abgelehnt: ${reason}` : "Ein Kunde hat ein Angebot abgelehnt.",quoteId]);
             await connection.commit();
             return sendJson(response,200,{message:"Das Angebot wurde als abgelehnt dokumentiert.",status:"ABGELEHNT"});
@@ -3192,24 +4573,34 @@ async function handleCustomerApi(request, response, pathname, searchParams) {
         const accepting = pathname.endsWith("/accept");
         if (accepting) {
             if (request.method !== "POST" || !isSameOriginRequest(request)) return sendJson(response, 403, { message: "Anfrage nicht erlaubt." });
-            const [result] = await pool.execute("UPDATE quotes SET status='ANGENOMMEN',accepted_at=COALESCE(accepted_at,CURRENT_TIMESTAMP),accepted_by_customer_id=? WHERE id=? AND customer_id=? AND status='GESENDET'", [session.customerId, quoteId, session.customerId]);
-            return result.affectedRows ? sendJson(response, 200, { message: "Das Angebot wurde dokumentiert angenommen.", status: "ANGENOMMEN" }) : sendJson(response, 404, { message: "Angebot nicht gefunden oder nicht zur Annahme verfügbar." });
+            const connection=await pool.getConnection();
+            try {
+                await connection.beginTransaction();
+                const [result] = await connection.execute("UPDATE quotes SET status='ANGENOMMEN',accepted_at=COALESCE(accepted_at,CURRENT_TIMESTAMP),accepted_by_customer_id=? WHERE id=? AND customer_id=? AND status='GESENDET'", [session.customerId, quoteId, session.customerId]);
+                if (!result.affectedRows) return sendJson(response,404,{message:"Angebot nicht gefunden oder nicht zur Annahme verfügbar."});
+                await updateRequestFromQuote(connection,quoteId,session.customerId,"accepted");
+                await auditEvent(connection,"CUSTOMER",session.customerId,"QUOTE_ACCEPTED","QUOTE",quoteId);
+                await connection.commit();
+                return sendJson(response,200,{message:"Das Angebot wurde dokumentiert angenommen.",status:"ANGENOMMEN"});
+            } finally {
+                try { await connection.rollback(); } finally { connection.release(); }
+            }
         }
         if (request.method !== "GET") return sendJson(response, 405, { message: "Methode nicht erlaubt." });
         if (quoteId) {
-            const [rows] = await pool.execute("SELECT id,quote_number,service_description,object_address,postal_code,city,service_type,area_sqm,frequency,start_date,valid_until,customer_notes,net_amount,tax_amount,gross_amount,status,accepted_at,created_at FROM quotes WHERE id=? AND customer_id=?", [quoteId, session.customerId]);
+            const [rows] = await pool.execute("SELECT id,quote_number,service_description,object_address,postal_code,city,service_type,area_sqm,frequency,start_date,valid_until,customer_notes,net_amount,tax_amount,gross_amount,status,accepted_at,created_at FROM quotes WHERE id=? AND customer_id=? AND status NOT IN ('ENTWURF','STORNIERT')", [quoteId, session.customerId]);
             if (!rows[0]) return sendJson(response, 404, { message: "Angebot nicht gefunden." });
             const [items] = await pool.execute("SELECT id,sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount FROM quote_items WHERE quote_id=? ORDER BY sort_order,id", [quoteId]);
             return sendJson(response, 200, { quote: rows[0], items });
         }
-        const [rows] = await pool.execute("SELECT id,quote_number,service_type,valid_until,net_amount,tax_amount,gross_amount,status,created_at FROM quotes WHERE customer_id=? ORDER BY created_at DESC,id DESC", [session.customerId]);
+        const [rows] = await pool.execute("SELECT id,quote_number,service_type,valid_until,net_amount,tax_amount,gross_amount,status,created_at FROM quotes WHERE customer_id=? AND status NOT IN ('ENTWURF','STORNIERT') ORDER BY created_at DESC,id DESC", [session.customerId]);
         return sendJson(response, 200, { rows });
     }
     const customerContractMatch = pathname.match(/^\/api\/customer\/contracts(?:\/(\d+))?$/);
     if (customerContractMatch && request.method === "GET") {
         const contractId = customerContractMatch[1] ? Number(customerContractMatch[1]) : null;
-        const columns = "co.id,co.contract_number,co.start_date,co.end_date,co.service_description,co.service_type,co.interval_type,co.interval_details,co.net_amount,co.tax_rate,co.tax_amount,co.gross_amount,co.payment_interval,co.status,co.created_at";
-        const [rows] = await pool.execute(`SELECT ${columns},(SELECT o.planned_start FROM orders o WHERE o.contract_id=co.id AND o.customer_id=co.customer_id AND o.status <> 'STORNIERT' AND o.planned_start >= NOW() ORDER BY o.planned_start LIMIT 1) AS next_service_at,(SELECT o.status FROM orders o WHERE o.contract_id=co.id AND o.customer_id=co.customer_id AND o.status <> 'STORNIERT' AND o.planned_start >= NOW() ORDER BY o.planned_start LIMIT 1) AS next_service_status FROM contracts co WHERE co.customer_id=?${contractId ? " AND co.id=?" : ""} ORDER BY co.created_at DESC,co.id DESC`, contractId ? [session.customerId,contractId] : [session.customerId]);
+        const columns = "co.id,co.contract_number,DATE_FORMAT(co.start_date,'%Y-%m-%d') AS start_date,DATE_FORMAT(co.end_date,'%Y-%m-%d') AS end_date,DATE_FORMAT(co.termination_date,'%Y-%m-%d') AS termination_date,co.service_description,co.service_type,co.interval_type,co.interval_details,co.net_amount,co.tax_rate,co.tax_amount,co.gross_amount,co.payment_interval,co.status,co.created_at";
+        const [rows] = await pool.execute(`SELECT ${columns},(SELECT o.planned_start FROM orders o WHERE o.contract_id=co.id AND o.customer_id=co.customer_id AND o.status <> 'STORNIERT' AND o.planned_start >= NOW() ORDER BY o.planned_start LIMIT 1) AS next_service_at,(SELECT o.status FROM orders o WHERE o.contract_id=co.id AND o.customer_id=co.customer_id AND o.status <> 'STORNIERT' AND o.planned_start >= NOW() ORDER BY o.planned_start LIMIT 1) AS next_service_status FROM contracts co WHERE co.customer_id=? AND co.status<>'ENTWURF'${contractId ? " AND co.id=?" : ""} ORDER BY co.created_at DESC,co.id DESC`, contractId ? [session.customerId,contractId] : [session.customerId]);
         if (contractId && !rows[0]) return sendJson(response,404,{message:"Vertrag nicht gefunden."});
         return sendJson(response,200,contractId?{contract:rows[0]}:{rows});
     }
@@ -3218,7 +4609,7 @@ async function handleCustomerApi(request, response, pathname, searchParams) {
         if (request.method !== "GET") return sendJson(response,405,{message:"Methode nicht erlaubt."});
         const invoiceId = Number(customerInvoicePdfMatch[1]);
         if (!Number.isSafeInteger(invoiceId) || invoiceId < 1) return sendJson(response,404,{message:"Rechnung nicht gefunden."});
-        const [rows] = await pool.execute("SELECT id,invoice_number,customer_name_snapshot,invoice_date,due_date,net_amount,tax_amount,gross_amount FROM invoices WHERE id=? AND customer_id=?",[invoiceId,session.customerId]);
+        const [rows] = await pool.execute("SELECT id,invoice_number,customer_name_snapshot,invoice_date,due_date,net_amount,tax_amount,gross_amount FROM invoices WHERE id=? AND customer_id=? AND status NOT IN ('ENTWURF','STORNIERT')",[invoiceId,session.customerId]);
         const invoice = rows[0]; if (!invoice) return sendJson(response,404,{message:"Rechnung nicht gefunden."});
         const [items] = await pool.execute("SELECT title,quantity,unit,gross_amount FROM invoice_items WHERE invoice_id=? ORDER BY sort_order,id",[invoiceId]);
         auditEvent(pool,"CUSTOMER",session.customerId,"INVOICE_PDF_DOWNLOADED","INVOICE",invoiceId,null).catch(()=>{});
@@ -3228,15 +4619,15 @@ async function handleCustomerApi(request, response, pathname, searchParams) {
     if (customerInvoiceMatch && request.method === "GET") {
         const invoiceId = customerInvoiceMatch[1] ? Number(customerInvoiceMatch[1]) : null;
         if (invoiceId) {
-            const [rows] = await pool.execute("SELECT id,invoice_number,invoice_date,service_period_from,service_period_to,due_date,status,net_amount,tax_amount,gross_amount,paid_amount,outstanding_amount FROM invoices WHERE id=? AND customer_id=?", [invoiceId, session.customerId]);
+            const [rows] = await pool.execute("SELECT id,invoice_number,invoice_date,service_period_from,service_period_to,due_date,status,net_amount,tax_amount,gross_amount,paid_amount,outstanding_amount FROM invoices WHERE id=? AND customer_id=? AND status NOT IN ('ENTWURF','STORNIERT')", [invoiceId, session.customerId]);
             if (!rows[0]) return sendJson(response, 404, { message: "Rechnung nicht gefunden." });
             const [items] = await pool.execute("SELECT sort_order,title,description,quantity,unit,unit_price,discount_amount,net_amount,tax_rate,tax_amount,gross_amount FROM invoice_items WHERE invoice_id=? ORDER BY sort_order,id", [invoiceId]);
             return sendJson(response, 200, { invoice: rows[0], items });
         }
-        const [rows] = await pool.execute("SELECT id,invoice_number,invoice_date,due_date,status,net_amount,tax_amount,gross_amount,paid_amount,outstanding_amount FROM invoices WHERE customer_id=? ORDER BY invoice_date DESC,id DESC", [session.customerId]);
+        const [rows] = await pool.execute("SELECT id,invoice_number,invoice_date,due_date,status,net_amount,tax_amount,gross_amount,paid_amount,outstanding_amount FROM invoices WHERE customer_id=? AND status NOT IN ('ENTWURF','STORNIERT') ORDER BY invoice_date DESC,id DESC", [session.customerId]);
         return sendJson(response, 200, { rows });
     }
-    const resource = pathname.match(/^\/api\/customer\/(appointments|quotes)(?:\/(\d+))?$/); if (resource && request.method === "GET") { const table=resource[1]==="appointments"?"appointments":"quote_requests", link=table==="appointments"?"portal_customer_id":"customer_id", id=resource[2]?Number(resource[2]):null; const columns=table==="appointments"?"id,service,object_type,address,postal_code,city,preferred_date,start_time,end_time,status,created_at":"id,requested_service,object_type,address,postal_code,city,status,created_at"; const [rows]=await pool.execute(`SELECT ${columns} FROM ${table} WHERE ${link}=?${id?" AND id=?":""} ORDER BY created_at DESC`,id?[session.customerId,id]:[session.customerId]); if(id&&!rows[0])return sendJson(response,404,{message:"Eintrag nicht gefunden."}); return sendJson(response,200,id?{[resource[1].slice(0,-1)]:rows[0]}:{rows}); }
+    const resource = pathname.match(/^\/api\/customer\/(appointments|quotes)(?:\/(\d+))?$/); if (resource && request.method === "GET") { const table=resource[1]==="appointments"?"appointments":"quote_requests", link=table==="appointments"?"portal_customer_id":"customer_id", id=resource[2]?Number(resource[2]):null; const columns=table==="appointments"?"id,service,object_type,address,postal_code,city,DATE_FORMAT(preferred_date,'%Y-%m-%d') AS preferred_date,start_time,end_time,status,created_at":"id,requested_service,object_type,address,postal_code,city,status,created_at"; const [rows]=await pool.execute(`SELECT ${columns} FROM ${table} WHERE ${link}=?${id?" AND id=?":""} ORDER BY created_at DESC`,id?[session.customerId,id]:[session.customerId]); if(id&&!rows[0])return sendJson(response,404,{message:"Eintrag nicht gefunden."}); return sendJson(response,200,id?{[resource[1].slice(0,-1)]:rows[0]}:{rows}); }
     return sendJson(response,404,{message:"API-Endpunkt nicht gefunden."});
 }
 
@@ -3359,14 +4750,14 @@ async function handleEmployeeApi(request, response, pathname, searchParams) {
         const connection = await pool.getConnection();
         try {
             await connection.beginTransaction();
-            const [rows] = await connection.execute("SELECT i.id AS invitation_id,i.employee_id,i.expires_at,i.accepted_at,i.revoked_at,e.id,e.first_name,e.last_name,e.email,e.role,e.status FROM employee_invitations i JOIN employees e ON e.id=i.employee_id WHERE i.token_hash=? FOR UPDATE", [invitationTokenHash(token)]);
+            const [rows] = await connection.execute("SELECT i.id AS invitation_id,i.employee_id,i.expires_at,i.accepted_at,i.revoked_at,e.id,e.first_name,e.last_name,e.email,e.role,e.status,e.session_version FROM employee_invitations i JOIN employees e ON e.id=i.employee_id WHERE i.token_hash=? FOR UPDATE", [invitationTokenHash(token)]);
             const invitation = rows[0];
             if (!invitation || invitation.accepted_at || invitation.revoked_at || new Date(invitation.expires_at).getTime() < Date.now()) { await connection.rollback(); return sendJson(response, 400, { message: "Dieser Einladungslink ist ungültig oder abgelaufen." }); }
             await connection.execute("UPDATE employees SET password_hash=?,status='ACTIVE',last_login_at=CURRENT_TIMESTAMP WHERE id=?", [await makePasswordHash(password), invitation.employee_id]);
             await connection.execute("UPDATE employee_invitations SET accepted_at=CURRENT_TIMESTAMP WHERE id=?", [invitation.invitation_id]);
             await connection.commit();
             const sessionToken = crypto.randomBytes(32).toString("base64url");
-            employeeSessions.set(sessionToken, { employeeId: invitation.employee_id, role: invitation.role, expiresAt: Date.now() + EMPLOYEE_SESSION_TTL_MS });
+            employeeSessions.set(sessionToken, { employeeId: invitation.employee_id, role: invitation.role, version:invitation.session_version, expiresAt: Date.now() + EMPLOYEE_SESSION_TTL_MS });
             employeeLoginBuckets.delete(request.socket.remoteAddress || "unknown");
             setEmployeeCookie(response, sessionToken, Math.floor(EMPLOYEE_SESSION_TTL_MS / 1000));
             return sendJson(response, 200, { authenticated: true, employee: { id: invitation.employee_id, first_name: invitation.first_name, last_name: invitation.last_name, email: invitation.email, role: invitation.role } });
@@ -3381,11 +4772,11 @@ async function handleEmployeeApi(request, response, pathname, searchParams) {
         const email = validateEmail(body.email), password = typeof body.password === "string" ? body.password : "";
         if (!email || !password) return sendJson(response, 401, { message: "E-Mail oder Passwort ist falsch." });
         try {
-            const [rows] = await pool.execute("SELECT id,first_name,last_name,email,role,status,password_hash FROM employees WHERE email=?", [email]);
+            const [rows] = await pool.execute("SELECT id,first_name,last_name,email,role,status,password_hash,session_version FROM employees WHERE email=?", [email]);
             const employee = rows[0];
             if (!employee || employee.status !== "ACTIVE" || !await verifyPassword(password, employee.password_hash)) return sendJson(response, 401, { message: "E-Mail oder Passwort ist falsch." });
             const token = crypto.randomBytes(32).toString("base64url");
-            employeeSessions.set(token, { employeeId: employee.id, role: employee.role, expiresAt: Date.now() + EMPLOYEE_SESSION_TTL_MS });
+            employeeSessions.set(token, { employeeId: employee.id, role: employee.role, version:employee.session_version, expiresAt: Date.now() + EMPLOYEE_SESSION_TTL_MS });
             employeeLoginBuckets.delete(request.socket.remoteAddress || "unknown");
             await pool.execute("UPDATE employees SET last_login_at=CURRENT_TIMESTAMP WHERE id=?", [employee.id]);
             setEmployeeCookie(response, token, Math.floor(EMPLOYEE_SESSION_TTL_MS / 1000));
@@ -3401,7 +4792,12 @@ async function handleEmployeeApi(request, response, pathname, searchParams) {
         return sendJson(response, 200, { authenticated: false });
     }
 
-    const session = employeeSessionOrRespond(request, response); if (!session) return;
+    const session = await portalSessionOrRespond(request,response,"employee"); if (!session) return;
+    if (pathname === "/api/employee/home") return sendPortalHome(request,response,(day,time)=>employeeHome(session.employeeId,day,time));
+
+    if (/^\/api\/employee\/absence-requests(?:\/\d+)?$/.test(pathname)) return handleAbsenceRequests(request,response,pathname,searchParams,session.employeeId);
+    if (pathname === "/api/employee/attendance" || pathname === "/api/employee/attendance/check-in" || pathname === "/api/employee/attendance/check-out") return handleEmployeeAttendance(request,response,pathname,searchParams,session);
+    if (pathname === "/api/employee/location-simulation" || /^\/api\/employee\/location-simulation\/(?:start|stop|update)$/.test(pathname)) return handleEmployeeLocationSimulation(request,response,pathname,session);
     if (pathname === "/api/employee/notifications" || /^\/api\/employee\/notifications\/\d+\/read$/.test(pathname)) return handleEmployeeNotifications(request,response,pathname,session);
     if (pathname === "/api/employee/material-consumptions" || /^\/api\/employee\/material-consumptions\/\d+$/.test(pathname)) return handleEmployeeMaterialConsumptions(request,response,pathname,session);
     if (pathname === "/api/employee/service-reports" || /^\/api\/employee\/service-reports\/\d+(?:\/submit)?$/.test(pathname)) return handleEmployeeServiceReports(request,response,pathname,session);
@@ -3498,7 +4894,7 @@ async function handleEmployeeApi(request, response, pathname, searchParams) {
         const orderId = Number(employeeOrderInvoiceMatch[1]);
         const [assigned] = await pool.execute("SELECT o.id,o.customer_id FROM order_assignments a JOIN orders o ON o.id=a.order_id WHERE a.employee_id=? AND a.order_id=? AND a.status <> 'STORNIERT'", [session.employeeId, orderId]);
         if (!assigned[0]) return sendJson(response, 404, { message: "Auftrag nicht gefunden." });
-        const [rows] = await pool.execute("SELECT id,invoice_number,status,outstanding_amount,due_date FROM invoices WHERE order_id=? AND customer_id=? ORDER BY invoice_date DESC,id DESC", [orderId, assigned[0].customer_id]);
+        const [rows] = await pool.execute("SELECT id,invoice_number,status,outstanding_amount,due_date FROM invoices WHERE order_id=? AND customer_id=? AND status NOT IN ('ENTWURF','STORNIERT') ORDER BY invoice_date DESC,id DESC", [orderId, assigned[0].customer_id]);
         return sendJson(response, 200, { rows });
     }
 
@@ -3677,6 +5073,7 @@ if (process.env.VALIDATE_CONFIG_ONLY === "true") {
 }
 
 async function shutdown() {
+    clearInterval(recurringAutomationTimer);
     server.close(async () => {
         await Promise.all([pool, adminPool].filter(Boolean).map(connectionPool => connectionPool.end()));
         process.exit(0);

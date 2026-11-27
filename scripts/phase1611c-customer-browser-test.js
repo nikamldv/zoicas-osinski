@@ -46,11 +46,19 @@ async function main() {
             const page = await context.newPage(); page.setDefaultTimeout(8000);
             await login(page, fixture.email); check(`${viewport.name}: portal login`, true); await noOverflow(page, viewport.name);
             await page.locator('[data-portal-view="quotes"]').click(); await page.waitForSelector("[data-quote-id]");
-            await page.locator("[data-quote-id]").first().click(); await page.waitForSelector("[data-reject-quote]");
+            const sentQuote = page.locator("article.portal-order-card").filter({ hasText:"GESENDET" }).locator("[data-quote-id]").first();
+            check(`${viewport.name}: sent quote available`, await sentQuote.count() === 1);
+            const quoteDetailResponse = page.waitForResponse(response => /\/api\/customer\/quotes\/\d+$/.test(response.url()) && response.request().method() === "GET");
+            await sentQuote.click(); await quoteDetailResponse;
+            await page.waitForSelector("[data-reject-quote]");
             check(`${viewport.name}: rejection control visible`, await page.locator("[data-reject-quote]").count() === 1);
             if (viewport.name === "mobile") {
                 page.on("dialog", async dialog => { if (dialog.type() === "confirm") await dialog.accept(); else await dialog.accept("TEST DATA – browser rejection"); });
-                await page.locator("[data-reject-quote]").click(); await page.waitForFunction(() => document.querySelector("#portal-description")?.textContent.includes("abgelehnt"));
+                const rejectionResponse = page.waitForResponse(response => /\/api\/customer\/quotes\/\d+\/reject$/.test(response.url()) && response.request().method() === "POST");
+                await page.locator("[data-reject-quote]").click();
+                const response = await rejectionResponse;
+                check("mobile: quote rejection API response", response.status() === 200, String(response.status()));
+                await page.waitForTimeout(250);
                 check("mobile: quote rejection status updated", await page.locator("#portal-data").textContent().then(text => text.includes("ABGELEHNT")));
             }
             await page.locator('[data-portal-view="invoices"]').click(); await page.waitForSelector("[data-invoice-id]"); await page.locator("[data-invoice-id]").click();

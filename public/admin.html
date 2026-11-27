@@ -5,13 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="robots" content="noindex, nofollow">
     <meta name="theme-color" content="#071a36">
-    <title>Verwaltung | Zoicas &amp; Osinski</title>
+    <title>Verwaltung | Zoicas &amp; Osinski</title><script src="../js/portal-theme-init.js" data-portal-theme="admin"></script>
     <link rel="icon" href="../assets/images/Logo/zoicas-osinski.svg" type="image/svg+xml">
     <link rel="stylesheet" href="../Css/admin.css">
-    <script src="../js/admin.js" defer></script>
+     <script src="../js/admin-dashboard.js" defer></script><script src="../js/admin-management.js" defer></script><script src="../js/admin.js" defer></script>
     <script src="../js/quality-admin.js" defer></script>
-</head>
-<body>
+<link rel="stylesheet" href="../Css/dashboard-home.css"><link rel="stylesheet" href="../Css/admin-dashboard.css"><link rel="stylesheet" href="../Css/admin-management.css"><link rel="stylesheet" href="../Css/portal-polish.css"></head>
+<body class="admin-portal">
     <main id="login-view" class="login-screen">
         <a class="back-link" href="../index.html">&larr; Zurück zur Website</a>
         <section class="login-card" aria-labelledby="login-title">
@@ -34,83 +34,86 @@
     </main>
 
     <div id="dashboard-view" class="dashboard" hidden>
-        <aside class="sidebar">
+        <a class="admin-skip" href="#admin-main">Zum Inhalt</a>
+        <aside class="sidebar" id="admin-sidebar">
             <a class="brand" href="../index.html" aria-label="Zoicas &amp; Osinski Startseite">
-                <img src="../assets/images/Logo/zoicas-osinski.svg" alt="Zoicas &amp; Osinski">
+                <img src="../assets/images/Logo/zoicas-osinski.png" alt="Zoicas &amp; Osinski">
             </a>
             <div class="sidebar-label">ARBEITSBEREICH</div>
             <nav class="side-nav" aria-label="Verwaltungsbereiche">
-                <p class="nav-group-title">Eingänge</p>
-                <button class="nav-item is-active" type="button" data-type="contact">
-                    <span class="nav-icon" aria-hidden="true">✉</span>
-                    <span>Kontaktanfragen</span>
-                    <span id="nav-contact-count" class="nav-count">0</span>
+<div class="admin-nav-group"><p class="nav-group-title">Übersicht</p>
+<button class="nav-item is-active" type="button" data-type="home"><span class="nav-icon" aria-hidden="true">⌂</span><span class="admin-nav-label">Dashboard</span></button></div>
+<div class="admin-nav-group"><p class="nav-group-title">Einsatz & Team</p>
+<button class="nav-item" type="button" data-type="schedule"><span class="nav-icon" aria-hidden="true">▦</span><span class="admin-nav-label">Kalender</span><span class="nav-count">↗</span></button>
+<button class="nav-item" type="button" data-type="appointment">
+                    <span class="nav-icon" aria-hidden="true">◷</span><span class="admin-nav-label">Termine</span><span id="nav-appointment-count" class="nav-count">0</span>
                 </button>
-                <button class="nav-item" type="button" data-type="career">
-                    <span class="nav-icon" aria-hidden="true">↗</span>
-                    <span>Bewerbungen</span>
-                    <span id="nav-career-count" class="nav-count">0</span>
-                </button>
-                <button class="nav-item" type="button" data-type="quote">
-                    <span class="nav-icon" aria-hidden="true">€</span>
-                    <span>Angebotsanfragen</span>
+<button class="nav-item" type="button" data-type="order"><span class="nav-icon" aria-hidden="true">▤</span><span class="admin-nav-label">Aufträge</span><span id="nav-order-count" class="nav-count">—</span></button>
+<button class="nav-item" type="button" data-type="recurring"><span class="nav-icon" aria-hidden="true">↻</span><span class="admin-nav-label">Wiederkehrende Aufträge</span><span id="nav-recurring-count" class="nav-count">—</span></button>
+<button class="nav-item" type="button" data-type="employee"><span class="nav-icon" aria-hidden="true">♙</span><span class="admin-nav-label">Mitarbeiter</span><span id="nav-employee-count" class="nav-count">—</span></button>
+<button class="nav-item" type="button" data-type="attendance"><span class="nav-icon" aria-hidden="true">◴</span><span class="admin-nav-label">Zeiterfassung</span><span id="nav-attendance-count" class="nav-count">—</span></button>
+<button class="admin-nav-extra" type="button" data-admin-nav="absence"><span class="nav-icon" aria-hidden="true">◩</span><span class="admin-nav-label">Urlaub und Abwesenheit</span></button>
+<button class="nav-item" type="button" data-type="service-report"><span class="nav-icon" aria-hidden="true">✓</span><span class="admin-nav-label">Leistungsnachweise</span><span id="nav-service-report-count" class="nav-count">—</span></button>
+<button class="nav-item" type="button" data-type="live-locations"><span class="nav-icon" aria-hidden="true">⌖</span><span class="admin-nav-label">Live-Standorte</span><span class="nav-count">TEST</span></button></div>
+<div class="admin-nav-group"><p class="nav-group-title">Kunden & Verkauf</p>
+<button class="nav-item" type="button" data-type="customer"><span class="nav-icon" aria-hidden="true">◎</span><span class="admin-nav-label">Kunden</span><span class="nav-count">—</span></button>
+<button class="nav-item" type="button" data-type="quote">
+                    <span class="nav-icon" aria-hidden="true">＋</span><span class="admin-nav-label">Angebotsanfragen</span>
                     <span id="nav-quote-count" class="nav-count">0</span>
                 </button>
-                <p class="nav-group-title">Vertrieb</p>
-                <button class="nav-item" type="button" data-type="offer">
-                    <span class="nav-icon" aria-hidden="true">€</span><span>Angebote</span><span id="nav-offer-count" class="nav-count">—</span>
+<button class="nav-item" type="button" data-type="offer">
+                    <span class="nav-icon" aria-hidden="true">◇</span><span class="admin-nav-label">Angebote</span><span id="nav-offer-count" class="nav-count">—</span>
                 </button>
-                <button class="nav-item" type="button" data-type="contract">
-                    <span class="nav-icon" aria-hidden="true">§</span><span>Verträge</span><span id="nav-contract-count" class="nav-count">—</span>
+<button class="nav-item" type="button" data-type="contract">
+                    <span class="nav-icon" aria-hidden="true">▧</span><span class="admin-nav-label">Verträge</span><span id="nav-contract-count" class="nav-count">—</span>
                 </button>
-                <button class="nav-item" type="button" data-type="recurring"><span class="nav-icon" aria-hidden="true">⟳</span><span>Wiederkehrende Aufträge</span><span id="nav-recurring-count" class="nav-count">—</span></button>
-                <button class="nav-item" type="button" data-type="invoice">
-                    <span class="nav-icon" aria-hidden="true">€</span><span>Rechnungen</span><span id="nav-invoice-count" class="nav-count">—</span>
+<button class="nav-item" type="button" data-type="invoice">
+                    <span class="nav-icon" aria-hidden="true">▤</span><span class="admin-nav-label">Rechnungen</span><span id="nav-invoice-count" class="nav-count">—</span>
                 </button>
-                <p class="nav-group-title">Betrieb</p>
-                <button class="nav-item" type="button" data-type="appointment">
-                    <span class="nav-icon" aria-hidden="true">◷</span><span>Termine</span><span id="nav-appointment-count" class="nav-count">0</span>
+<button class="nav-item" type="button" data-type="finance"><span class="nav-icon" aria-hidden="true">€</span><span class="admin-nav-label">Finanzen</span><span class="nav-count">↗</span></button></div>
+<div class="admin-nav-group"><p class="nav-group-title">Verwaltung</p>
+<button class="nav-item" type="button" data-type="materials"><span class="nav-icon" aria-hidden="true">⊞</span><span class="admin-nav-label">Lager</span><span id="nav-material-count" class="nav-count">—</span></button>
+<button class="nav-item" type="button" data-type="quality"><span class="nav-icon" aria-hidden="true">✓</span><span class="admin-nav-label">Qualitätsmanagement</span><span id="nav-quality-count" class="nav-count">—</span></button>
+<button class="nav-item" type="button" data-type="document"><span class="nav-icon" aria-hidden="true">▱</span><span class="admin-nav-label">Dokumente</span><span class="nav-count">↗</span></button>
+<button class="nav-item" type="button" data-type="reporting"><span class="nav-icon" aria-hidden="true">▥</span><span class="admin-nav-label">Berichte</span><span class="nav-count">↗</span></button>
+<button class="nav-item" type="button" data-type="message"><span class="nav-icon" aria-hidden="true">✉</span><span class="admin-nav-label">Nachrichten</span><span class="nav-count">↗</span></button>
+<button class="nav-item" type="button" data-type="notification"><span class="nav-icon" aria-hidden="true">◉</span><span class="admin-nav-label">Benachrichtigungen</span><span class="nav-count">↗</span></button>
+<button class="nav-item" type="button" data-type="action-center"><span class="nav-icon" aria-hidden="true">!</span><span class="admin-nav-label">Aktionscenter</span><span id="nav-action-count" class="nav-count">—</span></button>
+<button class="nav-item" type="button" data-type="contact">
+                    <span class="nav-icon" aria-hidden="true">✉</span><span class="admin-nav-label">Kontaktanfragen</span>
+                    <span id="nav-contact-count" class="nav-count">0</span>
                 </button>
-                <button class="nav-item" type="button" data-type="customer"><span class="nav-icon" aria-hidden="true">◉</span><span>Kunden</span><span class="nav-count">—</span></button>
-                <button class="nav-item" type="button" data-type="employee"><span class="nav-icon" aria-hidden="true">★</span><span>Mitarbeiter</span><span id="nav-employee-count" class="nav-count">—</span></button>
-                <button class="nav-item" type="button" data-type="order"><span class="nav-icon" aria-hidden="true">▣</span><span>Aufträge</span><span id="nav-order-count" class="nav-count">—</span></button>
-                <button class="nav-item" type="button" data-type="schedule"><span class="nav-icon" aria-hidden="true">▤</span><span>Einsatzplanung</span><span class="nav-count">↗</span></button>
-                <button class="nav-item" type="button" data-type="service-report"><span class="nav-icon" aria-hidden="true">✓</span><span>Leistungsnachweise</span><span id="nav-service-report-count" class="nav-count">—</span></button>
-                <button class="nav-item" type="button" data-type="quality"><span class="nav-icon" aria-hidden="true">!</span><span>Qualität &amp; Vorfälle</span><span id="nav-quality-count" class="nav-count">—</span></button>
-                <p class="nav-group-title">Material &amp; Lager</p>
-                <button class="nav-item" type="button" data-type="materials"><span class="nav-icon" aria-hidden="true">▤</span><span>Materialverwaltung</span><span id="nav-material-count" class="nav-count">—</span></button>
-                <p class="nav-group-title">Finanzen</p>
-                <button class="nav-item" type="button" data-type="finance"><span class="nav-icon" aria-hidden="true">€</span><span>Finanzen</span><span class="nav-count">↗</span></button>
-                <p class="nav-group-title">Controlling</p>
-                <button class="nav-item" type="button" data-type="action-center"><span class="nav-icon" aria-hidden="true">!</span><span>Aktionscenter</span><span id="nav-action-count" class="nav-count">—</span></button>
-                <button class="nav-item" type="button" data-type="reporting"><span class="nav-icon" aria-hidden="true">R</span><span>Reporting</span><span class="nav-count">↗</span></button>
-                <p class="nav-group-title">Kommunikation &amp; System</p>
-                <button class="nav-item" type="button" data-type="document"><span class="nav-icon" aria-hidden="true">▣</span><span>Dokumente</span><span class="nav-count">↗</span></button>
-                <button class="nav-item" type="button" data-type="message"><span class="nav-icon" aria-hidden="true">✉</span><span>Nachrichten</span><span class="nav-count">↗</span></button>
-                <button class="nav-item" type="button" data-type="notification"><span class="nav-icon" aria-hidden="true">●</span><span>Benachrichtigungen</span><span class="nav-count">↗</span></button>
-                <button class="nav-item" type="button" data-type="audit"><span class="nav-icon" aria-hidden="true">◫</span><span>Audit-Protokoll</span><span class="nav-count">↗</span></button>
-            </nav>
+<button class="nav-item" type="button" data-type="career">
+                    <span class="nav-icon" aria-hidden="true">↗</span><span class="admin-nav-label">Bewerbungen</span>
+                    <span id="nav-career-count" class="nav-count">0</span>
+                </button>
+<button class="nav-item" type="button" data-type="audit"><span class="nav-icon" aria-hidden="true">◫</span><span class="admin-nav-label">Audit-Protokoll</span><span class="nav-count">↗</span></button>
+<button class="admin-nav-extra" type="button" data-admin-nav="settings"><span class="nav-icon" aria-hidden="true">⚙</span><span class="admin-nav-label">Einstellungen</span></button></div>
+</nav>
             <div class="sidebar-bottom">
                 <a class="back-link" href="../index.html">Website ansehen <span aria-hidden="true">↗</span></a>
-                <div class="account-card">
-                    <span class="account-avatar" aria-hidden="true">AD</span>
-                    <span class="account-meta"><strong id="account-name">Admin</strong><small>Administrator</small></span>
-                    <button id="logout-button" class="icon-button" type="button" aria-label="Abmelden" title="Abmelden">↪</button>
-                </div>
+                
             </div>
         </aside>
 
-        <main class="main-panel">
+        <dialog id="admin-nav-drawer" class="admin-nav-drawer" aria-label="Verwaltungsnavigation"><button id="admin-nav-close" class="button button-light" type="button">Menü schließen</button></dialog>
+        <main class="main-panel" id="admin-main" tabindex="-1">
             <header class="topbar">
-                <div>
-                    <p class="eyebrow">ZOICAS &amp; OSINSKI <span class="eyebrow-divider">/</span> VERWALTUNG</p>
-                    <h1 id="page-title">Kontaktanfragen</h1>
-                </div>
-                <div class="topbar-right">
+                <div class="admin-top-start"><button id="admin-nav-toggle" class="button button-light admin-icon" type="button" aria-label="Navigation umschalten" aria-controls="admin-sidebar" aria-expanded="true">☰</button><div>
+                    <nav class="admin-breadcrumb" aria-label="Brotkrumennavigation"><button type="button" data-admin-go="home">Verwaltung</button><span aria-hidden="true"> / </span><span id="admin-crumb" aria-current="page">Dashboard</span></nav>
+                    <h1 id="page-title" tabindex="-1">Kontaktanfragen</h1>
+                </div></div>
+                <div class="topbar-right"><div class="admin-top-actions"><button id="admin-search-shortcut" class="button button-light" type="button" hidden>Suchen</button><button id="admin-notifications" class="button button-light" type="button" data-admin-go="notification">Benachrichtigungen <span id="admin-unread" hidden></span></button><button id="admin-theme" class="button button-light" type="button" aria-label="Dunkles Design" aria-pressed="false"><span aria-hidden="true">◐</span></button><details id="admin-account"><summary>Adminprofil</summary><div class="account-card">
+                    <span class="account-avatar" aria-hidden="true">AD</span>
+                    <span class="account-meta"><strong id="account-name">Admin</strong><small>Administrator</small></span>
+                    <button id="logout-button" class="icon-button" type="button" aria-label="Abmelden" title="Abmelden">↪</button>
+                </div></details></div>
                     <span class="live-indicator"><span></span> Datenbank verbunden</span>
                     <button id="create-employee-button" class="button button-primary" type="button" hidden>Mitarbeiter anlegen</button>
                     <button id="create-order-button" class="button button-primary" type="button" hidden>Auftrag anlegen</button>
                     <button id="create-offer-button" class="button button-primary" type="button" hidden>Angebot anlegen</button>
+                    <button id="register-existing-contract" class="button button-light" type="button" hidden>Bestehenden Vertrag erfassen</button>
+                    <button id="create-customer-button" class="button button-primary" type="button" hidden>Neuen Kunden anlegen</button>
                     <button id="create-contract-button" class="button button-primary" type="button" hidden>Vertrag anlegen</button>
                     <button id="create-recurring-button" class="button button-primary" type="button" hidden>Einsatzplan anlegen</button>
                     <button id="generate-recurring-button" class="button button-light" type="button" hidden>Aufträge generieren</button>
@@ -122,6 +125,10 @@
                 </div>
             </header>
 
+            <div id="admin-page-intro" class="admin-page-intro" hidden><p id="admin-page-description"></p><dl id="admin-view-summary" class="admin-view-summary" hidden aria-live="polite"><div><dt>Einträge</dt><dd id="admin-view-count"></dd></div></dl></div>
+            <div id="management-progress" class="management-progress" role="status" tabindex="-1" hidden>Ansicht wird geladen …<span class="admin-skeleton" aria-hidden="true"></span><span class="admin-skeleton" aria-hidden="true"></span></div>
+            <div id="admin-view-error" class="admin-queue-error admin-state error" hidden><p id="admin-view-error-label" role="status"></p><button id="admin-view-retry" class="button button-light" type="button">Erneut versuchen</button></div>
+            <section id="management-home" class="portal-home" aria-label="Managementübersicht"></section>
             <section class="stats-grid" aria-label="Übersicht">
                 <article class="stat-card stat-card-dark">
                     <div class="stat-top"><span>Kontaktanfragen</span><span class="stat-icon" aria-hidden="true">✉</span></div>
@@ -146,7 +153,7 @@
             </section>
 
             <section id="finance-panel" class="finance-panel" hidden aria-labelledby="finance-title">
-                <div class="records-heading"><div><p class="eyebrow">FINANZEN</p><h2 id="finance-title">Finanz-Dashboard</h2></div><div class="finance-filters"><select id="finance-period"><option value="today">Heute</option><option value="week">Diese Woche</option><option value="month" selected>Dieser Monat</option><option value="last-month">Letzter Monat</option><option value="year">Dieses Jahr</option></select><button id="finance-refresh" class="button button-light" type="button">Aktualisieren</button></div></div>
+                <div class="records-heading"><div><p class="eyebrow">FINANZEN</p><h2 id="finance-title">Finanz-Dashboard</h2></div><div class="finance-filters"><select id="finance-period" aria-label="Finanzzeitraum"><option value="today">Heute</option><option value="week">Diese Woche</option><option value="month" selected>Dieser Monat</option><option value="last-month">Letzter Monat</option><option value="year">Dieses Jahr</option></select><button id="finance-refresh" class="button button-light" type="button">Aktualisieren</button></div></div>
                 <div id="finance-cards" class="finance-cards"></div>
                 <div class="finance-tabs"><button class="button button-light is-active" data-finance-tab="payments" type="button">Mitarbeitereinnahmen</button><button class="button button-light" data-finance-tab="cashbook" type="button">Kassenbuch</button><button class="button button-light" data-finance-tab="transfers" type="button">Kassenübergaben</button></div>
                 <button id="create-expense-button" class="button button-primary" type="button">Ausgabe erfassen</button>
@@ -168,11 +175,54 @@
                 <section class="reporting-export" aria-labelledby="reporting-export-title"><div><p class="eyebrow">EXPORT</p><h3 id="reporting-export-title">Bericht exportieren</h3><p id="reporting-period-label" class="form-note">Zeitraum: wird geladen</p></div><label>Bericht<select id="reporting-export-type"><option value="revenue">Umsatz</option><option value="invoices">Rechnungen</option><option value="orders">Aufträge</option><option value="customers">Kunden</option><option value="employees">Mitarbeiter</option><option value="materials">Materialverbrauch</option></select></label><div class="dialog-actions"><button id="reporting-export-csv" class="button button-primary" type="button">CSV herunterladen</button><button id="reporting-export-pdf" class="button button-light" type="button">PDF herunterladen</button><button id="reporting-print" class="button button-light" type="button">Drucken</button></div></section>
                 <div id="reporting-message" class="dashboard-message" role="status" aria-live="polite" hidden></div><div id="reporting-cards" class="reporting-cards" aria-live="polite"></div><div id="reporting-visuals" class="reporting-visuals" aria-live="polite"></div><section class="performance-analysis" aria-labelledby="performance-analysis-title"><div class="records-heading"><div><p class="eyebrow">LEISTUNGSANALYSE</p><h3 id="performance-analysis-title">Management Performance</h3><p class="form-note">Contribution vor Personalkosten: Umsatz minus Materialkosten. Personalkosten sind nicht enthalten.</p></div></div><details class="performance-filter-panel" open><summary>Leistungsanalyse filtern</summary><div class="finance-filter-grid"><label>Leistung<select id="performance-service"><option value="">Alle Leistungen</option></select></label><label>Kunde<select id="performance-customer"><option value="">Alle Kunden</option></select></label><label>Mitarbeiter <span class="field-hint">nur Operations &amp; Orders</span><select id="performance-employee"><option value="">Alle Mitarbeiter</option></select></label></div><div class="dialog-actions"><button id="performance-apply-filters" class="button button-primary" type="button">Filter anwenden</button><button id="performance-clear-filters" class="button button-light" type="button">Filter zurücksetzen</button></div></details><div id="performance-cards" class="reporting-cards" aria-live="polite"></div><div id="performance-content" class="reporting-summary" aria-live="polite"></div></section><p class="reporting-disclaimer"><strong>Teilergebnis – unvollständig:</strong> Umsatz netto − erfasste Ausgaben − erfasste Materialverbrauchskosten. Dies ist kein Gewinn.</p><div id="reporting-summary" class="reporting-summary"></div>
             </section>
+            <section id="recurring-operations-panel" class="records-panel recurring-operations" hidden aria-labelledby="recurring-operations-title">
+                <div class="records-heading"><h2 id="recurring-operations-title">Wiederkehrende Einsätze prüfen</h2><button id="recurring-operations-refresh" class="button button-light" type="button">Aktualisieren</button></div>
+                <form id="recurring-automation-form" class="recurring-automation-form" hidden>
+                    <label><input name="enabled" type="checkbox"> Automatische Generierung im Testsystem</label>
+                    <label>Planungshorizont (Tage) <input name="days" type="number" min="1" max="30" required></label>
+                    <button class="button button-primary" type="submit">Einstellungen speichern</button>
+                </form>
+                <p id="recurring-operations-status" role="status"></p>
+                <h3>Offene Ausnahmen</h3>
+                <div id="recurring-exceptions-list" class="assignment-list"></div>
+                <div class="absence-request-pagination"><button id="recurring-exceptions-prev" class="button button-light" type="button" disabled>Zurück</button><button id="recurring-exceptions-next" class="button button-light" type="button" disabled>Weiter</button></div>
+                <h3>Letzte Generierungsläufe</h3>
+                <div id="recurring-runs-list" class="assignment-list"></div>
+            </section>
             <section id="schedule-panel" class="schedule-panel" hidden aria-labelledby="schedule-title">
-                <div class="records-heading"><div><p class="eyebrow">EINSATZPLANUNG</p><h2 id="schedule-title">Tagesansicht</h2></div><div class="schedule-controls"><button id="schedule-previous" class="button button-light" type="button">←</button><input id="schedule-date" type="date"><button id="schedule-next" class="button button-light" type="button">→</button><button id="schedule-week" class="button button-light" type="button">Wochenansicht</button><button id="create-absence-button" class="button button-primary" type="button">Abwesenheit eintragen</button></div></div>
+                <div class="records-heading"><div><p class="eyebrow">EINSATZPLANUNG</p><h2 id="schedule-title">Tagesansicht</h2></div><div class="schedule-controls"><button id="schedule-previous" class="button button-light" type="button">←</button><input id="schedule-date" type="date" aria-label="Kalenderdatum"><button id="schedule-next" class="button button-light" type="button">→</button><button id="schedule-week" class="button button-light" type="button">Wochenansicht</button><button id="create-absence-button" class="button button-primary" type="button">Abwesenheit eintragen</button></div></div>
                 <p id="schedule-note" class="form-note">Arbeitszeiten, Abwesenheiten und bereits geplante Einsätze im Überblick.</p>
                 <div id="schedule-grid" class="schedule-grid" aria-live="polite"></div>
+                <section class="absence-summary" aria-labelledby="absence-request-title">
+                    <div class="records-heading absence-request-heading">
+                        <h3 id="absence-request-title">Abwesenheitsanträge</h3>
+                        <label>Status <select id="absence-request-filter"><option value="PENDING">Offen</option><option value="ALL">Alle</option><option value="APPROVED">Genehmigt</option><option value="REJECTED">Abgelehnt</option><option value="WITHDRAWN">Zurückgezogen</option></select></label>
+                    </div>
+                    <p id="absence-request-list-status" role="status"></p>
+                    <div id="absence-request-list" class="assignment-list"></div>
+                    <div class="absence-request-pagination">
+                        <button id="absence-request-prev" class="button button-light" type="button" disabled>Zurück</button>
+                        <button id="absence-request-next" class="button button-light" type="button" disabled>Weiter</button>
+                    </div>
+                </section>
                 <section class="absence-summary"><h3>Abwesenheiten</h3><div id="absence-list" class="assignment-list"></div></section>
+            </section>
+
+            <section id="attendance-panel" class="service-reports-panel attendance-admin-panel" hidden aria-labelledby="attendance-title">
+                <div class="records-heading"><div><p class="eyebrow">BETRIEB</p><h2 id="attendance-title">Anwesenheit &amp; Check-ins</h2><p class="form-note">Manuell bestätigte Arbeitsbeginne und Arbeitsenden. Standortdaten werden in dieser Phase nicht erhoben.</p></div><button id="attendance-refresh" class="button button-light" type="button">Aktualisieren</button></div>
+                <details class="service-report-filters" open><summary>Anwesenheit filtern</summary><div class="service-report-filter-grid"><label>Status<select id="attendance-status-filter"><option value="">Alle Status</option><option value="OPEN">Offen</option><option value="CLOSED">Abgeschlossen</option><option value="REVIEW_REQUIRED">Prüfung nötig</option><option value="NICHT_ERFASST">Nicht erfasst</option><option value="CANCELLED">Storniert</option></select></label><label>Von<input id="attendance-from" type="date"></label><label>Bis<input id="attendance-to" type="date"></label></div><div class="dialog-actions"><button id="attendance-apply" class="button button-primary" type="button">Filter anwenden</button><button id="attendance-clear" class="button button-light" type="button">Zurücksetzen</button></div></details>
+                <div id="attendance-message" class="dashboard-message" role="status" aria-live="polite" hidden></div>
+                <div id="attendance-results" class="table-wrap" role="region" aria-labelledby="attendance-title" tabindex="0"><table><thead><tr><th>MITARBEITER</th><th>KUNDE / AUFTRAG</th><th>GEPLANT</th><th>CHECK-IN</th><th>CHECK-OUT</th><th>PÜNKTLICHKEIT</th><th>LEISTUNGSNACHWEIS</th><th>KUNDENBESTÄTIGUNG</th><th>STATUS</th></tr></thead><tbody id="attendance-body"></tbody></table><div id="attendance-empty" class="empty-state" hidden><span class="empty-icon" aria-hidden="true">◷</span><strong>Keine Einsätze gefunden</strong><p>Passen Sie die Filter an oder aktualisieren Sie die Liste.</p></div></div>
+                <footer class="table-footer"><span id="attendance-page-info">Einträge 0</span><div class="pagination"><button id="attendance-previous" class="page-button" type="button">← Zurück</button><span id="attendance-page-number">1</span><button id="attendance-next" class="page-button" type="button">Weiter →</button></div></footer>
+                <section id="location-simulation-admin" class="admin-simulation-panel" hidden aria-labelledby="location-simulation-admin-title"><div class="records-heading"><div><p class="eyebrow">NUR TESTMODUS</p><h3 id="location-simulation-admin-title">Aktive Standort-Simulationen</h3><p class="form-note">Ausschließlich synthetische Testkoordinaten. Keine reale Ortung und keine Standort-Historie.</p></div></div><div id="location-simulation-admin-message" class="dashboard-message" role="status" aria-live="polite" hidden></div><div class="table-wrap" role="region" aria-labelledby="location-simulation-admin-title" tabindex="0"><table><thead><tr><th>MITARBEITER</th><th>AUFTRAG</th><th>STATUS</th><th>LETZTES TEST-UPDATE</th><th>SYNTHETISCHE KOORDINATEN</th><th>ABLAUF</th></tr></thead><tbody id="location-simulation-admin-body"></tbody></table><div id="location-simulation-admin-empty" class="empty-state" hidden><strong>Keine aktive Standort-Simulation</strong><p>Eine Simulation wird nur bei geöffnetem Check-in im Testmodus angezeigt.</p></div></div></section>
+            </section>
+
+            <section id="live-locations-panel" class="service-reports-panel live-locations-panel" hidden aria-labelledby="live-locations-title">
+                <div class="records-heading"><div><p class="eyebrow">NUR TEST / SIMULATION</p><h2 id="live-locations-title">Mitarbeiter – Live-Standorte</h2><p class="form-note">Diese Ansicht zeigt ausschließlich künstliche Testkoordinaten aus dem isolierten Testmodus. Es gibt keine reale Ortung und keine Standort-Historie.</p></div><button id="live-locations-refresh" class="button button-light" type="button">Aktualisieren</button></div>
+                <div class="simulation-banner" role="note"><strong>SIMULATION</strong><span>Keine GPS-Erhebung · keine Hintergrundortung · keine Routenaufzeichnung</span></div>
+                <div id="live-locations-message" class="dashboard-message" role="status" aria-live="polite" hidden></div>
+                <div class="simulation-map-layout"><section><h3>Simulationskarte</h3><div id="live-locations-map" class="simulation-map" role="region" aria-label="Interaktive Karte aktiver synthetischer Mitarbeiterstandorte" tabindex="0"><p class="empty-copy">Standorte werden geladen …</p></div><p class="form-note">Interaktive Marker sind per Tastatur erreichbar. Die Karte nutzt keine externen Tiles oder Kartendienste.</p></section><aside class="simulation-map-detail" aria-live="polite"><h3>Marker-Details</h3><div id="live-location-marker-detail"><p class="empty-copy">Wählen Sie einen Marker auf der Simulationskarte.</p></div></aside></div>
+                <section class="simulation-accessible-list" aria-labelledby="live-locations-list-title"><h3 id="live-locations-list-title">Barrierefreie Listenansicht</h3><div class="table-wrap" tabindex="0" aria-label="Liste aktiver synthetischer Mitarbeiterstandorte"><table><thead><tr><th>MITARBEITER</th><th>AUFTRAG</th><th>ZUSTAND</th><th>LETZTES UPDATE</th><th>GENAUIGKEIT</th><th>ABLAUF</th></tr></thead><tbody id="live-locations-list-body"></tbody></table><div id="live-locations-empty" class="empty-state" hidden><strong>Keine aktive Standort-Simulation</strong><p>Aktuell liegen keine künstlichen Standortdaten vor.</p></div></div></section>
             </section>
 
             <section id="service-reports-panel" class="service-reports-panel" hidden aria-labelledby="service-reports-title">
@@ -184,6 +234,13 @@
             </section>
 
             <section id="quality-panel" class="service-reports-panel quality-panel" hidden aria-labelledby="quality-title">
+                <section class="complaints-panel" aria-labelledby="complaints-heading">
+                    <div class="records-heading"><h3 id="complaints-heading">Kundenbeschwerden</h3><label>Status <select id="complaints-filter"><option value="">Alle</option><option value="RECEIVED">Eingegangen</option><option value="IN_REVIEW">In Prüfung</option><option value="RESOLVED">Gelöst</option><option value="CLOSED">Abgeschlossen</option></select></label></div>
+                    <p id="complaints-status" role="status"></p>
+                    <div id="complaints-list" class="assignment-list"></div>
+                    <div class="absence-request-pagination"><button type="button" class="button button-light" id="complaints-prev" disabled>Zurück</button><button type="button" class="button button-light" id="complaints-next" disabled>Weiter</button></div>
+                </section>
+
                 <div class="records-heading"><div><p class="eyebrow">QUALITÄTSMANAGEMENT</p><h2 id="quality-title">Qualität &amp; Vorfälle</h2><p class="form-note">Vorfälle, Ursachen und Korrekturmaßnahmen nachvollziehbar steuern.</p></div><div class="dialog-actions"><button id="quality-create" class="button button-primary" type="button">Neuen Vorfall erstellen</button><button id="quality-refresh" class="button button-light" type="button">Aktualisieren</button></div></div>
                 <div id="quality-cards" class="finance-cards" aria-live="polite"></div>
                 <details class="service-report-filters" open><summary>Vorfälle filtern</summary><div class="service-report-filter-grid"><label>Status<select id="quality-status"><option value="">Alle Status</option><option>OPEN</option><option>IN_REVIEW</option><option>IN_PROGRESS</option><option>WAITING_CUSTOMER</option><option>RESOLVED</option><option>CLOSED</option><option>CANCELLED</option></select></label><label>Schweregrad<select id="quality-severity"><option value="">Alle Schweregrade</option><option>LOW</option><option>NORMAL</option><option>HIGH</option><option>CRITICAL</option></select></label><label>Kunden-ID<input id="quality-customer" type="number" min="1" inputmode="numeric"></label><label>Mitarbeiter-ID<input id="quality-employee" type="number" min="1" inputmode="numeric"></label><label>Auftrags-ID<input id="quality-order" type="number" min="1" inputmode="numeric"></label><label>Von<input id="quality-from" type="date"></label><label>Bis<input id="quality-to" type="date"></label><label class="service-report-filter-search">Suche<input id="quality-search" type="search" maxlength="100" placeholder="Nummer, Titel, Kategorie oder Kunde"></label></div><div class="dialog-actions"><button id="quality-apply" class="button button-primary" type="button">Filter anwenden</button><button id="quality-clear" class="button button-light" type="button">Zurücksetzen</button></div></details>
@@ -201,7 +258,7 @@
                 <div id="materials-message" class="dashboard-message" role="status" hidden></div><div class="table-wrap"><table><thead><tr id="materials-head"></tr></thead><tbody id="materials-body"></tbody></table></div><footer class="table-footer"><span id="materials-page-info">Keine Einträge</span></footer>
             </section>
 
-            <section class="records-panel" aria-labelledby="records-title">
+            <section id="admin-records" class="records-panel" aria-labelledby="records-title">
                 <div class="records-heading">
                     <div>
                         <p class="eyebrow">EINGÄNGE</p>
@@ -212,11 +269,15 @@
                 <div class="toolbar">
                     <label class="search-box">
                         <span aria-hidden="true">⌕</span>
-                        <input id="search-input" type="search" placeholder="Name, E-Mail oder Nachricht suchen" autocomplete="off">
+                        <input id="search-input" type="search" aria-label="Einträge suchen" placeholder="Name, E-Mail oder Nachricht suchen" autocomplete="off">
                     </label>
+                    <label id="contract-filter-wrap" hidden>Vertragsübersicht <select id="contract-schedule-filter" class="filter-select"><option value="all">Alle Verträge</option><option value="active">Aktiver Einsatzplan</option><option value="inactive">Inaktiver Einsatzplan</option><option value="missing">Ohne Einsatzplan</option><option value="incomplete">Angaben fehlen</option></select></label>
                     <label class="filter-label" for="status-filter">Status</label>
                     <select id="status-filter" class="filter-select">
                         <option value="all">Alle Status</option>
+                        <option value="active">Aktiv</option>
+                        <option value="inactive">Inaktiv</option>
+                        <option value="blocked">Gesperrt</option>
                         <option value="new">Neu</option>
                         <option value="in_progress">In Bearbeitung</option>
                         <option value="offer_sent">Angebot gesendet</option>
@@ -246,9 +307,9 @@
                         <option value="TEILBEZAHLT">Teilbezahlt</option>
                         <option value="ÜBERFÄLLIG">Überfällig</option>
                     </select>
-                    <input id="invoice-customer-filter" class="filter-select" type="number" min="1" placeholder="Kunden-ID" hidden>
-                    <input id="invoice-order-filter" class="filter-select" type="number" min="1" placeholder="Auftrags-ID" hidden>
-                    <input id="invoice-due-filter" class="filter-select" type="date" hidden>
+                    <input id="invoice-customer-filter" aria-label="Kunden-ID" class="filter-select" type="number" min="1" placeholder="Kunden-ID" hidden>
+                    <input id="invoice-order-filter" aria-label="Auftrags-ID" class="filter-select" type="number" min="1" placeholder="Auftrags-ID" hidden>
+                    <input id="invoice-due-filter" aria-label="Fälligkeit" class="filter-select" type="date" hidden>
                 </div>
 
                 <div id="dashboard-message" class="dashboard-message" role="status" aria-live="polite" hidden></div>
@@ -256,10 +317,10 @@
                     <table>
                         <thead>
                             <tr>
-                                <th scope="col">EINGANG</th>
-                                <th scope="col">KONTAKT</th>
+                                <th id="date-heading" scope="col">EINGANG</th>
+                                <th id="person-heading" scope="col">KONTAKT</th>
                                 <th id="service-heading" scope="col">LEISTUNG</th>
-                                <th scope="col">NACHRICHT</th>
+                                <th id="operations-heading" scope="col">NACHRICHT</th>
                                 <th scope="col">STATUS</th>
                                 <th scope="col"><span class="sr-only">Details</span></th>
                             </tr>
@@ -286,6 +347,38 @@
         </main>
     </div>
 
+    <dialog id="customer-create-dialog" class="detail-dialog commercial-dialog" aria-labelledby="customer-create-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <h2 id="customer-create-title">Neuen Kunden anlegen</h2>
+        <p>Der Kundendatensatz kann ohne Portalzugang gespeichert werden.</p>
+        <form id="customer-create-form" class="admin-employee-form">
+            <fieldset class="admin-form-wide contract-fields"><legend>Kundendaten</legend>
+                <label>Kundentyp<select name="customer_type"><option value="PRIVATE">Privatkunde</option><option value="BUSINESS">Geschäftskunde</option></select></label>
+                <label>Kundenstatus<select name="status"><option value="active">Aktiv</option><option value="inactive">Inaktiv</option><option value="blocked">Gesperrt</option></select></label>
+                <label>Vorname<input name="first_name" maxlength="80" required></label>
+                <label>Nachname<input name="last_name" maxlength="80" required></label>
+                <label>Firmenname<input name="company_name" maxlength="180"></label>
+                <label>Ansprechpartner<input name="contact_name" maxlength="160"></label>
+                <label>E-Mail<input name="email" type="email" maxlength="254"></label>
+                <label>Telefonnummer<input name="phone" type="tel" maxlength="40"></label>
+                <label>Kundennummer<input name="customer_number" maxlength="40" placeholder="Wird beim Speichern vergeben"></label>
+            </fieldset>
+            <fieldset class="admin-form-wide contract-fields"><legend>Adresse</legend>
+                <label>Straße und Hausnummer<input name="address" maxlength="180"></label>
+                <label>Postleitzahl<input name="postal_code" maxlength="16"></label>
+                <label>Ort<input name="city" maxlength="120"></label>
+            </fieldset>
+            <fieldset class="admin-form-wide contract-fields"><legend>Abweichende Rechnungsadresse</legend>
+                <label>Straße und Hausnummer<input name="billing_address" maxlength="180"></label>
+                <label>Postleitzahl<input name="billing_postal_code" maxlength="16"></label>
+                <label>Ort<input name="billing_city" maxlength="120"></label>
+            </fieldset>
+            <label class="admin-form-wide">Interne Notizen<textarea name="internal_notes" maxlength="4000"></textarea></label>
+            <p id="customer-create-note" role="status"></p>
+            <button class="button button-primary" type="submit">Kunden speichern</button>
+            <button id="customer-create-contract" class="button button-light" type="button" hidden>Bestehenden Vertrag erfassen</button>
+        </form>
+    </dialog>
     <dialog id="detail-dialog" class="detail-dialog" aria-labelledby="detail-name">
         <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
         <p id="detail-type" class="eyebrow">EINGANG</p>
@@ -297,6 +390,7 @@
             <div id="detail-phone-row" hidden><dt>Telefon</dt><dd id="detail-phone">—</dd></div>
         </dl>
         <div class="detail-message"><span>Nachricht</span><p id="detail-message">—</p></div>
+        <div id="customer-detail-sections" class="admin-row-detail" hidden></div>
         <div id="detail-quote-extra" class="detail-message" hidden><span>Objekt &amp; Anfrage</span><p id="detail-quote-values">—</p></div>
         <div id="detail-files" class="detail-message" hidden><span>Dateien</span><p id="detail-file-links">—</p></div>
         <div id="employee-task-summary" class="detail-message" hidden><span>Aufgaben</span><p id="employee-task-list">—</p></div>
@@ -309,6 +403,7 @@
         <button id="create-offer-from-request" class="button button-primary" type="button" hidden>Angebot aus Anfrage erstellen</button>
         <button id="resend-employee-invite" class="button button-light" type="button" hidden>Einladung erneut senden</button>
     </dialog>
+    <dialog id="customer-invite-dialog" class="detail-dialog employee-dialog" aria-labelledby="customer-invite-title"><form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form><h2 id="customer-invite-title">Portal-Einladung</h2><form id="customer-invite-form" class="admin-employee-form"><label>E-Mail des Kunden<input name="email" type="email" required></label><button class="button button-primary" type="submit">Link erstellen</button><p id="customer-invite-note" role="status"></p></form><label>Einladungslink<input id="customer-invite-link" readonly></label><p>Link 24 Stunden gültig. Geben Sie ihn nur an den vorgesehenen Kunden weiter.</p></dialog>
     <dialog id="finance-reject-dialog" class="detail-dialog employee-dialog" aria-labelledby="finance-reject-title">
         <form id="finance-reject-form" class="admin-employee-form">
             <input id="finance-reject-payment-id" type="hidden">
@@ -391,6 +486,12 @@
             <label class="admin-form-wide">Interne Notiz<textarea name="notes" maxlength="4000"></textarea></label>
             <p id="order-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Auftrag speichern</button>
         </form>
+        <section id="order-billing" class="order-assignment-section" hidden>
+            <h3>Abrechnung</h3>
+            <p id="order-billing-status" role="status"></p>
+            <ul id="order-team-billing" class="assignment-list" aria-label="Teamnachweise"></ul>
+            <button id="order-billing-action" type="button" class="button button-primary" hidden>Rechnungsentwurf erstellen</button>
+        </section>
         <section id="order-assignment-section" class="order-assignment-section" hidden>
             <h3>Einsatzplanung</h3><div id="order-assignment-list" class="assignment-list"></div>
             <form id="assignment-form" class="admin-employee-form">
@@ -403,6 +504,23 @@
             <section class="availability-box"><h4>Verfügbare Mitarbeiter</h4><div id="available-employee-list" class="availability-list"><p class="empty-copy">Datum und Uhrzeit für die Verfügbarkeitsprüfung wählen.</p></div></section>
             <h3>Private Dokumentation</h3><div id="order-document-list" class="assignment-list"></div>
         </section>
+    </dialog>
+    <dialog id="absence-request-dialog" class="detail-dialog employee-dialog" aria-labelledby="absence-request-review-title">
+        <form method="dialog"><button type="submit" class="dialog-close" aria-label="Schließen">×</button></form>
+        <h2 id="absence-request-review-title">Abwesenheitsantrag prüfen</h2>
+        <p id="absence-request-summary"></p>
+        <p id="absence-request-note" class="absence-note"></p>
+        <p id="absence-request-history" class="absence-note"></p>
+        <section id="absence-request-conflicts" aria-labelledby="absence-request-conflict-title">
+            <h3 id="absence-request-conflict-title">Betroffene Einsätze</h3>
+            <ul id="absence-request-conflict-list"></ul>
+        </section>
+        <form id="absence-request-review-form" class="admin-employee-form">
+            <label class="admin-form-wide">Entscheidungsnotiz (optional)<textarea name="decision_note" maxlength="1000"></textarea></label>
+            <label id="absence-request-confirm-row" class="admin-form-wide" hidden><span><input id="absence-request-confirm" type="checkbox"> Ich habe die betroffenen Einsätze geprüft. Sie bleiben eingeplant und werden zur Prüfung markiert.</span></label>
+            <div class="dialog-actions admin-form-wide"><button class="button button-primary" type="submit" value="APPROVED">Genehmigen</button><button class="button button-light" type="submit" value="REJECTED">Ablehnen</button></div>
+        </form>
+        <p id="absence-request-review-status" role="status"></p>
     </dialog>
     <dialog id="absence-dialog" class="detail-dialog employee-dialog" aria-labelledby="absence-dialog-title">
         <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
@@ -434,7 +552,7 @@
             <label class="admin-form-wide">Hinweis für Kunden<textarea name="customer_notes" maxlength="8000"></textarea></label>
             <label class="admin-form-wide">Interne Notiz<textarea name="internal_notes" maxlength="8000"></textarea></label>
             <section class="commercial-items admin-form-wide"><div class="commercial-section-heading"><h3>Leistungspositionen</h3><button id="add-quote-item" class="button button-light" type="button">Position hinzufügen</button></div><div id="quote-items"></div><div id="quote-totals" class="quote-totals">Netto: 0,00 € · MwSt.: 0,00 € · Brutto: 0,00 €</div></section>
-            <p id="offer-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Angebot speichern</button>
+            <p id="offer-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Angebot speichern</button><button class="button button-primary" data-publish-status="GESENDET" type="submit">Angebot senden</button>
         </form>
         <div id="offer-actions" class="dialog-actions" hidden><button id="create-order-from-offer" class="button button-primary" type="button">Auftrag aus Angebot erstellen</button></div>
     </dialog>
@@ -442,14 +560,64 @@
         <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
         <p class="eyebrow">VERTRAGSVERWALTUNG</p><h2 id="contract-dialog-title">Vertrag anlegen</h2>
         <form id="contract-form" class="admin-employee-form"><input name="id" type="hidden">
-            <label>Kunde *<select id="contract-customer" name="customer_id" required><option value="">Kunde wählen</option></select></label><label>Aus Angebot<select id="contract-quote" name="quote_id"><option value="">Ohne Angebot</option></select></label>
-            <label>Startdatum *<input name="start_date" type="date" required></label><label>Enddatum<input name="end_date" type="date"></label><label>Kündigungsfrist (Tage)<input name="cancellation_notice_days" type="number" min="0" max="3650"></label>
-            <label>Leistungsart *<input name="service_type" required maxlength="160"></label><label>Intervall *<select name="interval_type"><option>EINMALIG</option><option>WOECHENTLICH</option><option>ZWEIMAL_WOECHENTLICH</option><option>MEHRMALS_WOECHENTLICH</option><option>MONATLICH</option><option selected>INDIVIDUELL</option></select></label><label>Intervall-Details<input name="interval_details" maxlength="255"></label>
-            <label>Netto *<input name="net_amount" type="number" min="0" step="0.01" required></label><label>MwSt. (%) *<input name="tax_rate" type="number" min="0" max="100" step="0.01" required></label><label>Zahlungsintervall<input name="payment_interval" maxlength="80" placeholder="monatlich"></label>
-            <label>Status<select name="status"><option>ENTWURF</option><option>AKTIV</option><option>PAUSIERT</option><option>GEKUENDIGT</option><option>ABGELAUFEN</option><option>BEENDET</option></select></label>
-            <label class="admin-form-wide">Leistungsbeschreibung *<textarea name="service_description" required maxlength="8000"></textarea></label><label class="admin-form-wide">Interne Notiz<textarea name="internal_notes" maxlength="8000"></textarea></label>
-            <p id="contract-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Vertrag speichern</button>
+            <fieldset class="admin-form-wide contract-fields"><legend>Kundenzuordnung</legend>
+                <label class="admin-form-wide">Kunden suchen<input id="contract-customer-search" type="search" maxlength="100"></label>
+                <p id="contract-customer-search-status" class="admin-form-wide" role="status"></p>
+                <label>Kunde *<select id="contract-customer" name="customer_id" required><option value="">Kunde wählen</option></select></label>
+                <label>Aus Angebot<select id="contract-quote" name="quote_id"><option value="">Ohne Angebot</option></select></label>
+            </fieldset>
+            <fieldset class="admin-form-wide contract-fields"><legend>Vertragsidentifikation</legend>
+                <label>Interne Vertragsnummer<input id="contract-number-display" readonly placeholder="Wird beim Speichern vergeben"></label>
+                <label>Externe Vertragsnummer<input name="external_contract_number" maxlength="80"></label>
+                <input name="historical_registration" type="checkbox" hidden>
+                <label>Vertragsstatus<select name="status"><option value="ENTWURF">Entwurf</option><option value="AKTIV">Aktiv</option><option value="PAUSIERT">Pausiert</option><option value="GEKUENDIGT">Gekündigt</option><option value="ABGELAUFEN">Abgelaufen</option><option value="BEENDET">Beendet</option></select></label>
+                <p id="historical-contract-hint" class="admin-form-wide" hidden>Der Originalvertrag wird ohne Aktivierungs-E-Mail erfasst. Die Einsatzplanung erfolgt nach dem Speichern separat.</p>
+            </fieldset>
+            <fieldset class="admin-form-wide contract-fields"><legend>Originale Vertragsdaten</legend>
+                <label>Vertragsbeginn *<input name="start_date" type="date" required></label>
+                <label>Vertragliches Enddatum<input name="end_date" type="date"></label>
+            </fieldset>
+            <fieldset class="admin-form-wide contract-fields"><legend>Leistung</legend>
+                <label>Leistungsart *<input name="service_type" required maxlength="160"></label>
+                <label class="admin-form-wide">Leistungsbeschreibung *<textarea name="service_description" required maxlength="8000"></textarea></label>
+                <label class="admin-form-wide">Interne Notiz<textarea name="internal_notes" maxlength="8000"></textarea></label>
+            </fieldset>
+            <fieldset class="admin-form-wide contract-fields"><legend>Preis und Abrechnung</legend>
+                <label>Netto (€) *<input name="net_amount" type="number" min="0" step="0.01" required></label>
+                <label>MwSt. (%) *<input name="tax_rate" type="number" min="0" max="100" step="0.01" required></label>
+                <label>Abrechnungsintervall<input name="payment_interval" maxlength="80" placeholder="z. B. monatlich"></label>
+            </fieldset>
+            <fieldset class="admin-form-wide contract-fields"><legend>Reinigungsfrequenz</legend>
+                <label>Reinigungsintervall *<select name="interval_type"><option value="EINMALIG">Einmalig</option><option value="WOECHENTLICH">Wöchentlich</option><option value="ZWEIMAL_WOECHENTLICH">Zweimal wöchentlich</option><option value="MEHRMALS_WOECHENTLICH">Mehrmals wöchentlich</option><option value="MONATLICH">Monatlich</option><option value="INDIVIDUELL" selected>Individuell</option></select></label>
+                <label>Details zur Reinigungsfrequenz<input name="interval_details" maxlength="255"></label>
+            </fieldset>
+            <fieldset class="admin-form-wide contract-fields" id="contract-cancellation"><legend>Kündigung und Fristen</legend>
+                <label>Kündigungsfrist (Tage)<input name="cancellation_notice_days" type="number" min="0" max="3650"></label>
+                <label>Kündigung eingegangen am<input name="cancellation_date" type="date"></label>
+                <label>Wirksames Vertragsende<input name="termination_date" type="date"></label>
+                <label class="admin-form-wide">Interne Kündigungsnotiz<textarea name="termination_note" maxlength="8000"></textarea></label>
+            </fieldset>
+            <section id="contract-links" class="admin-form-wide" hidden aria-labelledby="contract-links-heading">
+                <h3 id="contract-links-heading">Dokumente und wiederkehrende Einsätze</h3><h4>Vertragsdokumente</h4>
+                <ul id="contract-documents"></ul>
+                <button id="contract-add-document" class="button button-light" type="button">Dokument zuordnen</button>
+                <h4>Einsatzplanung</h4><button id="contract-schedule-button" class="button button-light" type="button">Einsatzplan öffnen</button>
+                <p id="contract-schedule-warning" role="status"></p>
+            </section>
+            <section id="contract-email-panel" class="admin-form-wide" hidden aria-labelledby="contract-email-heading">
+                <h3 id="contract-email-heading">Vertrags-E-Mail</h3>
+                <p id="contract-email-status" role="status"></p>
+                <details id="contract-email-history" hidden><summary>Versandverlauf</summary><ul id="contract-email-attempts"></ul></details>
+                <button id="contract-email-retry" class="button button-light" type="button" hidden>E-Mail erneut senden</button>
+            </section>
+            <p id="contract-form-note" class="form-message" hidden></p><button id="save-contract-button" class="button button-primary" type="submit">Vertrag speichern</button><button class="button button-primary" data-publish-status="AKTIV" type="submit" hidden>Vertrag aktivieren und Kunden benachrichtigen</button>
         </form>
+    </dialog>
+    <dialog id="contract-review-dialog" class="detail-dialog commercial-dialog" aria-labelledby="contract-review-title">
+        <h2 id="contract-review-title">Bestehenden Vertrag prüfen</h2>
+        <dl id="contract-review-details" class="contract-review-details"></dl>
+        <p>Beim Speichern wird keine Aktivierungs-E-Mail gesendet und kein Einsatzplan angelegt.</p>
+        <form method="dialog" class="dialog-actions"><button class="button button-light" value="edit" autofocus>Angaben korrigieren</button><button class="button button-primary" value="save">Vertrag verbindlich speichern</button></form>
     </dialog>
     <dialog id="invoice-dialog" class="detail-dialog order-dialog commercial-dialog" aria-labelledby="invoice-dialog-title">
         <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
@@ -460,9 +628,20 @@
             <label>Rechnungsdatum *<input name="invoice_date" type="date" required></label><label>Zahlungsziel *<input name="due_date" type="date" required></label><label>Leistungszeitraum von<input name="service_period_from" type="date"></label><label>Leistungszeitraum bis<input name="service_period_to" type="date"></label>
             <label>Status<select name="status"><option>ENTWURF</option><option>AUSGESTELLT</option><option>GESENDET</option></select></label><label class="admin-form-wide">Notiz<textarea name="notes" maxlength="8000"></textarea></label>
             <section class="commercial-items admin-form-wide"><div class="commercial-section-heading"><h3>Rechnungspositionen</h3><button id="add-invoice-item" class="button button-light" type="button">Position hinzufügen</button></div><div id="invoice-items"></div><div id="invoice-totals" class="quote-totals">Netto: 0,00 € · MwSt.: 0,00 € · Brutto: 0,00 €</div></section>
-            <p id="invoice-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Rechnung speichern</button>
+            <p id="invoice-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Rechnung speichern</button><button class="button button-primary" data-publish-status="GESENDET" type="submit">Rechnung veröffentlichen</button>
         </form>
         <section id="invoice-payments-panel" class="commercial-items" hidden><div class="commercial-section-heading"><h3>Zahlungen</h3></div><div id="invoice-payment-list"></div><form id="invoice-payment-form" class="admin-employee-form"><input name="invoice_id" type="hidden"><label>Zahlungsdatum *<input name="payment_date" type="date" required></label><label>Betrag *<input name="amount" type="number" min="0.01" step="0.01" required></label><label>Zahlungsart *<select name="payment_method"><option>BANKÜBERWEISUNG</option><option>BAR</option><option>KARTENZAHLUNG</option><option>SONSTIGE</option></select></label><label>Referenz<input name="payment_reference" maxlength="180"></label><label class="admin-form-wide">Notiz<textarea name="notes" maxlength="4000"></textarea></label><button class="button button-primary" type="submit">Zahlung erfassen</button></form></section>
+    </dialog>
+    <dialog id="billing-exception-dialog" class="detail-dialog employee-dialog" aria-labelledby="billing-exception-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <h2 id="billing-exception-title">Ausnahme zur Teamabrechnung</h2>
+        <p>Die Ausnahme dokumentiert fehlende Arbeit. Der Einsatz wird dabei als unvollständig geführt.</p>
+        <form id="billing-exception-form" class="admin-employee-form">
+            <label>Grund<select name="reason"><option value="ABSENT">Genehmigte Abwesenheit</option><option value="UNABLE_TO_COMPLETE">Einsatz konnte nicht abgeschlossen werden</option></select></label>
+            <label class="admin-form-wide">Begründung<textarea name="note" required maxlength="1000"></textarea></label>
+            <p id="billing-exception-note" role="status"></p>
+            <button class="button button-primary" type="submit">Ausnahme dokumentieren</button>
+        </form>
     </dialog>
     <dialog id="recurring-dialog" class="detail-dialog order-dialog commercial-dialog" aria-labelledby="recurring-dialog-title">
         <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
@@ -470,11 +649,16 @@
         <p class="employee-dialog-intro">Nur aktive Verträge werden automatisiert. Dubletten- und Verfügbarkeitsprüfungen bleiben aktiv.</p>
         <form id="recurring-form" class="admin-employee-form"><input name="id" type="hidden">
             <label>Aktiver Vertrag *<select id="recurring-contract" name="contract_id" required><option value="">Vertrag wählen</option></select></label>
-            <label>Bevorzugter Mitarbeiter<select id="recurring-employee" name="preferred_employee_id"><option value="">Automatisch vorschlagen</option></select></label>
-            <label>Startdatum *<input name="start_date" type="date" required></label><label>Enddatum<input name="end_date" type="date"></label>
+            <label>Erforderliche Teamgröße<input name="required_crew_size" type="number" min="1" max="20" value="1" required></label>
+            <label>Bevorzugte Einsatzkräfte<select id="recurring-employee" name="preferred_employee_ids" multiple size="5" aria-describedby="recurring-employee-hint"></select></label>
+            <p id="recurring-employee-hint" class="admin-form-wide">Ohne Auswahl wird automatisch nach verfügbaren Einsatzkräften gesucht.</p>
+            <label>Planungsbeginn *<input name="start_date" type="date" required></label><label>Planungsende<input name="end_date" type="date"></label>
             <label>Intervall *<select name="recurrence_type"><option>EINMALIG</option><option>WOECHENTLICH</option><option>ZWEIMAL_WOECHENTLICH</option><option>MEHRMALS_WOECHENTLICH</option><option>MONATLICH</option><option>INDIVIDUELL</option></select></label>
             <label>Wochentage (1=Mo bis 7=So)<input name="weekdays" maxlength="32" placeholder="z. B. 1,4"></label>
-            <label>Beginn *<input name="preferred_start_time" type="time" required></label><label>Dauer (Min.) *<input name="duration_minutes" type="number" min="15" max="1440" step="15" required></label>
+            <button id="recurring-daily-preset" class="button button-light" type="button">Täglich (alle Wochentage)</button><label>Beginn *<input name="preferred_start_time" type="time" required></label><label>Geplantes Ende *<input name="planned_end_time" type="time" required></label><input name="duration_minutes" type="hidden">
+            <fieldset class="admin-form-wide contract-fields"><legend>Einsatzort</legend><p class="admin-form-wide">Ohne eigenen Einsatzort gilt die Angebots- oder Kundenadresse.</p>
+                <label>Straße und Hausnummer<input name="service_address" maxlength="180"></label><label>Postleitzahl<input name="service_postal_code" maxlength="16"></label><label>Ort<input name="service_city" maxlength="120"></label>
+            </fieldset>
             <label>Aktiv<select name="active"><option value="1">Ja</option><option value="0">Nein</option></select></label>
             <p id="recurring-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Einsatzplan speichern</button>
         </form>
@@ -512,6 +696,20 @@
     <dialog id="movement-detail-dialog" class="detail-dialog employee-dialog" aria-labelledby="movement-detail-title"><form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form><p class="eyebrow">LAGERBEWEGUNG</p><h2 id="movement-detail-title">Bewegungsdetail</h2><div id="movement-detail-content" class="detail-fields"></div></dialog>
     <dialog id="requirement-dialog" class="detail-dialog employee-dialog"><form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form><p class="eyebrow">AUFTRAGSBEDARF</p><h2 id="requirement-dialog-title">Materialbedarf hinzufügen</h2><form id="requirement-form" class="admin-employee-form"><input name="id" type="hidden"><label>Material *<select id="requirement-material" name="material_id" required><option value="">Material wählen</option></select></label><label>Einheit<input id="requirement-unit" readonly></label><label>Menge *<input name="required_quantity" type="number" min="0.001" step="0.001" required></label><label>Status<select name="status"><option value="PLANNED">Geplant</option><option value="ORDERED">Bestellt</option><option value="READY">Bereit</option><option value="CANCELLED">Storniert</option></select></label><label class="admin-form-wide">Notiz<textarea name="notes" maxlength="4000"></textarea></label><p id="requirement-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Materialbedarf speichern</button></form></dialog>
     <dialog id="quality-dialog" class="detail-dialog order-dialog commercial-dialog" aria-labelledby="quality-dialog-title"><form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form><p class="eyebrow">QUALITÄTSMANAGEMENT</p><h2 id="quality-dialog-title">Neuen Vorfall erstellen</h2><form id="quality-form" class="admin-employee-form"><input name="id" type="hidden"><label>Kunden-ID *<input name="customer_id" type="number" min="1" required></label><label>Auftrags-ID<input name="order_id" type="number" min="1"></label><label>Einsatz-ID<input name="assignment_id" type="number" min="1"></label><label>Leistungsnachweis-ID<input name="service_report_id" type="number" min="1"></label><label>Zugewiesene Mitarbeiter-ID<input name="assigned_employee_id" type="number" min="1"></label><label>Kategorie *<input name="category" maxlength="80" required></label><label>Schweregrad *<select name="severity"><option>LOW</option><option selected>NORMAL</option><option>HIGH</option><option>CRITICAL</option></select></label><label>Fällig am<input name="due_date" type="date"></label><label class="admin-form-wide">Titel *<input name="title" maxlength="180" required></label><label class="admin-form-wide">Beschreibung *<textarea name="description" maxlength="8000" required></textarea></label><label class="admin-form-wide">Interne Notizen<textarea name="internal_notes" maxlength="8000"></textarea></label><label class="admin-form-wide">Ursache<textarea name="root_cause" maxlength="8000"></textarea></label><p id="quality-form-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Vorfall speichern</button></form></dialog>
+    <dialog id="complaint-dialog" class="detail-dialog employee-dialog" aria-labelledby="complaint-title">
+        <form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form>
+        <h2 id="complaint-title">Kundenbeschwerde</h2>
+        <p id="complaint-summary"></p><p id="complaint-description" class="intake-description"></p>
+        <p id="complaint-internal-status"></p>
+        <button type="button" id="complaint-incident-action" class="button button-light">Qualitätsvorfall anlegen</button>
+        <h3>Veröffentlichte Antworten</h3><div id="complaint-public-history"></div>
+        <form id="complaint-publish-form" class="admin-employee-form">
+            <label>Status für den Kunden<select name="status"><option value="RECEIVED">Eingegangen</option><option value="IN_REVIEW">In Prüfung</option><option value="RESOLVED">Gelöst</option><option value="CLOSED">Abgeschlossen</option></select></label>
+            <label class="admin-form-wide">Öffentliche Antwort (optional)<textarea name="response" maxlength="2000" rows="4"></textarea></label>
+            <button type="submit" class="button button-primary">Im Kundenportal veröffentlichen</button>
+        </form>
+        <p id="complaint-action-status" role="status"></p>
+    </dialog>
     <dialog id="quality-detail-dialog" class="detail-dialog order-dialog commercial-dialog" aria-labelledby="quality-detail-title"><form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form><p class="eyebrow">QUALITÄTSMANAGEMENT</p><h2 id="quality-detail-title">Vorfall</h2><div id="quality-detail-values" class="detail-fields"></div><h3>Beschreibung</h3><p id="quality-detail-description"></p><h3>Interne Notizen</h3><p id="quality-detail-notes"></p><h3>Ursache</h3><p id="quality-detail-cause"></p><h3>Korrekturmaßnahmen</h3><div id="quality-actions-list" class="assignment-list"></div><div id="quality-detail-actions" class="dialog-actions"></div></dialog>
     <dialog id="quality-action-dialog" class="detail-dialog employee-dialog" aria-labelledby="quality-action-title"><form method="dialog"><button class="dialog-close" aria-label="Schließen">×</button></form><p class="eyebrow">KORREKTURMASSNAHME</p><h2 id="quality-action-title">Maßnahme anlegen</h2><form id="quality-action-form" class="admin-employee-form"><input name="incident_id" type="hidden"><input name="action_id" type="hidden"><label>Mitarbeiter-ID<input name="assigned_employee_id" type="number" min="1"></label><label>Fällig am<input name="due_date" type="date"></label><label>Status<select name="status"><option>OPEN</option><option>IN_PROGRESS</option><option>COMPLETED</option><option>CANCELLED</option></select></label><label class="admin-form-wide">Titel *<input name="title" maxlength="180" required></label><label class="admin-form-wide">Beschreibung<textarea name="description" maxlength="8000"></textarea></label><p id="quality-action-note" class="form-message" hidden></p><button class="button button-primary" type="submit">Maßnahme speichern</button></form></dialog>
 </body>
